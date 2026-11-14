@@ -88,13 +88,7 @@ impl Platform for Native {
     }
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
-        let handle = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            bail!("not an AppKit window");
-        };
-        // SAFETY: the handle comes from a live window on the main thread.
-        let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
-        let ns_window = view.window().context("view has no window")?;
+        let ns_window = ns_window(window)?;
 
         // gpui creates a titled panel; a titled window keeps its traffic lights and is
         // pushed below the menu bar. Borderless covers the whole display.
@@ -112,6 +106,46 @@ impl Platform for Native {
         };
         ns_window.setFrame_display(frame, true);
         ns_window.makeKeyAndOrderFront(None);
+        Ok(())
+    }
+
+    fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image> {
+        // The rect is in display-local points; the image comes back in pixels.
+        let s = display.scale_factor as f64;
+        let r = CGRect {
+            origin: CGPoint { x: rect.x as f64 / s, y: rect.y as f64 / s },
+            size: CGSize { width: rect.width as f64 / s, height: rect.height as f64 / s },
+        };
+        #[allow(deprecated)] // see capture_display_under_cursor
+        let image = objc2_core_graphics::CGDisplayCreateImageForRect(display.id, r)
+            .context("CGDisplayCreateImageForRect failed")?;
+        to_bgrx(&image)
+    }
+
+    fn place_floating_window(
+        &self,
+        window: &dyn HasWindowHandle,
+        display: &DisplayInfo,
+        rect: PixelRect,
+        hole: Option<PixelRect>,
+    ) -> anyhow::Result<()> {
+        let ns_window = ns_window(window)?;
+        ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        ns_window.setHidesOnDeactivate(false);
+        // The frame has nothing to click; letting all input through is simplest.
+        ns_window.setIgnoresMouseEvents(hole.is_some());
+        ns_window.setAcceptsMouseMovedEvents(true);
+        let s = display.scale_factor as f64;
+        let b = display.bounds;
+        let primary_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+        let (w, h) = (rect.width as f64 / s, rect.height as f64 / s);
+        let top = b.y + rect.y as f64 / s;
+        let frame = CGRect {
+            origin: CGPoint { x: b.x + rect.x as f64 / s, y: primary_height - (top + h) },
+            size: CGSize { width: w, height: h },
+        };
+        ns_window.setFrame_display(frame, true);
+        ns_window.orderFrontRegardless();
         Ok(())
     }
 
@@ -164,6 +198,16 @@ unsafe extern "C" {
         space: Option<&CGColorSpace>,
         bitmap_info: u32,
     ) -> Option<NonNull<CGContext>>;
+}
+
+fn ns_window(window: &dyn HasWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
+    let handle = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        bail!("not an AppKit window");
+    };
+    // SAFETY: the handle comes from a live window on the main thread.
+    let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+    view.window().context("view has no window")
 }
 
 fn prewarm_vision() -> anyhow::Result<()> {

@@ -11,6 +11,7 @@ pub mod pixels;
 pub mod reading_order;
 pub mod render;
 pub mod shape;
+pub mod stitch;
 pub mod style;
 pub mod text;
 

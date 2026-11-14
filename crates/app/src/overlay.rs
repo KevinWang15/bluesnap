@@ -51,6 +51,8 @@ pub struct Overlay {
     ocr: Option<Task<()>>,
     /// Set when the OS withheld window contents; where to grant the permission.
     permission_url: Option<&'static str>,
+    /// The display this overlay covers, for starting a scrolling capture.
+    display: bluesnap_platform::DisplayInfo,
 }
 
 /// Opaque BGRA screenshot pixels as a gpui image (gpui's native layout, so no copy).
@@ -129,6 +131,7 @@ impl Overlay {
         editor: Editor,
         background: Arc<RenderImage>,
         permission_url: Option<&'static str>,
+        display: bluesnap_platform::DisplayInfo,
         cx: &mut Context<Self>,
     ) -> Self {
         // However the window goes away (including OS-initiated closes), allow the next capture.
@@ -156,6 +159,7 @@ impl Overlay {
             status: None,
             ocr: None,
             permission_url,
+            display,
         }
     }
 
@@ -209,6 +213,22 @@ impl Overlay {
             }
             _ => {}
         }
+    }
+
+    /// Closes the overlay and starts capturing the selection while the user scrolls.
+    /// Annotations aren't carried over: the result is assembled from live frames.
+    pub fn start_scrolling_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sel) = self.editor.selection() else { return };
+        let sel = sel.round();
+        let rect = bluesnap_platform::PixelRect { x: sel.x as i32, y: sel.y as i32, width: sel.w as i32, height: sel.h as i32 };
+        let screen = self.editor.screen();
+        let (display, screen) = (self.display.clone(), (screen.w as i32, screen.h as i32));
+        self.finish(Finish::Cancel, window, cx);
+        cx.defer(move |cx| {
+            if let Err(e) = crate::scrolling::start(display, screen, rect, cx) {
+                log::error!("could not start scrolling capture: {e:#}");
+            }
+        });
     }
 
     pub fn is_recognizing(&self) -> bool {

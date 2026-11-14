@@ -7,6 +7,7 @@ mod assets;
 mod config;
 mod output;
 mod overlay;
+mod scrolling;
 mod toolbar;
 
 use std::sync::Arc;
@@ -31,6 +32,8 @@ pub struct AppState {
     fonts: Arc<FontSet>,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
+    /// The running scrolling capture, if any.
+    pub scrolling: Option<gpui::WeakEntity<scrolling::ScrollingCapture>>,
     /// Unregisters the hotkey when dropped, so it must live as long as the app.
     _hotkeys: Option<GlobalHotKeyManager>,
     /// Removes the tray / menu bar icon when dropped.
@@ -75,7 +78,7 @@ fn main() {
         if fonts.is_empty() {
             log::warn!("no usable font found; text annotations will be invisible");
         }
-        cx.set_global(AppState { config, fonts, overlay: None, _hotkeys: hotkeys, _tray: tray });
+        cx.set_global(AppState { config, fonts, overlay: None, scrolling: None, _hotkeys: hotkeys, _tray: tray });
     });
 }
 
@@ -161,6 +164,11 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
 }
 
 fn start_capture(cx: &mut App) {
+    // During a scrolling capture the hotkey means "done".
+    if let Some(session) = cx.global_mut::<AppState>().scrolling.take() {
+        session.update(cx, |s, cx| s.finish(scrolling::Finish::Copy, cx)).ok();
+        return;
+    }
     if cx.global::<AppState>().overlay.is_some() {
         log::debug!("hotkey ignored: a capture is already open");
         return;
@@ -219,7 +227,7 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
         window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     };
-    let handle = cx.open_window(options, |_, cx| cx.new(|cx| Overlay::new(editor, background, permission_url, cx)))?;
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| Overlay::new(editor, background, permission_url, capture.display.clone(), cx)))?;
     stages.push(("open window", started.elapsed()));
     handle.update(cx, |view, window, _| {
         if let Err(e) = platform.configure_overlay(window, &capture.display) {

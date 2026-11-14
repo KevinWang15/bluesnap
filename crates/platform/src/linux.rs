@@ -30,6 +30,20 @@ impl Platform for Native {
         Ok(())
     }
 
+    fn capture_region(&self, _display: &DisplayInfo, _rect: crate::PixelRect) -> anyhow::Result<crate::Image> {
+        bail!("screen capture is not implemented on Linux yet")
+    }
+
+    fn place_floating_window(
+        &self,
+        _window: &dyn HasWindowHandle,
+        _display: &DisplayInfo,
+        _rect: crate::PixelRect,
+        _hole: Option<crate::PixelRect>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn create_tray(&self, _hotkey: &str, _on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
         bail!("tray icon is not implemented on Linux yet")
     }

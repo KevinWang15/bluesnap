@@ -45,9 +45,9 @@ fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 's
     move |_, cx| cx.new(|_| Tooltip(text.into())).into()
 }
 
-/// Logical size of the toolbar: 6 tools | undo | extract text, save, cancel, done.
+/// Logical size of the toolbar: 6 tools | undo | scrolling, to text, save, cancel, done.
 pub fn toolbar_size() -> (f32, f32) {
-    let buttons = 11.0;
+    let buttons = 12.0;
     let children = buttons + 2.0;
     (2.0 * PAD + buttons * BUTTON + 2.0 * SEP + (children - 1.0) * GAP, 2.0 * PAD + BUTTON)
 }
@@ -137,6 +137,10 @@ pub fn toolbar(this: &Overlay, x: f32, y: f32, cx: &mut Context<Overlay>) -> Any
             ),
         )
         .child(separator())
+        .child(
+            icon_button("icons/scroll.svg", "Scrolling screenshot: scroll the window to capture more", normal, false)
+                .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.start_scrolling_capture(w, cx))),
+        )
         .child(
             icon_button(
                 "icons/ocr.svg",

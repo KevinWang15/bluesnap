@@ -95,6 +95,23 @@ pub trait Platform {
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
+    /// Captures `rect` (in `display`'s image pixels) from the live screen, for
+    /// scrolling screenshots. Called repeatedly, so it avoids anything that
+    /// flickers the cursor.
+    fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image>;
+
+    /// Places a helper window (the scrolling-capture frame or panel) exactly at
+    /// `rect` (in `display`'s image pixels), above other windows, without taking
+    /// focus. Mouse input inside `hole` (relative to `rect`) goes to the windows
+    /// below, so the user can scroll the captured app through the frame.
+    fn place_floating_window(
+        &self,
+        window: &dyn HasWindowHandle,
+        display: &DisplayInfo,
+        rect: PixelRect,
+        hole: Option<PixelRect>,
+    ) -> anyhow::Result<()>;
+
     /// Adds the tray (Windows) or menu bar (macOS) icon. `hotkey` is shown in its menu.
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray>;
 
