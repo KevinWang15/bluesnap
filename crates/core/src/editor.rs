@@ -74,6 +74,10 @@ pub struct Editor {
     styles: [Style; Tool::ALL.len()],
     text: Option<TextEdit>,
     revision: u64,
+    /// Bumped when shapes other than the active one change (see [`Self::render_static_layer`]).
+    static_revision: u64,
+    /// Bumped when the active shape changes (see [`Self::render_active_layer`]).
+    active_revision: u64,
 }
 
 impl Editor {
@@ -97,6 +101,8 @@ impl Editor {
             styles: [Style::default(); Tool::ALL.len()],
             text: None,
             revision: 0,
+            static_revision: 0,
+            active_revision: 0,
         };
         editor.update_hover();
         editor
@@ -108,6 +114,27 @@ impl Editor {
 
     fn touch(&mut self) {
         self.revision += 1;
+    }
+
+    /// Any shape, or which shape is active, may have changed.
+    fn touch_shapes(&mut self) {
+        self.touch();
+        self.static_revision += 1;
+        self.active_revision += 1;
+    }
+
+    /// Only the active shape changed: the hot path while dragging or typing.
+    fn touch_active(&mut self) {
+        self.touch();
+        self.active_revision += 1;
+    }
+
+    /// The shape being dragged, created or typed into right now.
+    fn active_index(&self) -> Option<usize> {
+        match &self.drag {
+            Some(Drag::Create { idx, .. } | Drag::ShapeMove { idx, .. } | Drag::ShapeHandle { idx, .. }) => Some(*idx),
+            _ => self.text.as_ref().map(|t| t.idx),
+        }
     }
 
     // ----- queries --------------------------------------------------------
@@ -267,6 +294,7 @@ impl Editor {
         if let Some((idx, handle)) = self.shape_handle_at(p) {
             self.begin_change();
             self.drag = Some(Drag::ShapeHandle { idx, handle, orig: self.shapes[idx].clone(), start: p });
+            self.touch_shapes();
             return;
         }
         if let Some(handle) = sel.handle_at(p, HANDLE_HIT_RADIUS * self.scale) {
@@ -277,6 +305,7 @@ impl Editor {
             self.selected = Some(idx);
             self.begin_change();
             self.drag = Some(Drag::ShapeMove { idx, orig: self.shapes[idx].clone(), start: p, moved: false });
+            self.touch_shapes();
             return;
         }
         self.selected = None;
@@ -313,6 +342,7 @@ impl Editor {
         } else {
             self.drag = Some(Drag::Create { idx, start: p });
         }
+        self.touch_shapes();
     }
 
     /// `constrain` (usually Shift) keeps rectangles square and ellipses circular.
@@ -331,6 +361,7 @@ impl Editor {
         };
         let screen = self.doc.bounds();
         let scale = self.scale;
+        let shape_drag = matches!(drag, Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. });
         match drag {
             Drag::Pick { start, moved } => {
                 if !*moved && start.distance(p) > DRAG_THRESHOLD * scale {
@@ -369,14 +400,18 @@ impl Editor {
             }
         }
         if prev != p {
-            self.touch();
+            if shape_drag { self.touch_active() } else { self.touch() }
         }
     }
 
     pub fn pointer_up(&mut self, p: Point) {
         self.pointer = p;
         let Some(drag) = self.drag.take() else { return };
-        self.touch();
+        if matches!(drag, Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. }) {
+            self.touch_shapes();
+        } else {
+            self.touch();
+        }
         match drag {
             Drag::Pick { start, moved } => {
                 let r = Rect::from_points(start, p).intersect(&self.screen());
@@ -465,7 +500,7 @@ impl Editor {
                 self.end_change();
             }
         }
-        self.touch();
+        self.touch_shapes();
     }
 
     pub fn undo(&mut self) -> bool {
@@ -474,7 +509,7 @@ impl Editor {
         let Some(prev) = self.history.pop() else { return false };
         self.shapes = prev;
         self.selected = None;
-        self.touch();
+        self.touch_shapes();
         true
     }
 
@@ -485,7 +520,7 @@ impl Editor {
         let Some(idx) = self.selected.take() else { return false };
         self.begin_change();
         self.shapes.remove(idx);
-        self.touch();
+        self.touch_shapes();
         true
     }
 
@@ -522,6 +557,7 @@ impl Editor {
             edit.caret = caret;
             edit.marked = None;
         }
+        self.touch_active();
     }
 
     /// Commits the text being edited; empty text boxes are removed.
@@ -532,7 +568,7 @@ impl Editor {
             self.selected = None;
         }
         self.end_change();
-        self.touch();
+        self.touch_shapes();
     }
 
     pub fn text_content(&self) -> Option<&str> {
@@ -554,7 +590,7 @@ impl Editor {
     pub fn text_unmark(&mut self) {
         if let Some(edit) = &mut self.text {
             edit.marked = None;
-            self.touch();
+            self.touch_active();
         }
     }
 
@@ -576,7 +612,7 @@ impl Editor {
             .unwrap_or(end);
         let marked = (mark && !new_text.is_empty()).then_some(range.start..end);
         self.text = Some(TextEdit { caret, marked, ..edit });
-        self.touch();
+        self.touch_active();
     }
 
     pub fn text_key(&mut self, key: TextKey) {
@@ -599,7 +635,7 @@ impl Editor {
                     _ => line_end,
                 };
                 self.text = Some(TextEdit { caret, marked: None, ..edit });
-                self.touch();
+                self.touch_active();
             }
             _ => {}
         }
@@ -634,14 +670,40 @@ impl Editor {
 
     // ----- output ---------------------------------------------------------
 
-    /// Annotations rendered over the selection, or `None` when there are none.
-    pub fn render_layer(&self) -> Option<(Rect, Pixmap)> {
-        if self.shapes.is_empty() {
-            return None;
-        }
-        let region = self.selection?.round().intersect(&self.screen())?;
-        let underline = self.text.as_ref().and_then(|e| Some((e.idx, e.marked.clone()?)));
-        let pixmap = render::render_layer(&self.doc, region, &self.shapes, self.metrics(), underline)?;
+    /// Changes whenever [`Self::render_static_layer`] would draw something different.
+    pub fn static_layer_revision(&self) -> u64 {
+        self.static_revision
+    }
+
+    /// Changes whenever [`Self::render_active_layer`] would draw something different.
+    pub fn active_layer_revision(&self) -> u64 {
+        self.active_revision
+    }
+
+    /// Every annotation except the active one, over the area they cover. This is
+    /// independent of the selection (the frontend clips to it), so it only needs
+    /// re-rendering when a shape is committed, deleted, restyled or undone.
+    pub fn render_static_layer(&self) -> Option<(Rect, Pixmap)> {
+        let active = self.active_index();
+        let shapes: Vec<&Shape> =
+            self.shapes.iter().enumerate().filter(|(i, _)| Some(*i) != active).map(|(_, s)| s).collect();
+        self.render_shapes(&shapes, None)
+    }
+
+    /// The shape being drawn, dragged or typed into, over just its own bounds, so
+    /// each mouse move or keystroke re-rasterizes only that shape. While active it
+    /// is drawn above the others; it drops back to its place when released.
+    pub fn render_active_layer(&self) -> Option<(Rect, Pixmap)> {
+        let idx = self.active_index()?;
+        let underline = self.text.as_ref().and_then(|e| Some((0, e.marked.clone()?)));
+        self.render_shapes(&[&self.shapes[idx]], underline)
+    }
+
+    fn render_shapes(&self, shapes: &[&Shape], underline: Option<render::Underline>) -> Option<(Rect, Pixmap)> {
+        let m = self.metrics();
+        let bounds = shapes.iter().map(|s| s.bounds(m)).reduce(|a, b| a.union(&b))?;
+        let region = bounds.inflate(1.0).round_out().intersect(&self.screen())?;
+        let pixmap = render::render_layer(&self.doc, region, shapes, m, underline)?;
         Some((region, pixmap))
     }
 
@@ -790,6 +852,42 @@ mod tests {
         assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[2]);
         assert!(e.undo());
         assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[0]);
+    }
+
+    #[test]
+    fn dragging_a_shape_only_rerenders_the_active_layer() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (20.0, 20.0), (60.0, 60.0));
+        e.toggle_tool(Tool::Pen);
+        e.pointer_down(Point::new(200.0, 200.0));
+        let (static_rev, active_rev) = (e.static_layer_revision(), e.active_layer_revision());
+        e.pointer_move(Point::new(220.0, 210.0), false);
+        e.pointer_move(Point::new(240.0, 230.0), false);
+        assert_eq!(e.static_layer_revision(), static_rev);
+        assert!(e.active_layer_revision() > active_rev);
+        // The active layer covers only the stroke; the rectangle stays in the static one.
+        let (active, _) = e.render_active_layer().unwrap();
+        assert!(active.x > 150.0 && active.w < 100.0);
+        let (fixed, _) = e.render_static_layer().unwrap();
+        assert!(fixed.right() < 100.0);
+        e.pointer_up(Point::new(240.0, 230.0));
+        assert!(e.render_active_layer().is_none());
+        assert!(e.render_static_layer().unwrap().0.right() > 200.0);
+    }
+
+    #[test]
+    fn moving_the_selection_keeps_both_layers() {
+        let mut e = editor();
+        drag(&mut e, (50.0, 50.0), (250.0, 200.0));
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (80.0, 80.0), (120.0, 120.0));
+        e.toggle_tool(Tool::Rect);
+        let revs = (e.static_layer_revision(), e.active_layer_revision());
+        drag(&mut e, (150.0, 150.0), (170.0, 160.0));
+        assert_eq!(e.selection(), Some(Rect::new(70.0, 60.0, 200.0, 150.0)));
+        assert_eq!((e.static_layer_revision(), e.active_layer_revision()), revs);
     }
 
     #[test]

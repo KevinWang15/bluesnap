@@ -8,3 +8,10 @@ license.workspace = true
 [dependencies]
 ab_glyph = "0.2"
 tiny-skia = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "editor"
+harness = false

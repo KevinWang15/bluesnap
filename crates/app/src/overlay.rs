@@ -13,7 +13,7 @@ use bluesnap_core::render::{to_bgra_straight, to_rgba_straight};
 use bluesnap_core::{CursorKind, Editor, Pixmap, Point as Px, Rect as PxRect, RightClick, THEME_BLUE, TextKey};
 use bluesnap_platform::Platform;
 use gpui::{
-    App, Bounds, BorderStyle, ClipboardItem, Context, Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
+    App, Bounds, BorderStyle, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage,
     SharedString, Styled, Task, UTF16Selection, Window, canvas, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
@@ -38,9 +38,10 @@ pub struct Overlay {
     editor: Editor,
     focus: FocusHandle,
     background: Arc<RenderImage>,
-    /// Annotations rendered for the current editor revision.
-    layer: Option<(PxRect, Arc<RenderImage>)>,
-    layer_revision: Option<u64>,
+    /// Finished annotations, re-rasterized only when they change.
+    static_layer: Layer,
+    /// The annotation being drawn, dragged or typed into.
+    active_layer: Layer,
     /// Screenshot pixels per logical pixel.
     scale: f32,
     finished: bool,
@@ -50,12 +51,8 @@ pub struct Overlay {
     ocr: Option<Task<()>>,
 }
 
-/// Opaque RGBA screenshot pixels as a gpui image (which wants BGRA).
-pub fn background_image(width: u32, height: u32, rgba: &[u8]) -> Option<RenderImage> {
-    let mut bgra = rgba.to_vec();
-    for px in bgra.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
+/// Opaque BGRA screenshot pixels as a gpui image (gpui's native layout, so no copy).
+pub fn background_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<RenderImage> {
     let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
     Some(RenderImage::new(vec![image::Frame::new(buffer)]))
 }
@@ -63,6 +60,27 @@ pub fn background_image(width: u32, height: u32, rgba: &[u8]) -> Option<RenderIm
 fn pixmap_image(pixmap: &Pixmap) -> Option<RenderImage> {
     let buffer = image::RgbaImage::from_raw(pixmap.width(), pixmap.height(), to_bgra_straight(pixmap))?;
     Some(RenderImage::new(vec![image::Frame::new(buffer)]))
+}
+
+/// One annotation layer uploaded to the GPU, tagged with the editor revision it shows.
+#[derive(Default)]
+struct Layer {
+    revision: Option<u64>,
+    image: Option<(PxRect, Arc<RenderImage>)>,
+}
+
+impl Layer {
+    fn sync(&mut self, revision: u64, render: impl FnOnce() -> Option<(PxRect, Pixmap)>, window: &mut Window) {
+        if self.revision == Some(revision) {
+            return;
+        }
+        self.revision = Some(revision);
+        let new = render().and_then(|(rect, pixmap)| Some((rect, Arc::new(pixmap_image(&pixmap)?))));
+        if let Some((_, old)) = std::mem::replace(&mut self.image, new) {
+            // Each version is a new texture; free the previous one from the atlas.
+            window.drop_image(old).ok();
+        }
+    }
 }
 
 fn color(c: bluesnap_core::Color) -> Hsla {
@@ -82,8 +100,8 @@ impl Overlay {
             editor,
             focus: cx.focus_handle(),
             background,
-            layer: None,
-            layer_revision: None,
+            static_layer: Layer::default(),
+            active_layer: Layer::default(),
             scale,
             finished: false,
             status: None,
@@ -117,21 +135,11 @@ impl Overlay {
         PxRect::new(r.x / s, r.y / s, r.w / s, r.h / s)
     }
 
-    /// Re-rasterizes the annotation layer when the editor changed since last frame.
-    fn sync_layer(&mut self, window: &mut Window) {
-        let revision = self.editor.revision();
-        if self.layer_revision == Some(revision) {
-            return;
-        }
-        self.layer_revision = Some(revision);
-        let new = self
-            .editor
-            .render_layer()
-            .and_then(|(rect, pixmap)| Some((rect, Arc::new(pixmap_image(&pixmap)?))));
-        if let Some((_, old)) = std::mem::replace(&mut self.layer, new) {
-            // Each layer is a new texture; free the previous one from the atlas.
-            window.drop_image(old).ok();
-        }
+    /// Re-rasterizes the annotation layers whose content changed since last frame.
+    fn sync_layers(&mut self, window: &mut Window) {
+        let e = &self.editor;
+        self.static_layer.sync(e.static_layer_revision(), || e.render_static_layer(), window);
+        self.active_layer.sync(e.active_layer_revision(), || e.render_active_layer(), window);
     }
 
     pub fn finish(&mut self, how: Finish, window: &mut Window, cx: &mut Context<Self>) {
@@ -164,12 +172,12 @@ impl Overlay {
             return;
         }
         let Some(pixmap) = self.editor.export() else { return };
-        let image = bluesnap_platform::Image { width: pixmap.width(), height: pixmap.height(), rgba: to_rgba_straight(&pixmap) };
+        let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
         self.status = Some("Recognizing text…".into());
         let started = std::time::Instant::now();
         let recognized = cx
             .background_executor()
-            .spawn(async move { bluesnap_platform::native().recognize_text(&image) });
+            .spawn(async move { bluesnap_platform::native().recognize_text(width, height, &rgba) });
         self.ocr = Some(cx.spawn_in(window, async move |this, cx| {
             let result = recognized.await;
             log::debug!("text recognition took {:?}", started.elapsed());
@@ -295,7 +303,11 @@ impl Overlay {
             entity,
             focus: self.focus.clone(),
             background: self.background.clone(),
-            layer: self.layer.as_ref().map(|(r, img)| (self.to_logical(*r), img.clone())),
+            layers: [&self.static_layer, &self.active_layer]
+                .into_iter()
+                .filter_map(|l| l.image.as_ref().map(|(r, img)| (self.to_logical(*r), img.clone())))
+                .collect(),
+            clip: e.selection().map(|r| self.to_logical(r)),
             active: e.active_rect().map(|r| self.to_logical(r)),
             handles: handles.into_iter().map(to_point).collect(),
             shape_frame: e
@@ -325,7 +337,7 @@ impl Render for Overlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         self.scale = self.editor.screen().w / f32::from(viewport.width).max(1.0);
-        self.sync_layer(window);
+        self.sync_layers(window);
 
         let scene = self.scene(cx.entity());
         let mut root = div()
@@ -409,7 +421,9 @@ struct Scene {
     entity: Entity<Overlay>,
     focus: FocusHandle,
     background: Arc<RenderImage>,
-    layer: Option<(Bounds<Pixels>, Arc<RenderImage>)>,
+    /// Annotation layers, bottom to top, and the selection they are clipped to.
+    layers: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
+    clip: Option<Bounds<Pixels>>,
     active: Option<Bounds<Pixels>>,
     handles: Vec<Point<Pixels>>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
@@ -439,8 +453,12 @@ impl Scene {
             None => window.paint_quad(fill(bounds, dim)),
         }
 
-        if let Some((b, image)) = self.layer {
-            window.paint_image(b, Corners::default(), image, 0, false).ok();
+        if let Some(clip) = self.clip {
+            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                for (b, image) in self.layers {
+                    window.paint_image(b, Corners::default(), image, 0, false).ok();
+                }
+            });
         }
 
         if let Some(a) = self.active {

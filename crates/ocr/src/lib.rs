@@ -1,7 +1,12 @@
 //! Text recognition with the PP-OCRv6 small models, embedded in the binary and run
 //! by tract (pure Rust, no ONNX Runtime). Used where the OS has no good OCR API.
+//!
+//! The engine is loaded on first use (about 30 ms) and dropped again after a
+//! minute without use: while warm it holds a few hundred MB of compiled plans
+//! and buffers, which a background app shouldn't keep around.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use pure_onnx_ocr::{DetLimitType, OcrEngine, OcrEngineBuilder};
@@ -15,23 +20,51 @@ pub struct Line {
     pub height: f32,
 }
 
-fn engine() -> anyhow::Result<&'static OcrEngine> {
-    static ENGINE: OnceLock<Result<OcrEngine, String>> = OnceLock::new();
-    ENGINE
-        .get_or_init(|| {
-            OcrEngineBuilder::new()
-                .det_model_bytes(include_bytes!("../models/det.onnx").to_vec())
-                .det_config_yaml(include_str!("../models/det.yml"))
-                .rec_model_bytes(include_bytes!("../models/rec.onnx").to_vec())
-                .rec_config_yaml(include_str!("../models/rec.yml"))
-                // Detect at native resolution (PaddleOCR 3.x behavior): screenshots
-                // often contain small UI text that downscaling would lose.
-                .det_limit_type(DetLimitType::Min)
-                .det_limit_side_len(64)
-                .build()
-                .map_err(|e| e.to_string())
-        })
-        .as_ref()
+/// How long the engine stays loaded after the last recognition.
+const KEEP_WARM: Duration = Duration::from_secs(60);
+
+struct Warm {
+    engine: OcrEngine,
+    last_used: Instant,
+}
+
+fn state() -> &'static Mutex<Option<Warm>> {
+    static STATE: OnceLock<Mutex<Option<Warm>>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("ocr-unload".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(KEEP_WARM / 4);
+                    let mut warm = state().lock().unwrap_or_else(|e| e.into_inner());
+                    if warm.as_ref().is_some_and(|w| w.last_used.elapsed() >= KEEP_WARM) {
+                        *warm = None;
+                    }
+                }
+            })
+            .expect("spawn OCR unload thread");
+        Mutex::new(None)
+    })
+}
+
+fn build_engine() -> anyhow::Result<OcrEngine> {
+    // Measured on a 20-thread CPU: 8 threads is as fast as 16 on typical
+    // selections and needs less memory (each thread has its own buffers).
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    OcrEngineBuilder::new()
+        .det_model_bytes(include_bytes!("../models/det.onnx").to_vec())
+        .det_config_yaml(include_str!("../models/det.yml"))
+        .rec_model_bytes(include_bytes!("../models/rec.onnx").to_vec())
+        .rec_config_yaml(include_str!("../models/rec.yml"))
+        // Detect at native resolution (PaddleOCR 3.x behavior): screenshots
+        // often contain small UI text that downscaling would lose.
+        .det_limit_type(DetLimitType::Min)
+        .det_limit_side_len(64)
+        // tract compiles a plan per recognition input width; lines of many
+        // different lengths overflow the default 16 and recompile.
+        .plan_cache_capacity(4, 32)
+        .inference_threads(threads)
+        .build()
         .map_err(|e| anyhow!("loading OCR models: {e}"))
 }
 
@@ -39,10 +72,17 @@ fn engine() -> anyhow::Result<&'static OcrEngine> {
 /// milliseconds on typical selections; call it off the UI thread.
 pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<Line>> {
     let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).context("buffer size mismatch")?;
-    let results = engine()?
+    let mut warm = state().lock().unwrap_or_else(|e| e.into_inner());
+    if warm.is_none() {
+        *warm = Some(Warm { engine: build_engine()?, last_used: Instant::now() });
+    }
+    let warm = warm.as_mut().expect("just loaded");
+    let results = warm
+        .engine
         .run_from_image(&image::DynamicImage::ImageRgba8(image))
-        .map_err(|e| anyhow!("OCR failed: {e}"))?;
-    Ok(results
+        .map_err(|e| anyhow!("OCR failed: {e}"));
+    warm.last_used = Instant::now();
+    Ok(results?
         .into_iter()
         .filter(|r| !r.text.trim().is_empty())
         .map(|r| {

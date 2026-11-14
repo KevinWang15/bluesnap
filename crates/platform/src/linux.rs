@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use raw_window_handle::HasWindowHandle;
 
-use crate::{Capture, DisplayInfo, Image, Platform, TextLine};
+use crate::{Capture, DisplayInfo, Platform, TextLine};
 
 pub struct Native;
 
@@ -29,8 +29,8 @@ impl Platform for Native {
         Ok(())
     }
 
-    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
-        crate::recognize_with_model(image)
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+        crate::recognize_with_model(width, height, rgba)
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {

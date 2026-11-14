@@ -37,11 +37,13 @@ pub struct DisplayInfo {
     pub scale_factor: f32,
 }
 
-/// Opaque, straight-alpha RGBA8 pixels, row-major without padding.
+/// Captured pixels in the layout every supported OS produces natively: BGRX,
+/// row-major without padding, 4th byte undefined. Converting is left to the
+/// caller so it happens once, in parallel (`bluesnap_core::pixels::split_bgrx`).
 pub struct Image {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub bgrx: Vec<u8>,
 }
 
 /// A line of recognized text and where it is, in image pixels.
@@ -72,9 +74,9 @@ pub trait Platform {
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
-    /// Recognizes text in `image`. Blocking; call it off the UI thread.
-    /// Lines come back in no particular order.
-    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>>;
+    /// Recognizes text in straight-alpha RGBA pixels. Blocking; call it off the
+    /// UI thread. Lines come back in no particular order.
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>>;
 
     /// Font files for text annotations, best first. CJK-capable fonts are listed
     /// early so mixed-script text renders without tofu.
@@ -83,8 +85,8 @@ pub trait Platform {
 
 /// The embedded PP-OCRv6 engine, for OSes without a good built-in OCR API.
 #[cfg(not(target_os = "macos"))]
-fn recognize_with_model(image: &Image) -> anyhow::Result<Vec<TextLine>> {
-    let lines = bluesnap_ocr::recognize(image.width, image.height, &image.rgba)?;
+fn recognize_with_model(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+    let lines = bluesnap_ocr::recognize(width, height, rgba)?;
     Ok(lines
         .into_iter()
         .map(|l| TextLine {

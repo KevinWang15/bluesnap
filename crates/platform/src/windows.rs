@@ -75,8 +75,8 @@ impl Platform for Native {
 
     /// Windows.Media.Ocr only knows languages whose language pack is installed, and
     /// its accuracy on CJK is poor, so use the embedded model instead.
-    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
-        crate::recognize_with_model(image)
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+        crate::recognize_with_model(width, height, rgba)
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {
@@ -141,7 +141,7 @@ fn monitor_scale(monitor: HMONITOR) -> f32 {
     dx as f32 / 96.0
 }
 
-/// BitBlt of the desktop into a top-down 32-bit DIB.
+/// BitBlt of the desktop into a top-down 32-bit DIB, which is BGRX.
 fn capture_rect(rc: &RECT) -> anyhow::Result<Image> {
     let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
     if w <= 0 || h <= 0 {
@@ -175,12 +175,8 @@ fn capture_rect(rc: &RECT) -> anyhow::Result<Image> {
                 Err(anyhow::anyhow!("BitBlt failed: {}", std::io::Error::last_os_error()))
             } else {
                 let len = w as usize * h as usize * 4;
-                let mut rgba = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
-                for px in rgba.as_chunks_mut::<4>().0 {
-                    px.swap(0, 2); // BGRX -> RGBX
-                    px[3] = 255; // GDI leaves alpha undefined
-                }
-                Ok(Image { width: w as u32, height: h as u32, rgba })
+                let bgrx = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
+                Ok(Image { width: w as u32, height: h as u32, bgrx })
             }
         };
         if !bitmap.is_null() {

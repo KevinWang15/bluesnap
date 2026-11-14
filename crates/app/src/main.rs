@@ -127,9 +127,10 @@ fn start_capture(cx: &mut App) {
 
 fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
     let started = Instant::now();
+    let mut stages = Vec::new();
     let platform = bluesnap_platform::native();
     let capture = platform.capture_display_under_cursor()?;
-    let captured = started.elapsed();
+    stages.push(("capture", started.elapsed()));
 
     let display = cx
         .displays()
@@ -137,21 +138,23 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
         .find(|d| u32::from(d.id()) == capture.display.id)
         .context("captured display not known to gpui")?;
 
-    let image = &capture.image;
-    let background = Arc::new(
-        overlay::background_image(image.width, image.height, &image.rgba).context("bad capture buffer")?,
-    );
-    let scale = image.width as f32 / f32::from(display.bounds().size.width);
+    let (width, height) = (capture.image.width, capture.image.height);
+    let mut bgra = capture.image.bgrx;
+    anyhow::ensure!(bgra.len() == width as usize * height as usize * 4, "bad capture buffer");
+    let rgba = bluesnap_core::pixels::split_bgrx(&mut bgra);
+    let background = Arc::new(overlay::background_image(width, height, bgra).context("bad capture buffer")?);
+    stages.push(("gpu image", started.elapsed()));
+    let scale = width as f32 / f32::from(display.bounds().size.width);
     let mosaic_block = (8.0 * scale).round() as u32;
     let windows = capture
         .windows
         .iter()
         .map(|w| Rect::new(w.x as f32, w.y as f32, w.width as f32, w.height as f32))
         .collect();
-    let doc = Document::from_rgba(image.width, image.height, capture.image.rgba, mosaic_block)
-        .context("bad capture buffer")?;
+    let doc = Document::from_rgba(width, height, rgba, mosaic_block).context("bad capture buffer")?;
     let fonts = cx.global::<AppState>().fonts.clone();
     let editor = Editor::new(doc, fonts, windows, scale);
+    stages.push(("editor", started.elapsed()));
 
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(display.bounds())),
@@ -167,15 +170,25 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
         ..Default::default()
     };
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| Overlay::new(editor, background, cx)))?;
+    stages.push(("open window", started.elapsed()));
     handle.update(cx, |view, window, _| {
         if let Err(e) = platform.configure_overlay(window, &capture.display) {
             log::warn!("overlay setup: {e:#}");
         }
         window.focus(view.focus_handle());
         window.activate_window();
+        stages.push(("configure", started.elapsed()));
+        let stages = std::mem::take(&mut stages);
+        // Frame callbacks run before drawing, so the nested one runs once the
+        // first frame (including the screenshot texture upload) is presented.
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| {
+                let timeline: Vec<String> = stages.iter().map(|(name, t)| format!("{name} {t:.1?}")).collect();
+                log::debug!("overlay timeline: {}, first frame presented {:.1?}", timeline.join(", "), started.elapsed());
+            });
+        });
     })?;
     cx.global_mut::<AppState>().overlay = Some(handle.into());
-    log::debug!("capture {:?}, overlay open after {:?}", captured, started.elapsed());
     Ok(())
 }
 

@@ -11,7 +11,7 @@ use objc2::{AllocAnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSView, NSWindowStyleMask};
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
+    CGBitmapContextCreateImage, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
     CGImageAlphaInfo, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
     kCGWindowLayer, kCGWindowOwnerPID,
@@ -53,7 +53,7 @@ impl Platform for Native {
 
         #[allow(deprecated)] // ScreenCaptureKit is async and much slower for a single frame.
         let image = objc2_core_graphics::CGDisplayCreateImage(id).context("CGDisplayCreateImage failed")?;
-        let image = to_rgba(&image)?;
+        let image = to_bgrx(&image)?;
         let captured = started.elapsed();
 
         let scale = image.width as f64 / bounds.size.width;
@@ -106,8 +106,8 @@ impl Platform for Native {
     }
 
     /// Apple's Vision framework: no bundled model, and good at Chinese.
-    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
-        objc2::rc::autoreleasepool(|_| recognize_with_vision(image))
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+        objc2::rc::autoreleasepool(|_| recognize_with_vision(width, height, rgba))
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {
@@ -139,9 +139,10 @@ unsafe extern "C" {
     ) -> Option<NonNull<CGContext>>;
 }
 
-fn recognize_with_vision(image: &Image) -> anyhow::Result<Vec<TextLine>> {
-    let (w, h) = (image.width as usize, image.height as usize);
-    let mut rgba = image.rgba.clone();
+fn recognize_with_vision(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+    let (w, h) = (width as usize, height as usize);
+    anyhow::ensure!(rgba.len() == w * h * 4, "buffer size mismatch");
+    let mut rgba = rgba.to_vec();
     let space = CGColorSpace::new_device_rgb();
     // SAFETY: `rgba` outlives the context; the CGImage made from it is a copy.
     let context = unsafe {
@@ -185,40 +186,27 @@ fn recognize_with_vision(image: &Image) -> anyhow::Result<Vec<TextLine>> {
     Ok(lines)
 }
 
-/// Draws `image` into an RGBX buffer we own. Using the image's own color space
-/// makes this a plain copy with a channel swizzle, with no color conversion.
-fn to_rgba(image: &CGImage) -> anyhow::Result<Image> {
+/// Draws `image` into a BGRX buffer we own: the display's native layout, so with
+/// the image's own color space this is a plain copy, with no color conversion.
+fn to_bgrx(image: &CGImage) -> anyhow::Result<Image> {
     let (w, h) = (CGImage::width(Some(image)), CGImage::height(Some(image)));
-    let mut rgba = vec![0u8; w * h * 4];
+    let mut bgrx = vec![0u8; w * h * 4];
+    // Little-endian 32-bit "XRGB" is B, G, R, X in memory.
+    let info = CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0;
     let space = CGImage::color_space(Some(image)).or_else(CGColorSpace::new_device_rgb);
-    // SAFETY: `rgba` outlives the context, which is released at the end of this function.
-    let context = unsafe {
-        CGBitmapContextCreate(
-            rgba.as_mut_ptr().cast(),
-            w,
-            h,
-            8,
-            w * 4,
-            space.as_deref(),
-            CGImageAlphaInfo::NoneSkipLast.0,
-        )
-    }
-    .or_else(|| {
-        let srgb = CGColorSpace::new_device_rgb();
-        unsafe {
-            CGBitmapContextCreate(rgba.as_mut_ptr().cast(), w, h, 8, w * 4, srgb.as_deref(), CGImageAlphaInfo::NoneSkipLast.0)
-        }
-    })
+    // SAFETY: `bgrx` outlives the context, which is released at the end of this function.
+    let context = unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, space.as_deref(), info) }
+        .or_else(|| {
+            let srgb = CGColorSpace::new_device_rgb();
+            unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, srgb.as_deref(), info) }
+        })
     .context("CGBitmapContextCreate failed")?;
     // SAFETY: Create functions return a +1 reference.
     let context = unsafe { CFRetained::from_raw(context) };
     let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w as f64, height: h as f64 } };
     CGContext::draw_image(Some(&context), rect, Some(image));
     drop(context);
-    for px in rgba.as_chunks_mut::<4>().0 {
-        px[3] = 255;
-    }
-    Ok(Image { width: w as u32, height: h as u32, rgba })
+    Ok(Image { width: w as u32, height: h as u32, bgrx })
 }
 
 /// On-screen windows of other apps in front-to-back order, relative to `display`

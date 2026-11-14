@@ -6,11 +6,12 @@ use std::cell::OnceCell;
 use std::ops::Range;
 
 use tiny_skia::{
-    FillRule, FilterQuality, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap, PixmapPaint,
-    SpreadMode, Stroke, Transform,
+    FillRule, FilterQuality, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform,
 };
 
 use crate::geom::{Point, Rect};
+pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
+use crate::pixels::{crop, pixelate, pixmap_from_rgba};
 use crate::shape::{Geometry, Metrics, Shape, arrow_head_len};
 use crate::style::Color;
 
@@ -24,7 +25,7 @@ pub struct Document {
 impl Document {
     /// Wraps opaque RGBA8 pixels. Returns `None` if `rgba` does not match the size.
     pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>, mosaic_block: u32) -> Option<Self> {
-        let image = Pixmap::from_vec(rgba, IntSize::from_wh(width, height)?)?;
+        let image = pixmap_from_rgba(width, height, rgba)?;
         Some(Self { image, mosaic_block: mosaic_block.max(2), mosaic: OnceCell::new() })
     }
 
@@ -50,44 +51,11 @@ impl Document {
     }
 }
 
-fn pixelate(src: &Pixmap, block: u32) -> Pixmap {
-    let (w, h) = (src.width(), src.height());
-    let mut out = src.clone();
-    let stride = w as usize * 4;
-    let data = src.data();
-    let dst = out.data_mut();
-    for by in (0..h).step_by(block as usize) {
-        for bx in (0..w).step_by(block as usize) {
-            let (x1, y1) = ((bx + block).min(w), (by + block).min(h));
-            let mut sum = [0u32; 4];
-            for y in by..y1 {
-                let row = &data[y as usize * stride..];
-                for x in bx..x1 {
-                    let i = x as usize * 4;
-                    for c in 0..4 {
-                        sum[c] += row[i + c] as u32;
-                    }
-                }
-            }
-            let n = (x1 - bx) * (y1 - by);
-            let avg = sum.map(|s| (s / n) as u8);
-            for y in by..y1 {
-                let row = &mut dst[y as usize * stride..];
-                for x in bx..x1 {
-                    let i = x as usize * 4;
-                    row[i..i + 4].copy_from_slice(&avg);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// IME composition underline for a text shape: (shape index, byte range in its content).
+/// IME composition underline for a text shape: (index into the rendered shapes, byte range in its content).
 pub type Underline = (usize, Range<usize>);
 
 /// Renders `shapes` onto a transparent pixmap covering `region` (pixel aligned).
-pub fn render_layer(doc: &Document, region: Rect, shapes: &[Shape], m: Metrics, underline: Option<Underline>) -> Option<Pixmap> {
+pub fn render_layer(doc: &Document, region: Rect, shapes: &[&Shape], m: Metrics, underline: Option<Underline>) -> Option<Pixmap> {
     let mut pixmap = Pixmap::new(region.w as u32, region.h as u32)?;
     draw_shapes(&mut pixmap, doc, shapes, m, Point::new(region.x, region.y), underline);
     Some(pixmap)
@@ -96,20 +64,13 @@ pub fn render_layer(doc: &Document, region: Rect, shapes: &[Shape], m: Metrics, 
 /// The final image: the screenshot cropped to `region` with all shapes drawn on top.
 pub fn export(doc: &Document, region: Rect, shapes: &[Shape], m: Metrics) -> Option<Pixmap> {
     let region = region.round().intersect(&doc.bounds())?;
-    let mut pixmap = Pixmap::new(region.w as u32, region.h as u32)?;
-    pixmap.draw_pixmap(
-        -region.x as i32,
-        -region.y as i32,
-        doc.image().as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
-    draw_shapes(&mut pixmap, doc, shapes, m, Point::new(region.x, region.y), None);
+    let mut pixmap = crop(doc.image(), region.x as u32, region.y as u32, region.w as u32, region.h as u32)?;
+    let shapes: Vec<&Shape> = shapes.iter().collect();
+    draw_shapes(&mut pixmap, doc, &shapes, m, Point::new(region.x, region.y), None);
     Some(pixmap)
 }
 
-fn draw_shapes(pixmap: &mut Pixmap, doc: &Document, shapes: &[Shape], m: Metrics, origin: Point, underline: Option<Underline>) {
+fn draw_shapes(pixmap: &mut Pixmap, doc: &Document, shapes: &[&Shape], m: Metrics, origin: Point, underline: Option<Underline>) {
     let ts = Transform::from_translate(-origin.x, -origin.y);
     for (i, shape) in shapes.iter().enumerate() {
         draw_shape(pixmap, doc, shape, m, ts);
@@ -240,31 +201,6 @@ fn draw_underline(pixmap: &mut Pixmap, shape: &Shape, m: Metrics, range: Range<u
     }
 }
 
-/// Converts premultiplied RGBA to straight-alpha BGRA, the layout most GPU
-/// texture uploads (and gpui) expect.
-pub fn to_bgra_straight(pixmap: &Pixmap) -> Vec<u8> {
-    let mut out = pixmap.data().to_vec();
-    for px in out.as_chunks_mut::<4>().0 {
-        let a = px[3];
-        px.swap(0, 2);
-        if a != 0 && a != 255 {
-            for c in &mut px[..3] {
-                *c = ((*c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
-            }
-        }
-    }
-    out
-}
-
-/// Converts premultiplied RGBA to straight-alpha RGBA (what clipboards and PNG want).
-pub fn to_rgba_straight(pixmap: &Pixmap) -> Vec<u8> {
-    let mut out = to_bgra_straight(pixmap);
-    for px in out.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,19 +238,5 @@ mod tests {
         assert_eq!((px.red(), px.green(), px.blue()), (255, 255, 255));
     }
 
-    #[test]
-    fn pixelate_averages_blocks() {
-        let d = doc(16, 8);
-        let m = d.mosaic();
-        // One 8x8 block per half: black stays black, white stays white.
-        assert_eq!(m.pixel(3, 3).unwrap().red(), 0);
-        assert_eq!(m.pixel(12, 3).unwrap().red(), 255);
-    }
 
-    #[test]
-    fn bgra_conversion_demultiplies() {
-        let mut p = Pixmap::new(1, 1).unwrap();
-        p.data_mut().copy_from_slice(&[64, 0, 0, 128]);
-        assert_eq!(to_bgra_straight(&p), vec![0, 0, 128, 128]);
-    }
 }
