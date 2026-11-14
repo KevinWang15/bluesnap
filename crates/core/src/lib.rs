@@ -7,6 +7,7 @@
 pub mod editor;
 pub mod geom;
 pub mod layout;
+pub mod reading_order;
 pub mod render;
 pub mod shape;
 pub mod style;

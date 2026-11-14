@@ -24,7 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
 };
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform};
+use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine};
 
 pub struct Native;
 
@@ -71,6 +71,12 @@ impl Platform for Native {
         // Allowed because the process just received the hotkey input.
         unsafe { SetForegroundWindow(hwnd) };
         Ok(())
+    }
+
+    /// Windows.Media.Ocr only knows languages whose language pack is installed, and
+    /// its accuracy on CJK is poor, so use the embedded model instead.
+    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
+        crate::recognize_with_model(image)
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {

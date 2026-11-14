@@ -8,13 +8,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bluesnap_core::layout::{place_panels, place_size_label};
-use bluesnap_core::render::to_bgra_straight;
+use bluesnap_core::reading_order::join_lines;
+use bluesnap_core::render::{to_bgra_straight, to_rgba_straight};
 use bluesnap_core::{CursorKind, Editor, Pixmap, Point as Px, Rect as PxRect, RightClick, THEME_BLUE, TextKey};
+use bluesnap_platform::Platform;
 use gpui::{
-    App, Bounds, BorderStyle, Context, Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
+    App, Bounds, BorderStyle, ClipboardItem, Context, Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage,
-    Styled, UTF16Selection, Window, canvas, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
+    SharedString, Styled, Task, UTF16Selection, Window, canvas, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
 use crate::{AppState, output, toolbar};
@@ -42,6 +44,10 @@ pub struct Overlay {
     /// Screenshot pixels per logical pixel.
     scale: f32,
     finished: bool,
+    /// Message shown over the selection (text recognition progress/result).
+    status: Option<SharedString>,
+    /// Running text recognition, if any. Dropping it cancels the UI update.
+    ocr: Option<Task<()>>,
 }
 
 /// Opaque RGBA screenshot pixels as a gpui image (which wants BGRA).
@@ -80,6 +86,8 @@ impl Overlay {
             layer_revision: None,
             scale,
             finished: false,
+            status: None,
+            ocr: None,
         }
     }
 
@@ -145,7 +153,69 @@ impl Overlay {
         }
     }
 
+    pub fn is_recognizing(&self) -> bool {
+        self.ocr.is_some()
+    }
+
+    /// Recognizes the text in the selection (as displayed, so mosaicked text stays
+    /// hidden), copies it to the clipboard and closes the overlay.
+    pub fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ocr.is_some() {
+            return;
+        }
+        let Some(pixmap) = self.editor.export() else { return };
+        let image = bluesnap_platform::Image { width: pixmap.width(), height: pixmap.height(), rgba: to_rgba_straight(&pixmap) };
+        self.status = Some("Recognizing text…".into());
+        let started = std::time::Instant::now();
+        let recognized = cx
+            .background_executor()
+            .spawn(async move { bluesnap_platform::native().recognize_text(&image) });
+        self.ocr = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = recognized.await;
+            log::debug!("text recognition took {:?}", started.elapsed());
+            this.update_in(cx, |this, window, cx| this.text_recognized(result, window, cx)).ok();
+        }));
+    }
+
+    fn text_recognized(
+        &mut self,
+        result: anyhow::Result<Vec<bluesnap_platform::TextLine>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ocr = None;
+        let text = result.map(|lines| {
+            join_lines(
+                lines
+                    .into_iter()
+                    .map(|l| {
+                        let b = l.bounds;
+                        (PxRect::new(b.x as f32, b.y as f32, b.width as f32, b.height as f32), l.text)
+                    })
+                    .collect(),
+            )
+        });
+        match text {
+            Ok(text) if !text.trim().is_empty() => {
+                log::info!("copied {} characters of recognized text", text.chars().count());
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.finished = true;
+                window.remove_window();
+                return;
+            }
+            Ok(_) => self.status = Some("No text found".into()),
+            Err(e) => {
+                log::error!("text recognition failed: {e:#}");
+                self.status = Some("Text recognition failed".into());
+            }
+        }
+        cx.notify();
+    }
+
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ocr.is_none() {
+            self.status = None;
+        }
         let p = self.to_px(ev.position);
         match ev.button {
             MouseButton::Left => {
@@ -288,6 +358,31 @@ impl Render for Overlay {
                     .text_color(white())
                     .text_size(px(12.0))
                     .child(label),
+            );
+        }
+
+        if let (Some(status), Some(sel)) = (&self.status, self.editor.selection()) {
+            let b = self.to_logical(sel);
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(b.origin.x)
+                    .top(b.origin.y)
+                    .w(b.size.width)
+                    .h(b.size.height)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(rgba(0x0000_00CC))
+                            .text_color(white())
+                            .text_size(px(14.0))
+                            .child(status.clone()),
+                    ),
             );
         }
 

@@ -10,6 +10,10 @@ anyhow.workspace = true
 log.workspace = true
 raw-window-handle.workspace = true
 
+# macOS uses the Vision framework instead, so the ~31 MB of models stay out of its build.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+bluesnap-ocr.workspace = true
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -22,7 +26,25 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSError",
+    "NSGeometry",
+    "NSString",
+] }
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNTypes",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",

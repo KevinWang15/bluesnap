@@ -10,6 +10,9 @@ Press the hotkey, then:
 - annotate with rectangle, ellipse, arrow, pen, mosaic and text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
+- the text-extraction button (the "T" in a frame) recognizes the text in the selection,
+  copies it to the clipboard as plain text and closes. Mosaicked areas stay unreadable
+  because recognition runs on the image as shown.
 - ✓ (or Enter, Ctrl/Cmd+C, double-click) copies to the clipboard, the download icon
   (or Ctrl/Cmd+S) saves a PNG, ✕ (or Esc) cancels. Right-click goes back to window
   picking, or exits when nothing is selected.
@@ -29,9 +32,16 @@ crates/
               windows.rs  GDI capture, EnumWindows + DWM window bounds, topmost overlay
               macos.rs    CoreGraphics capture and window list, AppKit overlay setup
               linux.rs    stub (builds, capture returns an error)
+  ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
   app/        bluesnap: the GPUI frontend. Hotkey, overlay window, toolbar, clipboard, save.
 third_party/xattr   patched copy of a gpui dependency (see below)
 ```
+
+Text recognition is per OS: macOS uses the built-in Vision framework (Simplified and
+Traditional Chinese plus English), Windows uses the embedded PP-OCRv6 small model
+(Simplified/Traditional Chinese, English, Japanese and 46 Latin-script languages).
+The models are only compiled into non-macOS builds; they add about 38 MB to the
+binary (about 28 MB compressed).
 
 The capture happens before the overlay window opens. The overlay shows the frozen
 screenshot, so the image is exactly what was on screen when the hotkey was pressed.

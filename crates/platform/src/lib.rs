@@ -44,6 +44,12 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// A line of recognized text and where it is, in image pixels.
+pub struct TextLine {
+    pub text: String,
+    pub bounds: PixelRect,
+}
+
 pub struct Capture {
     pub display: DisplayInfo,
     pub image: Image,
@@ -66,9 +72,26 @@ pub trait Platform {
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
+    /// Recognizes text in `image`. Blocking; call it off the UI thread.
+    /// Lines come back in no particular order.
+    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>>;
+
     /// Font files for text annotations, best first. CJK-capable fonts are listed
     /// early so mixed-script text renders without tofu.
     fn font_paths(&self) -> Vec<PathBuf>;
+}
+
+/// The embedded PP-OCRv6 engine, for OSes without a good built-in OCR API.
+#[cfg(not(target_os = "macos"))]
+fn recognize_with_model(image: &Image) -> anyhow::Result<Vec<TextLine>> {
+    let lines = bluesnap_ocr::recognize(image.width, image.height, &image.rgba)?;
+    Ok(lines
+        .into_iter()
+        .map(|l| TextLine {
+            text: l.text,
+            bounds: PixelRect { x: l.x as i32, y: l.y as i32, width: l.width as i32, height: l.height as i32 },
+        })
+        .collect())
 }
 
 #[cfg(target_os = "windows")]

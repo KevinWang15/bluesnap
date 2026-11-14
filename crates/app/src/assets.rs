@@ -14,7 +14,7 @@ macro_rules! icons {
     };
 }
 
-icons!["rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "save", "cancel", "done"];
+icons!["rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "ocr", "save", "cancel", "done"];
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {

@@ -6,18 +6,21 @@ use std::ptr::NonNull;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use objc2::MainThreadMarker;
+use objc2::rc::Retained;
+use objc2::{AllocAnyThread, MainThreadMarker};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSView, NSWindowStyleMask};
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGColorSpace, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
+    CGBitmapContextCreateImage, CGColorSpace, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
     CGImageAlphaInfo, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
     kCGWindowLayer, kCGWindowOwnerPID,
 };
+use objc2_foundation::{NSArray, NSDictionary, NSString};
+use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform};
+use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine};
 
 pub struct Native;
 
@@ -102,6 +105,11 @@ impl Platform for Native {
         Ok(())
     }
 
+    /// Apple's Vision framework: no bundled model, and good at Chinese.
+    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
+        objc2::rc::autoreleasepool(|_| recognize_with_vision(image))
+    }
+
     fn font_paths(&self) -> Vec<PathBuf> {
         [
             "/System/Library/Fonts/Helvetica.ttc",
@@ -129,6 +137,52 @@ unsafe extern "C" {
         space: Option<&CGColorSpace>,
         bitmap_info: u32,
     ) -> Option<NonNull<CGContext>>;
+}
+
+fn recognize_with_vision(image: &Image) -> anyhow::Result<Vec<TextLine>> {
+    let (w, h) = (image.width as usize, image.height as usize);
+    let mut rgba = image.rgba.clone();
+    let space = CGColorSpace::new_device_rgb();
+    // SAFETY: `rgba` outlives the context; the CGImage made from it is a copy.
+    let context = unsafe {
+        CGBitmapContextCreate(rgba.as_mut_ptr().cast(), w, h, 8, w * 4, space.as_deref(), CGImageAlphaInfo::NoneSkipLast.0)
+    }
+    .context("CGBitmapContextCreate failed")?;
+    let context = unsafe { CFRetained::from_raw(context) };
+    let cg_image = CGBitmapContextCreateImage(Some(&context)).context("CGBitmapContextCreateImage failed")?;
+    drop(context);
+
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+    // Chinese can only be combined with English in Vision; listing Chinese first
+    // makes it the priority, and its model reads Latin text too.
+    let languages = ["zh-Hans", "zh-Hant", "en-US"].map(NSString::from_str);
+    request.setRecognitionLanguages(&NSArray::from_retained_slice(&languages));
+
+    let handler = unsafe {
+        VNImageRequestHandler::initWithCGImage_options(VNImageRequestHandler::alloc(), &cg_image, &NSDictionary::new())
+    };
+    let requests: Retained<NSArray<VNRequest>> = NSArray::from_slice(&[&**request]);
+    handler.performRequests_error(&requests).map_err(|e| anyhow::anyhow!("Vision: {}", e.localizedDescription()))?;
+
+    let mut lines = Vec::new();
+    for observation in request.results().iter().flat_map(|r| r.iter()) {
+        let Some(best) = observation.topCandidates(1).firstObject() else { continue };
+        // Normalized coordinates with a bottom-left origin.
+        let b = unsafe { observation.boundingBox() };
+        let (x, y) = (b.origin.x * w as f64, (1.0 - b.origin.y - b.size.height) * h as f64);
+        lines.push(TextLine {
+            text: best.string().to_string(),
+            bounds: PixelRect {
+                x: x as i32,
+                y: y as i32,
+                width: (b.size.width * w as f64) as i32,
+                height: (b.size.height * h as f64) as i32,
+            },
+        });
+    }
+    Ok(lines)
 }
 
 /// Draws `image` into an RGBX buffer we own. Using the image's own color space

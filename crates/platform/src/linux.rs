@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use raw_window_handle::HasWindowHandle;
 
-use crate::{Capture, DisplayInfo, Platform};
+use crate::{Capture, DisplayInfo, Image, Platform, TextLine};
 
 pub struct Native;
 
@@ -27,6 +27,10 @@ impl Platform for Native {
 
     fn configure_overlay(&self, _window: &dyn HasWindowHandle, _display: &DisplayInfo) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn recognize_text(&self, image: &Image) -> anyhow::Result<Vec<TextLine>> {
+        crate::recognize_with_model(image)
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {

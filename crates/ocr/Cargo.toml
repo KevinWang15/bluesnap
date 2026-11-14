@@ -1,0 +1,14 @@
+[package]
+name = "bluesnap-ocr"
+description = "Embedded PP-OCRv6 text recognition, for platforms without a built-in OCR engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image = { version = "0.25", default-features = false }
+pure-onnx-ocr = "0.3.2"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

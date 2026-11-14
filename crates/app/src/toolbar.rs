@@ -24,9 +24,9 @@ const TOOLS: [(Tool, &str); 6] = [
     (Tool::Text, "icons/text.svg"),
 ];
 
-/// Logical size of the toolbar: 6 tools | undo | save, cancel, done.
+/// Logical size of the toolbar: 6 tools | undo | extract text, save, cancel, done.
 pub fn toolbar_size() -> (f32, f32) {
-    let buttons = 10.0;
+    let buttons = 11.0;
     let children = buttons + 2.0;
     (2.0 * PAD + buttons * BUTTON + 2.0 * SEP + (children - 1.0) * GAP, 2.0 * PAD + BUTTON)
 }
@@ -114,6 +114,10 @@ pub fn toolbar(this: &Overlay, x: f32, y: f32, cx: &mut Context<Overlay>) -> Any
             ),
         )
         .child(separator())
+        .child(
+            icon_button("icons/ocr.svg", if this.is_recognizing() { blue } else { normal }, this.is_recognizing())
+                .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.extract_text(w, cx))),
+        )
         .child(
             icon_button("icons/save.svg", normal, false)
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.finish(Finish::Save, w, cx))),

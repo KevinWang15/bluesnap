@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/platform", "crates/app"]
+members = ["crates/core", "crates/platform", "crates/ocr", "crates/app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 bluesnap-core = { path = "crates/core" }
 bluesnap-platform = { path = "crates/platform" }
+bluesnap-ocr = { path = "crates/ocr" }
 anyhow = "1"
 log = "0.4"
 raw-window-handle = "0.6"
@@ -24,6 +25,15 @@ opt-level = 3
 opt-level = 2
 [profile.dev.package.bluesnap-platform]
 opt-level = 2
+# Neural network inference is unusably slow without optimizations.
+[profile.dev.package.tract-core]
+opt-level = 3
+[profile.dev.package.tract-linalg]
+opt-level = 3
+[profile.dev.package.tract-onnx]
+opt-level = 3
+[profile.dev.package.pure-onnx-ocr]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
