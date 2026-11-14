@@ -20,8 +20,9 @@ Press the hotkey, then:
   frames into one tall image. Sticky headers and footers appear once. Done (or the
   hotkey again) copies it, Save writes a PNG, ✕ cancels. Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
-  scrolling back a little picks it up again. Annotations aren't carried over, and
-  the image stops at 30,000 px.
+  scrolling back a little picks it up again. Only the part that scrolls ends up in
+  the image: fixed side panels and scrollbars (including macOS overlay scrollbars)
+  are left out. Annotations aren't carried over, and the image stops at 30,000 px.
 - ✓ (or Enter, Ctrl/Cmd+C, double-click) copies to the clipboard, the download icon
   (or Ctrl/Cmd+S) saves a PNG, ✕ (or Esc) cancels. Right-click goes back to window
   picking, or exits when nothing is selected.
