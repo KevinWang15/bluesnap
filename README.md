@@ -10,12 +10,16 @@ Press the hotkey, then:
 - annotate with rectangle, ellipse, arrow, pen, mosaic and text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
-- the text-extraction button (the "T" in a frame) recognizes the text in the selection,
+- the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
   copies it to the clipboard as plain text and closes. Mosaicked areas stay unreadable
   because recognition runs on the image as shown.
 - ✓ (or Enter, Ctrl/Cmd+C, double-click) copies to the clipboard, the download icon
   (or Ctrl/Cmd+S) saves a PNG, ✕ (or Esc) cancels. Right-click goes back to window
   picking, or exits when nothing is selected.
+
+bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
+Take Screenshot, Edit Settings… and Quit; on Windows, left-clicking the tray icon
+also takes a screenshot.
 
 Default hotkey: **Ctrl+Alt+A** on Windows, **Option+Cmd+A** on macOS. It is set in
 `config.toml`, created on first run in the OS config directory
@@ -34,6 +38,7 @@ crates/
               linux.rs    stub (builds, capture returns an error)
   ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
   app/        bluesnap: the GPUI frontend. Hotkey, overlay window, toolbar, clipboard, save.
+packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
 third_party/xattr   patched copy of a gpui dependency (see below)
 ```
 
@@ -57,9 +62,28 @@ cargo run --release -p bluesnap
 
 - **Windows**: MSVC toolchain. Release builds of gpui compile shaders with `fxc.exe`
   from the Windows SDK (set `GPUI_FXC_PATH` if it isn't found).
-- **macOS**: Xcode (gpui compiles Metal shaders). On first capture macOS asks for
-  Screen Recording permission; until it's granted captures contain only the wallpaper.
-  The app runs without a Dock icon.
+- **macOS**: Xcode (gpui compiles Metal shaders). CI builds `bluesnap.app`
+  (menu bar app, no Dock icon) and uploads it zipped.
+
+### macOS Screen Recording permission
+
+macOS shows only the wallpaper (or plain gray) in place of windows until bluesnap
+has Screen Recording permission, and on macOS 15+ it ignores that permission for
+unsigned or ad-hoc signed apps. bluesnap shows a banner with an "Open Settings"
+button when the permission is missing. To make the permission stick, sign the app
+with a real identity:
+
+- CI: add the repository secrets `MACOS_CERTIFICATE_P12` (base64 of a `.p12` with a
+  "Developer ID Application" or "Apple Development" certificate and its key),
+  `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY` (e.g.
+  `Developer ID Application: Your Name (TEAMID)`).
+- Locally: create an "Apple Development" certificate (a free Apple ID works:
+  Xcode → Settings → Accounts → Manage Certificates → +), then
+  `codesign --force --sign "Apple Development: you@example.com (TEAMID)" bluesnap.app`.
+
+Then open the app, enable it under System Settings → Privacy & Security → Screen &
+System Audio Recording, and restart it from the menu bar icon (Quit, then reopen).
+If an old entry gets in the way: `tccutil reset ScreenCapture com.kevinwang15.bluesnap`.
 - **Linux**: builds for development (needs `libxkbcommon-x11-dev` and friends), but
   capturing isn't implemented.
 
@@ -93,7 +117,6 @@ on first use. While warm it holds several hundred MB, so it unloads after a minu
 ## Known limitations
 
 - Only the display under the cursor is captured.
-- No tray icon; quit by ending the process.
 - macOS capture uses `CGDisplayCreateImage`, which Apple deprecated in favor of
   ScreenCaptureKit (much slower for a single frame). If a future macOS removes it,
   `macos.rs` is the only file to change.

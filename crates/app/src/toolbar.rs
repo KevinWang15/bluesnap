@@ -2,8 +2,9 @@
 
 use bluesnap_core::{Color, PALETTE, SizeLevel, THEME_BLUE, Tool};
 use gpui::{
-    AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Styled, Window, div, prelude::FluentBuilder, px, rgb, rgba, svg,
+    AnyElement, AnyView, App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px, rgb, rgba, svg, white,
 };
 
 use crate::overlay::{Finish, Overlay};
@@ -15,14 +16,34 @@ const BUTTON: f32 = 32.0;
 const ICON: f32 = 20.0;
 const STYLE_BUTTON: f32 = 24.0;
 
-const TOOLS: [(Tool, &str); 6] = [
-    (Tool::Rect, "icons/rect.svg"),
-    (Tool::Ellipse, "icons/ellipse.svg"),
-    (Tool::Arrow, "icons/arrow.svg"),
-    (Tool::Pen, "icons/pen.svg"),
-    (Tool::Mosaic, "icons/mosaic.svg"),
-    (Tool::Text, "icons/text.svg"),
+const TOOLS: [(Tool, &str, &str); 6] = [
+    (Tool::Rect, "icons/rect.svg", "Rectangle"),
+    (Tool::Ellipse, "icons/ellipse.svg", "Ellipse"),
+    (Tool::Arrow, "icons/arrow.svg", "Arrow"),
+    (Tool::Pen, "icons/pen.svg", "Pen"),
+    (Tool::Mosaic, "icons/mosaic.svg", "Mosaic"),
+    (Tool::Text, "icons/text.svg", "Text"),
 ];
+
+/// Hover label for a toolbar button.
+struct Tooltip(SharedString);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .bg(rgba(0x0000_00E0))
+            .text_color(white())
+            .text_size(px(12.0))
+            .child(self.0.clone())
+    }
+}
+
+fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_, cx| cx.new(|_| Tooltip(text.into())).into()
+}
 
 /// Logical size of the toolbar: 6 tools | undo | extract text, save, cancel, done.
 pub fn toolbar_size() -> (f32, f32) {
@@ -66,8 +87,10 @@ fn separator() -> Div {
     div().w(px(1.0)).h(px(20.0)).mx(px(4.0)).bg(rgba(0x0000_0022))
 }
 
-fn icon_button(icon: &'static str, color: Hsla, active: bool) -> Div {
+fn icon_button(icon: &'static str, label: &'static str, color: Hsla, active: bool) -> Stateful<Div> {
     div()
+        .id(label)
+        .tooltip(tooltip(label))
         .size(px(BUTTON))
         .flex()
         .items_center()
@@ -97,16 +120,16 @@ pub fn toolbar(this: &Overlay, x: f32, y: f32, cx: &mut Context<Overlay>) -> Any
     let disabled = hsla(Color::rgb(0xBBBBBB));
 
     let mut bar = panel(w, h).left(px(x)).top(px(y));
-    for (tool, icon) in TOOLS {
+    for (tool, icon, label) in TOOLS {
         let active = editor.tool() == Some(tool);
         bar = bar.child(
-            icon_button(icon, if active { blue } else { normal }, active)
+            icon_button(icon, label, if active { blue } else { normal }, active)
                 .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().toggle_tool(tool))),
         );
     }
     bar.child(separator())
         .child(
-            icon_button("icons/undo.svg", if editor.can_undo() { normal } else { disabled }, false).on_mouse_down(
+            icon_button("icons/undo.svg", "Undo", if editor.can_undo() { normal } else { disabled }, false).on_mouse_down(
                 MouseButton::Left,
                 on_press(cx, |this, _, _| {
                     this.editor_mut().undo();
@@ -115,19 +138,24 @@ pub fn toolbar(this: &Overlay, x: f32, y: f32, cx: &mut Context<Overlay>) -> Any
         )
         .child(separator())
         .child(
-            icon_button("icons/ocr.svg", if this.is_recognizing() { blue } else { normal }, this.is_recognizing())
+            icon_button(
+                "icons/ocr.svg",
+                "To text: copy the text in the selection",
+                if this.is_recognizing() { blue } else { normal },
+                this.is_recognizing(),
+            )
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.extract_text(w, cx))),
         )
         .child(
-            icon_button("icons/save.svg", normal, false)
+            icon_button("icons/save.svg", "Save", normal, false)
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.finish(Finish::Save, w, cx))),
         )
         .child(
-            icon_button("icons/cancel.svg", hsla(Color::rgb(0xF5222D)), false)
+            icon_button("icons/cancel.svg", "Cancel (Esc)", hsla(Color::rgb(0xF5222D)), false)
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.finish(Finish::Cancel, w, cx))),
         )
         .child(
-            icon_button("icons/done.svg", blue, false)
+            icon_button("icons/done.svg", "Copy (Enter)", blue, false)
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, w, cx| this.finish(Finish::Copy, w, cx))),
         )
         .into_any_element()

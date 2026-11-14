@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use anyhow::bail;
 use raw_window_handle::HasWindowHandle;
 
-use crate::{Capture, DisplayInfo, Platform, TextLine};
+use crate::{Capture, DisplayInfo, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
+    const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
         Ok(())
@@ -27,6 +28,14 @@ impl Platform for Native {
 
     fn configure_overlay(&self, _window: &dyn HasWindowHandle, _display: &DisplayInfo) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn create_tray(&self, _hotkey: &str, _on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
+        bail!("tray icon is not implemented on Linux yet")
+    }
+
+    fn permission_settings_url(&self) -> Option<&'static str> {
+        None
     }
 
     fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {

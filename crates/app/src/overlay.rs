@@ -49,6 +49,8 @@ pub struct Overlay {
     status: Option<SharedString>,
     /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
+    /// Set when the OS withheld window contents; where to grant the permission.
+    permission_url: Option<&'static str>,
 }
 
 /// Opaque BGRA screenshot pixels as a gpui image (gpui's native layout, so no copy).
@@ -83,12 +85,52 @@ impl Layer {
     }
 }
 
+/// Shown when macOS returned a capture without window contents.
+fn permission_banner(url: &'static str, cx: &mut Context<Overlay>) -> impl IntoElement {
+    div().absolute().top(px(16.0)).left_0().right_0().flex().justify_center().child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(14.0))
+            .py(px(10.0))
+            .rounded(px(8.0))
+            .bg(rgba(0x0000_00E0))
+            .text_color(white())
+            .text_size(px(13.0))
+            .occlude()
+            .child("bluesnap needs Screen Recording permission to capture windows. Grant it, then restart bluesnap.")
+            .child(
+                div()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .bg(color(THEME_BLUE))
+                    .cursor_pointer()
+                    .child("Open Settings")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(url);
+                            this.finish(Finish::Cancel, window, cx);
+                        }),
+                    ),
+            ),
+    )
+}
+
 fn color(c: bluesnap_core::Color) -> Hsla {
     rgb(c.to_hex()).into()
 }
 
 impl Overlay {
-    pub fn new(editor: Editor, background: Arc<RenderImage>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        editor: Editor,
+        background: Arc<RenderImage>,
+        permission_url: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // However the window goes away (including OS-initiated closes), allow the next capture.
         cx.on_release(|_, cx| {
             log::debug!("overlay closed");
@@ -106,6 +148,7 @@ impl Overlay {
             finished: false,
             status: None,
             ocr: None,
+            permission_url,
         }
     }
 
@@ -299,10 +342,12 @@ impl Overlay {
             _ => Vec::new(),
         };
         let to_point = |p: Px| point(px(p.x / self.scale), px(p.y / self.scale));
+        let screen = self.to_logical(e.screen());
         Scene {
             entity,
             focus: self.focus.clone(),
             background: self.background.clone(),
+            background_size: screen.size,
             layers: [&self.static_layer, &self.active_layer]
                 .into_iter()
                 .filter_map(|l| l.image.as_ref().map(|(r, img)| (self.to_logical(*r), img.clone())))
@@ -335,8 +380,10 @@ impl Overlay {
 
 impl Render for Overlay {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let viewport = window.viewport_size();
-        self.scale = self.editor.screen().w / f32::from(viewport.width).max(1.0);
+        // Device pixels per logical pixel. The screenshot is drawn 1:1 in device
+        // pixels from the window origin, so it is never resampled, even if the
+        // window ends up a little larger or smaller than the display.
+        self.scale = window.scale_factor();
         self.sync_layers(window);
 
         let scene = self.scene(cx.entity());
@@ -371,6 +418,10 @@ impl Render for Overlay {
                     .text_size(px(12.0))
                     .child(label),
             );
+        }
+
+        if let Some(url) = self.permission_url {
+            root = root.child(permission_banner(url, cx));
         }
 
         if let (Some(status), Some(sel)) = (&self.status, self.editor.selection()) {
@@ -421,6 +472,7 @@ struct Scene {
     entity: Entity<Overlay>,
     focus: FocusHandle,
     background: Arc<RenderImage>,
+    background_size: gpui::Size<Pixels>,
     /// Annotation layers, bottom to top, and the selection they are clipped to.
     layers: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
     clip: Option<Bounds<Pixels>>,
@@ -436,7 +488,8 @@ struct Scene {
 impl Scene {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let blue = color(THEME_BLUE);
-        window.paint_image(bounds, Corners::default(), self.background.clone(), 0, false).ok();
+        let screen = Bounds::new(bounds.origin, self.background_size);
+        window.paint_image(screen, Corners::default(), self.background.clone(), 0, false).ok();
 
         // Dim everything outside the highlighted region.
         let dim = rgba(0x0000_0073);

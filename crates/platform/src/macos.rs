@@ -20,13 +20,14 @@ use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine};
+use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
 impl Platform for Native {
     /// Option+Command+A: the Windows default with Command in place of Control.
     const DEFAULT_HOTKEY: &'static str = "Alt+Cmd+A";
+    const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
         let mtm = MainThreadMarker::new().context("init must run on the main thread")?;
@@ -68,6 +69,9 @@ impl Platform for Native {
             scale_factor: scale as f32,
         };
         let windows = visible_windows(&bounds, scale);
+        // Without Screen Recording permission macOS still returns an image, but
+        // with only the wallpaper (or plain gray) where windows should be.
+        let permission_missing = !CGPreflightScreenCaptureAccess();
         log::debug!(
             "captured {}x{} in {:?}, {} windows in {:?}",
             image.width,
@@ -76,7 +80,7 @@ impl Platform for Native {
             windows.len(),
             started.elapsed() - captured
         );
-        Ok(Capture { display, image, windows })
+        Ok(Capture { display, image, windows, permission_missing })
     }
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
@@ -103,6 +107,19 @@ impl Platform for Native {
         ns_window.setFrame_display(frame, true);
         ns_window.makeKeyAndOrderFront(None);
         Ok(())
+    }
+
+    fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
+        let style = crate::tray::Style {
+            icon_png: include_bytes!("../assets/tray-macos-template-36.png"),
+            template: true,
+            left_click_captures: false,
+        };
+        crate::tray::create(style, hotkey, on_command)
+    }
+
+    fn permission_settings_url(&self) -> Option<&'static str> {
+        Some("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     }
 
     /// Apple's Vision framework: no bundled model, and good at Chinese.

@@ -57,11 +57,32 @@ pub struct Capture {
     pub image: Image,
     /// Visible top-level windows on that display, topmost first, clipped to it.
     pub windows: Vec<PixelRect>,
+    /// The OS withheld window contents (macOS Screen Recording permission), so
+    /// the image likely shows only the desktop. The UI should say so.
+    pub permission_missing: bool,
 }
+
+/// Commands from the tray / menu bar icon's menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrayCommand {
+    Capture,
+    EditSettings,
+    Quit,
+}
+
+/// Keeps the tray / menu bar icon alive; dropping it removes the icon.
+pub struct Tray(#[allow(dead_code)] Box<dyn std::any::Any>);
 
 pub trait Platform {
     /// Hotkey used when the config file doesn't set one, in `global-hotkey` syntax.
     const DEFAULT_HOTKEY: &'static str;
+
+    /// Whether the overlay should be opened in gpui's fullscreen mode. On Windows
+    /// that is a borderless window exactly covering the monitor; a regular
+    /// frameless window there keeps invisible resize borders, which shrink the
+    /// client area and would scale the screenshot. On macOS fullscreen means a
+    /// separate Space with an animation, so the overlay is sized by hand instead.
+    const OVERLAY_FULLSCREEN: bool;
 
     /// One-time setup once the UI event loop is running (permissions, app policy).
     fn init(&self) -> anyhow::Result<()>;
@@ -73,6 +94,12 @@ pub trait Platform {
     /// Turns a freshly opened window into the capture overlay: exactly covering
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
+
+    /// Adds the tray (Windows) or menu bar (macOS) icon. `hotkey` is shown in its menu.
+    fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray>;
+
+    /// Where the user grants the permission behind [`Capture::permission_missing`].
+    fn permission_settings_url(&self) -> Option<&'static str>;
 
     /// Recognizes text in straight-alpha RGBA pixels. Blocking; call it off the
     /// UI thread. Lines come back in no particular order.
@@ -95,6 +122,9 @@ fn recognize_with_model(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<
         })
         .collect())
 }
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+mod tray;
 
 #[cfg(target_os = "windows")]
 mod windows;

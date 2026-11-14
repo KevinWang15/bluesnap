@@ -21,15 +21,16 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
 };
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine};
+use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
+    const OVERLAY_FULLSCREEN: bool = true;
 
     fn init(&self) -> anyhow::Result<()> {
         Ok(())
@@ -51,26 +52,28 @@ impl Platform for Native {
             bail!("not a Win32 window");
         };
         let hwnd = handle.hwnd.get() as HWND;
-        let b = display.bounds;
-        // Exact physical placement (gpui positions in logical pixels, which can be off
-        // by a pixel after rounding) and always-on-top, above the taskbar.
-        let ok = unsafe {
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                b.x as i32,
-                b.y as i32,
-                b.width as i32,
-                b.height as i32,
-                SWP_SHOWWINDOW,
-            )
-        };
+        let _ = display; // gpui's fullscreen mode already covers exactly this monitor.
+        // Always on top, above the taskbar. Position and size stay as gpui set them.
+        let ok = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) };
         if ok == FALSE {
             bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
         }
         // Allowed because the process just received the hotkey input.
         unsafe { SetForegroundWindow(hwnd) };
         Ok(())
+    }
+
+    fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
+        let style = crate::tray::Style {
+            icon_png: include_bytes!("../assets/tray-windows-32.png"),
+            template: false,
+            left_click_captures: true,
+        };
+        crate::tray::create(style, hotkey, on_command)
+    }
+
+    fn permission_settings_url(&self) -> Option<&'static str> {
+        None
     }
 
     /// Windows.Media.Ocr only knows languages whose language pack is installed, and
@@ -121,7 +124,7 @@ fn capture_under_cursor() -> anyhow::Result<Capture> {
         windows.len(),
         started.elapsed() - captured
     );
-    Ok(Capture { display, image, windows })
+    Ok(Capture { display, image, windows, permission_missing: false })
 }
 
 /// gpui identifies monitors by their position in `EnumDisplayMonitors` order.
