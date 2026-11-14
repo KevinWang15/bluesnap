@@ -1,0 +1,208 @@
+//! bluesnap: press the hotkey, pick a window or drag a region, annotate, copy or save.
+
+// No console window on Windows release builds.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod assets;
+mod config;
+mod output;
+mod overlay;
+mod toolbar;
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::Context as _;
+use bluesnap_core::{Document, Editor, FontSet, Rect};
+use bluesnap_platform::Platform;
+use futures::StreamExt;
+use global_hotkey::hotkey::HotKey;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use gpui::{
+    AnyWindowHandle, App, AppContext, Application, Bounds, Context, Global, IntoElement, ParentElement, Render,
+    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, size,
+};
+
+use crate::config::Config;
+use crate::overlay::Overlay;
+
+pub struct AppState {
+    pub config: Config,
+    fonts: Arc<FontSet>,
+    /// The open capture overlay, if any. Cleared when its view is released.
+    pub overlay: Option<AnyWindowHandle>,
+    /// Unregisters the hotkey when dropped, so it must live as long as the app.
+    _hotkeys: GlobalHotKeyManager,
+}
+
+impl Global for AppState {}
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let config = Config::load();
+
+    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+        let platform = bluesnap_platform::native();
+        if let Err(e) = platform.init() {
+            log::error!("platform setup failed: {e:#}");
+        }
+        open_keepalive_window(cx);
+
+        let hotkeys = match register_hotkey(&config.hotkey, cx) {
+            Ok(manager) => manager,
+            Err(e) => {
+                let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
+                return show_fatal_error(format!("{e:#}\n\nChange `hotkey` in {path} and restart."), cx);
+            }
+        };
+        log::info!("ready: press {} to capture", config.hotkey);
+
+        // Loading fonts reads a few MB from disk; do it once, up front.
+        let fonts = Arc::new(FontSet::load(&platform.font_paths()));
+        if fonts.is_empty() {
+            log::warn!("no usable font found; text annotations will be invisible");
+        }
+        cx.set_global(AppState { config, fonts, overlay: None, _hotkeys: hotkeys });
+    });
+}
+
+/// gpui quits on Windows when its last window closes. An invisible window keeps
+/// the app alive between captures.
+fn open_keepalive_window(cx: &mut App) {
+    struct Empty;
+    impl Render for Empty {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.), px(0.)), size(px(1.), px(1.))))),
+        titlebar: None,
+        focus: false,
+        show: false,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
+    };
+    if let Err(e) = cx.open_window(options, |_, cx| cx.new(|_| Empty)) {
+        log::error!("could not open keep-alive window: {e:#}");
+    }
+}
+
+fn register_hotkey(spec: &str, cx: &mut App) -> anyhow::Result<GlobalHotKeyManager> {
+    let hotkey: HotKey = spec.parse().with_context(|| format!("invalid hotkey {spec:?}"))?;
+    let manager = GlobalHotKeyManager::new().context("global hotkeys unavailable")?;
+    manager
+        .register(hotkey)
+        .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
+
+    // The handler runs inside the OS event dispatch; hop onto a gpui task.
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        tx.unbounded_send(event).ok();
+    }));
+    let id = hotkey.id();
+    cx.spawn(async move |cx| {
+        while let Some(event) = rx.next().await {
+            if event.id == id && event.state == HotKeyState::Pressed {
+                cx.update(start_capture).ok();
+            }
+        }
+    })
+    .detach();
+    Ok(manager)
+}
+
+fn start_capture(cx: &mut App) {
+    if cx.global::<AppState>().overlay.is_some() {
+        log::debug!("hotkey ignored: a capture is already open");
+        return;
+    }
+    if let Err(e) = open_overlay(cx) {
+        log::error!("capture failed: {e:#}");
+    }
+}
+
+fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let platform = bluesnap_platform::native();
+    let capture = platform.capture_display_under_cursor()?;
+    let captured = started.elapsed();
+
+    let display = cx
+        .displays()
+        .into_iter()
+        .find(|d| u32::from(d.id()) == capture.display.id)
+        .context("captured display not known to gpui")?;
+
+    let image = &capture.image;
+    let background = Arc::new(
+        overlay::background_image(image.width, image.height, &image.rgba).context("bad capture buffer")?,
+    );
+    let scale = image.width as f32 / f32::from(display.bounds().size.width);
+    let mosaic_block = (8.0 * scale).round() as u32;
+    let windows = capture
+        .windows
+        .iter()
+        .map(|w| Rect::new(w.x as f32, w.y as f32, w.width as f32, w.height as f32))
+        .collect();
+    let doc = Document::from_rgba(image.width, image.height, capture.image.rgba, mosaic_block)
+        .context("bad capture buffer")?;
+    let fonts = cx.global::<AppState>().fonts.clone();
+    let editor = Editor::new(doc, fonts, windows, scale);
+
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(display.bounds())),
+        titlebar: None,
+        focus: true,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        display_id: Some(display.id()),
+        window_background: WindowBackgroundAppearance::Opaque,
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| Overlay::new(editor, background, cx)))?;
+    handle.update(cx, |view, window, _| {
+        if let Err(e) = platform.configure_overlay(window, &capture.display) {
+            log::warn!("overlay setup: {e:#}");
+        }
+        window.focus(view.focus_handle());
+        window.activate_window();
+    })?;
+    cx.global_mut::<AppState>().overlay = Some(handle.into());
+    log::debug!("capture {:?}, overlay open after {:?}", captured, started.elapsed());
+    Ok(())
+}
+
+/// The app can't do anything without its hotkey: explain why in a window, then quit.
+fn show_fatal_error(message: String, cx: &mut App) {
+    log::error!("{message}");
+    struct ErrorView(String);
+    impl Render for ErrorView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .p(px(20.))
+                .bg(rgb(0xFFFFFF))
+                .text_color(rgb(0x222222))
+                .text_size(px(14.))
+                .child(self.0.clone())
+        }
+    }
+    let bounds = Bounds::centered(None, size(px(520.), px(200.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(gpui::TitlebarOptions { title: Some("bluesnap".into()), ..Default::default() }),
+        ..Default::default()
+    };
+    if cx.open_window(options, |_, cx| cx.new(|_| ErrorView(message))).is_err() {
+        cx.quit();
+        return;
+    }
+    cx.on_window_closed(|cx| cx.quit()).detach();
+}

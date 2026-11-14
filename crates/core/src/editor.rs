@@ -1,0 +1,803 @@
+//! The capture session state machine: window picking, selection editing and
+//! annotation editing. Frontends feed it pointer/keyboard input in screenshot
+//! pixel coordinates and draw what it reports.
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use tiny_skia::Pixmap;
+
+use crate::geom::{CursorKind, Handle, Point, Rect};
+use crate::render::{self, Document};
+use crate::shape::{EditHandle, Geometry, Metrics, Shape};
+use crate::style::{Color, SizeLevel, Style, Tool};
+use crate::text::FontSet;
+
+/// Movement (in logical pixels) before a press turns into a drag.
+const DRAG_THRESHOLD: f32 = 3.0;
+/// Hit radius (in logical pixels) of the selection's and shapes' resize handles.
+const HANDLE_HIT_RADIUS: f32 = 8.0;
+/// Pointer samples closer than this (in logical pixels) are dropped from strokes.
+const MIN_STROKE_STEP: f32 = 1.5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextKey {
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Newline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RightClick {
+    /// Nothing selected yet: the frontend should end the capture.
+    Exit,
+    Handled,
+}
+
+#[derive(Clone, Debug)]
+enum Drag {
+    /// Press while picking: becomes a manual selection once the pointer moves.
+    Pick { start: Point, moved: bool },
+    SelResize { handle: Handle, orig: Rect, start: Point },
+    SelMove { orig: Rect, start: Point },
+    Create { idx: usize, start: Point },
+    ShapeMove { idx: usize, orig: Shape, start: Point, moved: bool },
+    ShapeHandle { idx: usize, handle: EditHandle, orig: Shape, start: Point },
+}
+
+#[derive(Clone, Debug)]
+struct TextEdit {
+    idx: usize,
+    caret: usize,
+    marked: Option<Range<usize>>,
+}
+
+pub struct Editor {
+    doc: Document,
+    fonts: Arc<FontSet>,
+    scale: f32,
+    /// Candidate window rectangles, topmost first.
+    windows: Vec<Rect>,
+    pointer: Point,
+    hover: Option<Rect>,
+    selection: Option<Rect>,
+    drag: Option<Drag>,
+    shapes: Vec<Shape>,
+    /// Snapshots of `shapes` taken before each change, for undo.
+    history: Vec<Vec<Shape>>,
+    selected: Option<usize>,
+    tool: Option<Tool>,
+    styles: [Style; Tool::ALL.len()],
+    text: Option<TextEdit>,
+    revision: u64,
+}
+
+impl Editor {
+    /// `scale` is screenshot pixels per logical pixel (the display's scale factor).
+    pub fn new(doc: Document, fonts: Arc<FontSet>, windows: Vec<Rect>, scale: f32) -> Self {
+        let bounds = doc.bounds();
+        let windows = windows.iter().filter_map(|w| w.intersect(&bounds)).collect();
+        let mut editor = Self {
+            doc,
+            fonts,
+            scale,
+            windows,
+            pointer: Point::default(),
+            hover: None,
+            selection: None,
+            drag: None,
+            shapes: Vec::new(),
+            history: Vec::new(),
+            selected: None,
+            tool: None,
+            styles: [Style::default(); Tool::ALL.len()],
+            text: None,
+            revision: 0,
+        };
+        editor.update_hover();
+        editor
+    }
+
+    fn metrics(&self) -> Metrics<'_> {
+        Metrics { scale: self.scale, fonts: &self.fonts }
+    }
+
+    fn touch(&mut self) {
+        self.revision += 1;
+    }
+
+    // ----- queries --------------------------------------------------------
+
+    pub fn document(&self) -> &Document {
+        &self.doc
+    }
+
+    pub fn screen(&self) -> Rect {
+        self.doc.bounds()
+    }
+
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Changes whenever anything visible changes; frontends cache on it.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn is_picking(&self) -> bool {
+        self.selection.is_none()
+    }
+
+    /// The highlighted region: hovered window, in-progress drag, or the selection.
+    pub fn active_rect(&self) -> Option<Rect> {
+        match (&self.drag, self.selection) {
+            (Some(Drag::Pick { start, moved: true }), _) => Some(Rect::from_points(*start, self.pointer)),
+            (_, Some(sel)) => Some(sel),
+            _ => self.hover,
+        }
+    }
+
+    pub fn selection(&self) -> Option<Rect> {
+        self.selection
+    }
+
+    /// The toolbar is hidden while the selection itself is being dragged.
+    pub fn toolbar_visible(&self) -> bool {
+        self.selection.is_some()
+            && !matches!(self.drag, Some(Drag::Pick { .. } | Drag::SelResize { .. } | Drag::SelMove { .. }))
+    }
+
+    pub fn tool(&self) -> Option<Tool> {
+        self.tool
+    }
+
+    /// Tool and style the style bar should show: the selected shape's, else the active tool's.
+    pub fn current_style(&self) -> Option<(Tool, Style)> {
+        if let Some(shape) = self.selected.and_then(|i| self.shapes.get(i)) {
+            return Some((shape.tool(), shape.style));
+        }
+        self.tool.map(|t| (t, self.styles[t.index()]))
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.history.is_empty()
+    }
+
+    pub fn has_shapes(&self) -> bool {
+        !self.shapes.is_empty()
+    }
+
+    /// Bounds and handle positions of the selected shape, for drawing its edit frame.
+    pub fn selected_frame(&self) -> Option<(Rect, Vec<Point>)> {
+        let shape = self.shapes.get(self.selected?)?;
+        if self.text.is_some() || matches!(self.drag, Some(Drag::Create { .. })) {
+            return None;
+        }
+        let handles = shape.handles().into_iter().map(|(_, p)| p).collect();
+        Some((shape.bounds(self.metrics()), handles))
+    }
+
+    pub fn cursor(&self) -> CursorKind {
+        match &self.drag {
+            Some(Drag::Pick { .. } | Drag::Create { .. }) => return CursorKind::Crosshair,
+            Some(Drag::SelResize { handle, .. }) => return handle.cursor(),
+            Some(Drag::SelMove { .. } | Drag::ShapeMove { .. }) => return CursorKind::Move,
+            Some(Drag::ShapeHandle { handle, .. }) => {
+                return match handle {
+                    EditHandle::Bounds(h) => h.cursor(),
+                    _ => CursorKind::Crosshair,
+                };
+            }
+            None => {}
+        }
+        let p = self.pointer;
+        let Some(sel) = self.selection else { return CursorKind::Crosshair };
+        if let Some(edit) = &self.text
+            && self.shapes[edit.idx].bounds(self.metrics()).inflate(4.0 * self.scale).contains(p)
+        {
+            return CursorKind::Text;
+        }
+        if let Some((_, h)) = self.shape_handle_at(p) {
+            return match h {
+                EditHandle::Bounds(h) => h.cursor(),
+                _ => CursorKind::Crosshair,
+            };
+        }
+        if let Some(h) = sel.handle_at(p, HANDLE_HIT_RADIUS * self.scale) {
+            return h.cursor();
+        }
+        if self.shape_at(p).is_some() {
+            return CursorKind::Move;
+        }
+        match self.tool {
+            Some(Tool::Text) if sel.contains(p) => CursorKind::Text,
+            Some(_) if sel.contains(p) => CursorKind::Crosshair,
+            None if sel.contains(p) => CursorKind::Move,
+            _ => CursorKind::Default,
+        }
+    }
+
+    fn shape_at(&self, p: Point) -> Option<usize> {
+        let m = self.metrics();
+        self.shapes.iter().rposition(|s| s.hit(p, m))
+    }
+
+    fn shape_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
+        let idx = self.selected?;
+        let radius = HANDLE_HIT_RADIUS * self.scale;
+        self.shapes[idx]
+            .handles()
+            .into_iter()
+            .find(|(_, hp)| hp.distance(p) <= radius)
+            .map(|(h, _)| (idx, h))
+    }
+
+    fn update_hover(&mut self) {
+        let p = self.pointer;
+        self.hover = Some(self.windows.iter().find(|w| w.contains(p)).copied().unwrap_or(self.screen()));
+    }
+
+    // ----- pointer input --------------------------------------------------
+
+    pub fn pointer_down(&mut self, p: Point) {
+        self.pointer = p;
+        self.touch();
+
+        if let Some(edit) = self.text.clone() {
+            let shape = &self.shapes[edit.idx];
+            if shape.bounds(self.metrics()).inflate(4.0 * self.scale).contains(p) {
+                self.set_caret_from_point(p);
+            } else {
+                self.finish_text();
+            }
+            return;
+        }
+
+        let Some(sel) = self.selection else {
+            self.update_hover();
+            self.drag = Some(Drag::Pick { start: p, moved: false });
+            return;
+        };
+
+        if let Some((idx, handle)) = self.shape_handle_at(p) {
+            self.begin_change();
+            self.drag = Some(Drag::ShapeHandle { idx, handle, orig: self.shapes[idx].clone(), start: p });
+            return;
+        }
+        if let Some(handle) = sel.handle_at(p, HANDLE_HIT_RADIUS * self.scale) {
+            self.drag = Some(Drag::SelResize { handle, orig: sel, start: p });
+            return;
+        }
+        if let Some(idx) = self.shape_at(p) {
+            self.selected = Some(idx);
+            self.begin_change();
+            self.drag = Some(Drag::ShapeMove { idx, orig: self.shapes[idx].clone(), start: p, moved: false });
+            return;
+        }
+        self.selected = None;
+        if !sel.contains(p) {
+            return;
+        }
+        match self.tool {
+            Some(tool) => self.start_shape(tool, p),
+            None => self.drag = Some(Drag::SelMove { orig: sel, start: p }),
+        }
+    }
+
+    fn start_shape(&mut self, tool: Tool, p: Point) {
+        let style = self.styles[tool.index()];
+        let geometry = match tool {
+            Tool::Rect => Geometry::Rect(Rect::from_points(p, p)),
+            Tool::Ellipse => Geometry::Ellipse(Rect::from_points(p, p)),
+            Tool::Arrow => Geometry::Arrow { from: p, to: p },
+            Tool::Pen => Geometry::Pen(vec![p]),
+            Tool::Mosaic => Geometry::Mosaic(vec![p]),
+            Tool::Text => {
+                // Center the first line vertically on the click.
+                let size = style.size.logical_px(Tool::Text) * self.scale;
+                let half_line = self.fonts.layout("", size).line_height / 2.0;
+                Geometry::Text { origin: Point::new(p.x, p.y - half_line), content: String::new() }
+            }
+        };
+        self.begin_change();
+        self.shapes.push(Shape { geometry, style });
+        let idx = self.shapes.len() - 1;
+        self.selected = Some(idx);
+        if tool == Tool::Text {
+            self.text = Some(TextEdit { idx, caret: 0, marked: None });
+        } else {
+            self.drag = Some(Drag::Create { idx, start: p });
+        }
+    }
+
+    /// `constrain` (usually Shift) keeps rectangles square and ellipses circular.
+    pub fn pointer_move(&mut self, p: Point, constrain: bool) {
+        let prev = self.pointer;
+        self.pointer = p;
+        let Some(drag) = &mut self.drag else {
+            if self.selection.is_none() {
+                let before = self.hover;
+                self.update_hover();
+                if self.hover != before {
+                    self.touch();
+                }
+            }
+            return;
+        };
+        let screen = self.doc.bounds();
+        let scale = self.scale;
+        match drag {
+            Drag::Pick { start, moved } => {
+                if !*moved && start.distance(p) > DRAG_THRESHOLD * scale {
+                    *moved = true;
+                }
+            }
+            Drag::SelResize { handle, orig, start } => {
+                let r = orig.resized(*handle, p - *start);
+                self.selection = Some(r.intersect(&screen).unwrap_or(Rect::new(r.x, r.y, 1.0, 1.0)));
+            }
+            Drag::SelMove { orig, start } => {
+                self.selection = Some(orig.translate(p - *start).clamp_within(&screen));
+            }
+            Drag::Create { idx, start } => {
+                let start = *start;
+                let shape = &mut self.shapes[*idx];
+                match &mut shape.geometry {
+                    Geometry::Rect(r) | Geometry::Ellipse(r) => *r = Rect::from_points(start, constrained(start, p, constrain)),
+                    Geometry::Arrow { to, .. } => *to = p,
+                    Geometry::Pen(pts) | Geometry::Mosaic(pts) => {
+                        if pts.last().is_none_or(|last| last.distance(p) >= MIN_STROKE_STEP * scale) {
+                            pts.push(p);
+                        }
+                    }
+                    Geometry::Text { .. } => {}
+                }
+            }
+            Drag::ShapeMove { idx, orig, start, moved } => {
+                *moved |= start.distance(p) > DRAG_THRESHOLD * scale;
+                if *moved {
+                    self.shapes[*idx] = orig.translated(p - *start);
+                }
+            }
+            Drag::ShapeHandle { idx, handle, orig, start } => {
+                self.shapes[*idx] = orig.with_handle_moved(*handle, p - *start);
+            }
+        }
+        if prev != p {
+            self.touch();
+        }
+    }
+
+    pub fn pointer_up(&mut self, p: Point) {
+        self.pointer = p;
+        let Some(drag) = self.drag.take() else { return };
+        self.touch();
+        match drag {
+            Drag::Pick { start, moved } => {
+                let r = Rect::from_points(start, p).intersect(&self.screen());
+                let min = DRAG_THRESHOLD * self.scale;
+                self.selection = match r {
+                    Some(r) if moved && r.w >= min && r.h >= min => Some(r.round()),
+                    _ => self.hover,
+                };
+            }
+            Drag::SelResize { .. } | Drag::SelMove { .. } => {
+                self.selection = self.selection.map(|s| s.round());
+            }
+            Drag::Create { idx, .. } => {
+                if self.shapes[idx].is_degenerate() {
+                    self.shapes.remove(idx);
+                    self.selected = None;
+                }
+                self.end_change();
+            }
+            Drag::ShapeMove { idx, moved, .. } => {
+                self.end_change();
+                if !moved && matches!(self.shapes[idx].geometry, Geometry::Text { .. }) {
+                    self.edit_text(idx, p);
+                }
+            }
+            Drag::ShapeHandle { .. } => self.end_change(),
+        }
+    }
+
+    /// Returns true when the double click should copy the capture (Snipaste-style).
+    pub fn double_click(&mut self, p: Point) -> bool {
+        self.text.is_none()
+            && self.tool.is_none()
+            && self.selection.is_some_and(|s| s.contains(p))
+            && self.shape_at(p).is_none()
+    }
+
+    pub fn right_click(&mut self) -> RightClick {
+        self.touch();
+        if self.text.is_some() {
+            self.finish_text();
+            return RightClick::Handled;
+        }
+        if self.drag.is_some() || !self.shapes.is_empty() {
+            return RightClick::Handled;
+        }
+        if self.selection.is_none() {
+            return RightClick::Exit;
+        }
+        // Back to picking a window.
+        self.selection = None;
+        self.tool = None;
+        self.selected = None;
+        self.update_hover();
+        RightClick::Handled
+    }
+
+    // ----- commands -------------------------------------------------------
+
+    /// Selecting the active tool again deselects it.
+    pub fn toggle_tool(&mut self, tool: Tool) {
+        self.finish_text();
+        self.tool = if self.tool == Some(tool) { None } else { Some(tool) };
+        self.selected = None;
+        self.touch();
+    }
+
+    pub fn set_color(&mut self, color: Color) {
+        self.update_style(|s| s.color = color);
+    }
+
+    pub fn set_size(&mut self, size: SizeLevel) {
+        self.update_style(|s| s.size = size);
+    }
+
+    /// Applies to the selected shape if there is one, and to the tool's future shapes.
+    fn update_style(&mut self, f: impl Fn(&mut Style)) {
+        let Some((tool, _)) = self.current_style() else { return };
+        f(&mut self.styles[tool.index()]);
+        if let Some(idx) = self.selected {
+            if self.text.is_none() {
+                self.begin_change();
+            }
+            f(&mut self.shapes[idx].style);
+            if self.text.is_none() {
+                self.end_change();
+            }
+        }
+        self.touch();
+    }
+
+    pub fn undo(&mut self) -> bool {
+        self.finish_text();
+        self.drag = None;
+        let Some(prev) = self.history.pop() else { return false };
+        self.shapes = prev;
+        self.selected = None;
+        self.touch();
+        true
+    }
+
+    pub fn delete_selected(&mut self) -> bool {
+        if self.text.is_some() {
+            return false;
+        }
+        let Some(idx) = self.selected.take() else { return false };
+        self.begin_change();
+        self.shapes.remove(idx);
+        self.touch();
+        true
+    }
+
+    fn begin_change(&mut self) {
+        self.history.push(self.shapes.clone());
+    }
+
+    /// Drops the snapshot from `begin_change` if nothing actually changed.
+    fn end_change(&mut self) {
+        if self.history.last() == Some(&self.shapes) {
+            self.history.pop();
+        }
+    }
+
+    // ----- text editing ---------------------------------------------------
+
+    pub fn is_editing_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    fn edit_text(&mut self, idx: usize, p: Point) {
+        self.begin_change();
+        self.selected = Some(idx);
+        self.text = Some(TextEdit { idx, caret: 0, marked: None });
+        self.set_caret_from_point(p);
+    }
+
+    fn set_caret_from_point(&mut self, p: Point) {
+        let Some(edit) = &self.text else { return };
+        let shape = &self.shapes[edit.idx];
+        let Geometry::Text { origin, content } = &shape.geometry else { return };
+        let caret = self.fonts.layout(content, shape.size_px(self.scale)).index_at(p - *origin);
+        if let Some(edit) = &mut self.text {
+            edit.caret = caret;
+            edit.marked = None;
+        }
+    }
+
+    /// Commits the text being edited; empty text boxes are removed.
+    pub fn finish_text(&mut self) {
+        let Some(edit) = self.text.take() else { return };
+        if self.shapes[edit.idx].is_degenerate() {
+            self.shapes.remove(edit.idx);
+            self.selected = None;
+        }
+        self.end_change();
+        self.touch();
+    }
+
+    pub fn text_content(&self) -> Option<&str> {
+        let edit = self.text.as_ref()?;
+        match &self.shapes[edit.idx].geometry {
+            Geometry::Text { content, .. } => Some(content),
+            _ => None,
+        }
+    }
+
+    pub fn text_caret(&self) -> Option<usize> {
+        self.text.as_ref().map(|e| e.caret)
+    }
+
+    pub fn text_marked(&self) -> Option<Range<usize>> {
+        self.text.as_ref()?.marked.clone()
+    }
+
+    pub fn text_unmark(&mut self) {
+        if let Some(edit) = &mut self.text {
+            edit.marked = None;
+            self.touch();
+        }
+    }
+
+    /// Replaces `range` (byte offsets; defaults to the marked text, else the caret) with
+    /// `new_text`. With `mark`, the inserted text becomes IME composition text and
+    /// `caret_in_new` positions the caret inside it.
+    pub fn text_replace(&mut self, range: Option<Range<usize>>, new_text: &str, mark: bool, caret_in_new: Option<usize>) {
+        let Some(edit) = self.text.clone() else { return };
+        let Geometry::Text { content, .. } = &mut self.shapes[edit.idx].geometry else { return };
+        let range = range.or(edit.marked.clone()).unwrap_or(edit.caret..edit.caret);
+        if range.start > range.end || !content.is_char_boundary(range.start) || !content.is_char_boundary(range.end) {
+            return;
+        }
+        content.replace_range(range.clone(), new_text);
+        let end = range.start + new_text.len();
+        let caret = caret_in_new
+            .map(|c| range.start + c.min(new_text.len()))
+            .filter(|c| content.is_char_boundary(*c))
+            .unwrap_or(end);
+        let marked = (mark && !new_text.is_empty()).then_some(range.start..end);
+        self.text = Some(TextEdit { caret, marked, ..edit });
+        self.touch();
+    }
+
+    pub fn text_key(&mut self, key: TextKey) {
+        let Some(edit) = self.text.clone() else { return };
+        let Some(content) = self.text_content() else { return };
+        let c = edit.caret;
+        let prev = content[..c].char_indices().next_back().map_or(0, |(i, _)| i);
+        let next = content[c..].chars().next().map_or(c, |ch| c + ch.len_utf8());
+        let line_start = content[..c].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = content[c..].find('\n').map_or(content.len(), |i| c + i);
+        match key {
+            TextKey::Backspace if c > 0 => self.text_replace(Some(prev..c), "", false, None),
+            TextKey::Delete if next > c => self.text_replace(Some(c..next), "", false, None),
+            TextKey::Newline => self.text_replace(Some(c..c), "\n", false, None),
+            TextKey::Left | TextKey::Right | TextKey::Home | TextKey::End => {
+                let caret = match key {
+                    TextKey::Left => prev,
+                    TextKey::Right => next,
+                    TextKey::Home => line_start,
+                    _ => line_end,
+                };
+                self.text = Some(TextEdit { caret, marked: None, ..edit });
+                self.touch();
+            }
+            _ => {}
+        }
+    }
+
+    /// Screen-space caret rectangle at byte offset `index` of the edited text.
+    pub fn text_caret_rect_at(&self, index: usize) -> Option<Rect> {
+        let edit = self.text.as_ref()?;
+        let shape = &self.shapes[edit.idx];
+        let Geometry::Text { origin, content } = &shape.geometry else { return None };
+        let caret = self.fonts.layout(content, shape.size_px(self.scale)).caret_rect(index);
+        Some(caret.translate(*origin))
+    }
+
+    pub fn text_caret_rect(&self) -> Option<Rect> {
+        self.text_caret_rect_at(self.text.as_ref()?.caret)
+    }
+
+    /// Byte offset in the edited text closest to screen point `p`.
+    pub fn text_index_at(&self, p: Point) -> Option<usize> {
+        let edit = self.text.as_ref()?;
+        let shape = &self.shapes[edit.idx];
+        let Geometry::Text { origin, content } = &shape.geometry else { return None };
+        Some(self.fonts.layout(content, shape.size_px(self.scale)).index_at(p - *origin))
+    }
+
+    /// Box drawn around the text being edited.
+    pub fn text_frame(&self) -> Option<Rect> {
+        let edit = self.text.as_ref()?;
+        Some(self.shapes[edit.idx].bounds(self.metrics()).inflate(3.0 * self.scale))
+    }
+
+    // ----- output ---------------------------------------------------------
+
+    /// Annotations rendered over the selection, or `None` when there are none.
+    pub fn render_layer(&self) -> Option<(Rect, Pixmap)> {
+        if self.shapes.is_empty() {
+            return None;
+        }
+        let region = self.selection?.round().intersect(&self.screen())?;
+        let underline = self.text.as_ref().and_then(|e| Some((e.idx, e.marked.clone()?)));
+        let pixmap = render::render_layer(&self.doc, region, &self.shapes, self.metrics(), underline)?;
+        Some((region, pixmap))
+    }
+
+    /// The selected region with all annotations, as the user sees it.
+    pub fn export(&mut self) -> Option<Pixmap> {
+        self.finish_text();
+        render::export(&self.doc, self.selection?, &self.shapes, self.metrics())
+    }
+}
+
+/// Snaps `p` so the box from `start` is square.
+fn constrained(start: Point, p: Point, constrain: bool) -> Point {
+    if !constrain {
+        return p;
+    }
+    let d = p - start;
+    let side = d.x.abs().max(d.y.abs());
+    Point::new(start.x + side.copysign(d.x), start.y + side.copysign(d.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor() -> Editor {
+        let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4], 8).unwrap();
+        let windows = vec![Rect::new(50.0, 50.0, 100.0, 100.0), Rect::new(0.0, 0.0, 300.0, 200.0)];
+        Editor::new(doc, Arc::new(FontSet::empty()), windows, 1.0)
+    }
+
+    fn click(e: &mut Editor, x: f32, y: f32) {
+        e.pointer_down(Point::new(x, y));
+        e.pointer_up(Point::new(x, y));
+    }
+
+    fn drag(e: &mut Editor, from: (f32, f32), to: (f32, f32)) {
+        e.pointer_down(Point::new(from.0, from.1));
+        e.pointer_move(Point::new((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0), false);
+        e.pointer_move(Point::new(to.0, to.1), false);
+        e.pointer_up(Point::new(to.0, to.1));
+    }
+
+    #[test]
+    fn hover_follows_topmost_window_and_click_selects_it() {
+        let mut e = editor();
+        e.pointer_move(Point::new(60.0, 60.0), false);
+        assert_eq!(e.active_rect(), Some(Rect::new(50.0, 50.0, 100.0, 100.0)));
+        e.pointer_move(Point::new(250.0, 60.0), false);
+        assert_eq!(e.active_rect(), Some(Rect::new(0.0, 0.0, 300.0, 200.0)));
+        e.pointer_move(Point::new(350.0, 250.0), false);
+        assert_eq!(e.active_rect(), Some(e.screen()));
+        click(&mut e, 60.0, 60.0);
+        assert_eq!(e.selection(), Some(Rect::new(50.0, 50.0, 100.0, 100.0)));
+    }
+
+    #[test]
+    fn drag_creates_manual_selection() {
+        let mut e = editor();
+        drag(&mut e, (10.0, 20.0), (110.0, 80.0));
+        assert_eq!(e.selection(), Some(Rect::new(10.0, 20.0, 100.0, 60.0)));
+    }
+
+    #[test]
+    fn handles_resize_selection_and_body_moves_it() {
+        let mut e = editor();
+        drag(&mut e, (10.0, 20.0), (110.0, 80.0));
+        drag(&mut e, (110.0, 80.0), (210.0, 130.0));
+        assert_eq!(e.selection(), Some(Rect::new(10.0, 20.0, 200.0, 110.0)));
+        drag(&mut e, (100.0, 50.0), (120.0, 60.0));
+        assert_eq!(e.selection(), Some(Rect::new(30.0, 30.0, 200.0, 110.0)));
+    }
+
+    #[test]
+    fn shapes_can_be_moved_deleted_and_undone() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (50.0, 50.0), (150.0, 120.0));
+        assert_eq!(e.shapes.len(), 1);
+        // Grab the outline (away from the handles) and move it.
+        drag(&mut e, (50.0, 70.0), (60.0, 80.0));
+        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 100.0, 70.0)));
+        // Resize via the bottom-right handle of the selected shape.
+        drag(&mut e, (160.0, 130.0), (170.0, 140.0));
+        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 110.0, 80.0)));
+        assert!(e.delete_selected());
+        assert!(e.shapes.is_empty());
+        assert!(e.undo());
+        assert!(e.undo());
+        assert!(e.undo());
+        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(50.0, 50.0, 100.0, 70.0)));
+    }
+
+    #[test]
+    fn tiny_shapes_are_discarded_without_history() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Arrow);
+        click(&mut e, 100.0, 100.0);
+        assert!(e.shapes.is_empty());
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn text_editing_with_ime_composition() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 100.0, 100.0);
+        assert!(e.is_editing_text());
+        e.text_replace(None, "hi", false, None);
+        e.text_replace(None, "ni", true, Some(2));
+        assert_eq!(e.text_marked(), Some(2..4));
+        e.text_replace(None, "你", false, None);
+        assert_eq!(e.text_content(), Some("hi你"));
+        e.text_key(TextKey::Backspace);
+        e.text_key(TextKey::Left);
+        e.text_key(TextKey::Newline);
+        assert_eq!(e.text_content(), Some("h\ni"));
+        // Clicking elsewhere commits.
+        click(&mut e, 300.0, 250.0);
+        assert!(!e.is_editing_text());
+        assert_eq!(e.shapes.len(), 1);
+        assert!(e.undo());
+        assert!(e.shapes.is_empty());
+    }
+
+    #[test]
+    fn empty_text_is_dropped() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 100.0, 100.0);
+        e.finish_text();
+        assert!(e.shapes.is_empty());
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn style_changes_apply_to_selected_shape() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Ellipse);
+        drag(&mut e, (50.0, 50.0), (150.0, 120.0));
+        e.set_color(crate::style::PALETTE[2]);
+        assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[2]);
+        assert!(e.undo());
+        assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[0]);
+    }
+
+    #[test]
+    fn right_click_returns_to_picking_then_exits() {
+        let mut e = editor();
+        click(&mut e, 60.0, 60.0);
+        assert_eq!(e.right_click(), RightClick::Handled);
+        assert!(e.is_picking());
+        assert_eq!(e.right_click(), RightClick::Exit);
+    }
+}

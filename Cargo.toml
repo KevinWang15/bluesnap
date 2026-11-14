@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/platform", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+bluesnap-core = { path = "crates/core" }
+bluesnap-platform = { path = "crates/platform" }
+anyhow = "1"
+log = "0.4"
+raw-window-handle = "0.6"
+
+# Pixel-heavy code (capture conversion, rasterizing annotations) is painfully
+# slow unoptimized, so optimize it even in dev builds.
+[profile.dev.package.tiny-skia]
+opt-level = 3
+[profile.dev.package.ab_glyph_rasterizer]
+opt-level = 3
+[profile.dev.package.bluesnap-core]
+opt-level = 2
+[profile.dev.package.bluesnap-platform]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# gpui 0.2.2 pulls in xattr 0.2.3, which no longer builds on Linux against
+# current libc (`ENOATTR` was removed there). Only affects Linux builds.
+[patch.crates-io]
+xattr = { path = "third_party/xattr" }
