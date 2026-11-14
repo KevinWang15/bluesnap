@@ -3,6 +3,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -24,9 +25,12 @@ use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLi
 
 pub struct Native;
 
+// A prewarm and an explicit recognition must not initialize Vision concurrently.
+static VISION_LOCK: Mutex<()> = Mutex::new(());
+static VISION_PREWARMED: OnceLock<()> = OnceLock::new();
+
 impl Platform for Native {
-    /// Option+Command+A: the Windows default with Command in place of Control.
-    const DEFAULT_HOTKEY: &'static str = "Alt+Cmd+A";
+    const DEFAULT_HOTKEY: &'static str = "Ctrl+Cmd+A";
     const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
@@ -95,6 +99,8 @@ impl Platform for Native {
         // gpui creates a titled panel; a titled window keeps its traffic lights and is
         // pushed below the menu bar. Borderless covers the whole display.
         ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        // GPUI leaves this disabled for pop-up windows; window picking needs hover events.
+        ns_window.setAcceptsMouseMovedEvents(true);
         ns_window.setHidesOnDeactivate(false);
 
         // Cocoa frames are bottom-left based, measured from the menu-bar display.
@@ -122,9 +128,13 @@ impl Platform for Native {
         Some("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     }
 
+    fn prewarm_text_recognition(&self) -> anyhow::Result<()> {
+        prewarm_vision()
+    }
+
     /// Apple's Vision framework: no bundled model, and good at Chinese.
     fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
-        objc2::rc::autoreleasepool(|_| recognize_with_vision(width, height, rgba))
+        recognize_with_vision(width, height, rgba)
     }
 
     fn font_paths(&self) -> Vec<PathBuf> {
@@ -156,7 +166,56 @@ unsafe extern "C" {
     ) -> Option<NonNull<CGContext>>;
 }
 
+fn prewarm_vision() -> anyhow::Result<()> {
+    if VISION_PREWARMED.get().is_some() {
+        return Ok(());
+    }
+    let (width, height, rgba) = decode_prewarm_image()?;
+    let started = Instant::now();
+    let result = objc2::rc::autoreleasepool(|_| {
+        let _guard = VISION_LOCK.lock().expect("Vision lock poisoned");
+        if VISION_PREWARMED.get().is_some() {
+            return Ok(());
+        }
+        let result = recognize_with_vision_locked(width, height, &rgba);
+        if result.is_ok() {
+            VISION_PREWARMED.set(()).ok();
+        }
+        result.map(|_| ())
+    });
+    if result.is_ok() {
+        log::debug!("Vision prewarm took {:?}", started.elapsed());
+    }
+    result
+}
+
+fn decode_prewarm_image() -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../assets/vision-prewarm.png")));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info()?;
+    let mut pixels = vec![0; reader.output_buffer_size().context("prewarm image too large")?];
+    let info = reader.next_frame(&mut pixels)?;
+    pixels.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => pixels,
+        png::ColorType::Rgb => pixels.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        _ => bail!("prewarm image must be RGB or RGBA"),
+    };
+    Ok((info.width, info.height, rgba))
+}
+
 fn recognize_with_vision(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+    objc2::rc::autoreleasepool(|_| {
+        let _guard = VISION_LOCK.lock().expect("Vision lock poisoned");
+        let result = recognize_with_vision_locked(width, height, rgba);
+        if result.is_ok() {
+            VISION_PREWARMED.set(()).ok();
+        }
+        result
+    })
+}
+
+fn recognize_with_vision_locked(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
     let (w, h) = (width as usize, height as usize);
     anyhow::ensure!(rgba.len() == w * h * 4, "buffer size mismatch");
     let mut rgba = rgba.to_vec();
@@ -226,6 +285,12 @@ fn to_bgrx(image: &CGImage) -> anyhow::Result<Image> {
     Ok(Image { width: w as u32, height: h as u32, bgrx })
 }
 
+fn is_pickable_window_layer(layer: i32) -> bool {
+    // The Dock can report a display-sized layer-20 window, and layers above it
+    // include the menu bar and other system UI rather than pickable app windows.
+    (0..20).contains(&layer)
+}
+
 /// On-screen windows of other apps in front-to-back order, relative to `display`
 /// and converted from points to image pixels.
 fn visible_windows(display: &CGRect, scale: f64) -> Vec<PixelRect> {
@@ -248,9 +313,7 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<PixelRect> {
                 number(kCGWindowAlpha).and_then(|n| n.as_f64()).unwrap_or(1.0),
             )
         };
-        // Layer 0 is normal windows; up to 25 covers floating panels, the Dock and
-        // the menu bar. Higher layers are cursors, screen savers and overlays.
-        if pid == own_pid || alpha <= 0.0 || !(0..=25).contains(&layer) {
+        if pid == own_pid || alpha <= 0.0 || !is_pickable_window_layer(layer) {
             continue;
         }
         let mut r = CGRect::default();
@@ -274,4 +337,26 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<PixelRect> {
         out.push(PixelRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dock_and_system_ui_layers_are_not_pickable() {
+        assert!(super::is_pickable_window_layer(0));
+        assert!(super::is_pickable_window_layer(8));
+        assert!(super::is_pickable_window_layer(19));
+        assert!(!super::is_pickable_window_layer(-1));
+        assert!(!super::is_pickable_window_layer(20));
+        assert!(!super::is_pickable_window_layer(24));
+        assert!(!super::is_pickable_window_layer(25));
+    }
+
+    #[test]
+    fn prewarm_image_decodes_to_rgba() {
+        let (width, height, rgba) = super::decode_prewarm_image().unwrap();
+        assert_eq!((width, height), (1000, 180));
+        assert_eq!(rgba.len(), width as usize * height as usize * 4);
+        assert!(rgba.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
+    }
 }

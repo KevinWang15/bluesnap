@@ -21,7 +21,7 @@ bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
 Take Screenshot, Edit Settings… and Quit; on Windows, left-clicking the tray icon
 also takes a screenshot.
 
-Default hotkey: **Ctrl+Alt+A** on Windows, **Option+Cmd+A** on macOS. It is set in
+Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. It is set in
 `config.toml`, created on first run in the OS config directory
 (`%APPDATA%\bluesnap\` on Windows, `~/Library/Application Support/bluesnap/` on macOS).
 
@@ -109,6 +109,9 @@ the shape being edited; both are clipped to the selection on the GPU, so only th
 edited shape is re-rasterized and uploaded per mouse move. With
 `RUST_LOG=bluesnap=debug` the app logs a timeline from hotkey to first presented
 frame (65–115 ms under WSLg, most of it gpui window creation and the first frame).
+
+On macOS, opening the capture overlay starts warming Vision in the background so
+its model loading usually finishes before you use To text.
 
 Text recognition with the embedded model (Windows) takes about 0.5 s for an
 800×450 selection of dense text and 2 s for a full 1080p screen, plus about 0.4 s

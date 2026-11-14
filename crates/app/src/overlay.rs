@@ -137,6 +137,13 @@ impl Overlay {
             cx.global_mut::<AppState>().overlay = None;
         })
         .detach();
+        cx.background_executor()
+            .spawn(async {
+                if let Err(e) = bluesnap_platform::native().prewarm_text_recognition() {
+                    log::warn!("text recognition prewarm failed: {e:#}");
+                }
+            })
+            .detach();
         let scale = editor.scale();
         Self {
             editor,

@@ -101,6 +101,11 @@ pub trait Platform {
     /// Where the user grants the permission behind [`Capture::permission_missing`].
     fn permission_settings_url(&self) -> Option<&'static str>;
 
+    /// Loads text recognition resources before the first explicit request.
+    fn prewarm_text_recognition(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Recognizes text in straight-alpha RGBA pixels. Blocking; call it off the
     /// UI thread. Lines come back in no particular order.
     fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>>;

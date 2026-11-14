@@ -8,7 +8,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Global shortcut, e.g. "Ctrl+Alt+A" or "Alt+Cmd+A".
+    /// Global shortcut, e.g. "Ctrl+Alt+A" or "Ctrl+Cmd+A".
     pub hotkey: String,
     /// Folder the save dialog opens in. Defaults to the Pictures folder.
     pub save_dir: Option<PathBuf>,
