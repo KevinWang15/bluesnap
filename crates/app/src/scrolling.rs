@@ -17,14 +17,17 @@ use gpui::{
     WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, rgba, size, svg,
 };
 
-use crate::{AppState, output};
+use crate::output::{self, Finish};
+use crate::toolbar::{self, Action};
+use crate::{AppState, document};
 
 /// Time between captures. Fast enough that normal scrolling keeps an overlap.
 const INTERVAL: Duration = Duration::from_millis(100);
 /// Border around the hole and gap to the bar, in logical pixels.
 const BORDER: f32 = 2.0;
 const GAP: f32 = 8.0;
-const BAR_SIZE: (f32, f32) = (430.0, 44.0);
+/// Width of the bar's status text, in logical pixels.
+const STATUS_WIDTH: f32 = 330.0;
 /// Height cap: 30k rows, and at most ~300 MB of pixels.
 const MAX_ROWS: u32 = 30_000;
 const MAX_BYTES: u64 = 300 << 20;
@@ -62,13 +65,6 @@ impl Render for Dim {
                     .border_color(hsla(THEME_BLUE)),
             )
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Finish {
-    Copy,
-    Save,
-    Cancel,
 }
 
 pub struct ScrollingCapture {
@@ -124,7 +120,8 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, cx: &mut
     let scale = display.scale_factor;
     let (screen_w, screen_h) = screen;
     let border = (BORDER * scale).round() as i32;
-    let (bar_w, bar_h) = ((BAR_SIZE.0 * scale).round() as i32, (BAR_SIZE.1 * scale).round() as i32);
+    let bar_size = toolbar::panel_size(toolbar::SCROLLING_BAR, STATUS_WIDTH);
+    let (bar_w, bar_h) = ((bar_size.0 * scale).round() as i32, (bar_size.1 * scale).round() as i32);
     let gap = (GAP * scale).round() as i32;
 
     // The bar goes below the frame, else above it, else inside the region's
@@ -233,14 +230,10 @@ impl ScrollingCapture {
         cx.notify();
     }
 
-    /// Ends the session; `Copy` and `Save` deliver the stitched image.
-    pub fn finish(&mut self, how: Finish, cx: &mut Context<Self>) {
+    /// Stops capturing and closes the dim layer and bar; returns the stitched image.
+    fn stop(&mut self, cx: &mut Context<Self>) -> Option<bluesnap_core::Pixmap> {
         self._task = None;
-        let image = if how == Finish::Cancel {
-            None
-        } else {
-            self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Stitcher::finish)
-        };
+        let image = self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Stitcher::finish);
         cx.global_mut::<AppState>().scrolling = None;
         let windows = [Some(self.frame), self.bar];
         // Close after this update returns: the bar's own window is borrowed now.
@@ -249,16 +242,37 @@ impl ScrollingCapture {
                 handle.update(cx, |_, window, _| window.remove_window()).ok();
             }
         });
-        match (how, image) {
-            (Finish::Copy, Some(image)) => output::copy_to_clipboard(image, cx),
-            (Finish::Save, Some(image)) => {
-                let dir = cx.global::<AppState>().config.save_dir();
-                output::save_with_dialog(image, dir, cx);
-            }
-            (Finish::Cancel, _) => {}
-            (_, None) => log::warn!("scrolling capture produced no image"),
-        }
         log::info!("scrolling capture of {}x{} finished", self.rect.width, self.height);
+        image
+    }
+
+    /// Ends the session; `Copy` and `Save` deliver the stitched image.
+    pub fn finish(&mut self, how: Finish, cx: &mut Context<Self>) {
+        let image = self.stop(cx);
+        output::deliver(how, if how == Finish::Cancel { None } else { image }, cx);
+    }
+
+    /// Ends the session and opens the stitched image in an editor window.
+    fn edit(&mut self, cx: &mut Context<Self>) {
+        let Some(image) = self.stop(cx) else { return log::warn!("scrolling capture produced no image") };
+        let (scale, id) = (self.display.scale_factor, self.display.id);
+        let display = cx.displays().into_iter().find(|d| u32::from(d.id()) == id).map(|d| d.id());
+        cx.defer(move |cx| {
+            if let Err(e) = document::open(image, scale, display, cx) {
+                log::error!("could not open the editor: {e:#}");
+            }
+        });
+    }
+
+    fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
+        match action {
+            Action::Edit => self.edit(cx),
+            other => {
+                if let Some(how) = other.finish() {
+                    self.finish(how, cx);
+                }
+            }
+        }
     }
 }
 
@@ -294,48 +308,32 @@ fn capture_and_stitch(
     Ok((progress, stitcher.height()))
 }
 
-fn bar_button(id: &'static str, icon: &'static str, color: Hsla) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .size(px(32.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.0))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgba(0x0000_000F)))
-        .child(svg().path(icon).size(px(20.0)).text_color(color))
-}
-
 impl Render for ScrollingCapture {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let press = |how: Finish| {
-            cx.listener(move |this: &mut Self, _: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                this.finish(how, cx);
-            })
-        };
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .bg(rgb(0xFFFFFF))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(rgba(0x0000_0022))
-            .text_size(px(13.0))
-            .child(svg().path("icons/scroll.svg").size(px(18.0)).text_color(hsla(THEME_BLUE)))
-            .child(
-                div()
-                    .flex_1()
-                    .text_color(if self.warning { hsla(Color::rgb(0xD4380D)) } else { hsla(Color::rgb(0x333333)) })
-                    .child(self.status.clone()),
-            )
-            .child(div().text_color(hsla(Color::rgb(0x888888))).child(format!("{} px", self.height)))
-            .child(bar_button("cancel", "icons/cancel.svg", hsla(Color::rgb(0xF5222D))).on_mouse_down(MouseButton::Left, press(Finish::Cancel)))
-            .child(bar_button("save", "icons/save.svg", hsla(Color::rgb(0x333333))).on_mouse_down(MouseButton::Left, press(Finish::Save)))
-            .child(bar_button("done", "icons/done.svg", hsla(THEME_BLUE)).on_mouse_down(MouseButton::Left, press(Finish::Copy)))
+        let status_color = if self.warning { hsla(Color::rgb(0xD4380D)) } else { hsla(Color::rgb(0x333333)) };
+        let mut bar = toolbar::panel().size_full().text_size(px(13.0)).child(
+            div()
+                .w(px(STATUS_WIDTH))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .pl(px(6.0))
+                .child(svg().path("icons/scroll.svg").size(px(18.0)).text_color(hsla(THEME_BLUE)))
+                .child(div().flex_1().overflow_hidden().text_color(status_color).child(self.status.clone()))
+                .child(div().flex_none().text_color(hsla(Color::rgb(0x888888))).child(format!("{} px", self.height))),
+        );
+        for group in toolbar::SCROLLING_BAR {
+            bar = bar.child(toolbar::separator());
+            for &action in *group {
+                bar = bar.child(toolbar::action_button(action, false, true).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut Self, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.perform(action, cx);
+                    }),
+                ));
+            }
+        }
+        bar
     }
 }

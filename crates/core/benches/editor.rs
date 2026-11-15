@@ -86,11 +86,11 @@ impl Presenter {
         let mut bytes = 0;
         if self.static_rev != Some(e.static_layer_revision()) {
             self.static_rev = Some(e.static_layer_revision());
-            bytes += e.render_static_layer().map_or(0, |(_, p)| to_bgra_straight(&p).len());
+            bytes += e.render_static_layer(e.screen()).map_or(0, |(_, p)| to_bgra_straight(&p).len());
         }
         if self.active_rev != Some(e.active_layer_revision()) {
             self.active_rev = Some(e.active_layer_revision());
-            bytes += e.render_active_layer().map_or(0, |(_, p)| to_bgra_straight(&p).len());
+            bytes += e.render_active_layer(e.screen()).map_or(0, |(_, p)| to_bgra_straight(&p).len());
         }
         bytes
     }

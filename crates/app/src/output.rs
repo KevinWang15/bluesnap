@@ -6,7 +6,31 @@ use bluesnap_core::Pixmap;
 use bluesnap_core::render::to_rgba_straight;
 use gpui::App;
 
-pub fn copy_to_clipboard(image: Pixmap, cx: &mut App) {
+use crate::AppState;
+
+/// How a capture or edit session ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    Copy,
+    Save,
+    Cancel,
+}
+
+/// Carries out `how` with the finished image (`None` when there is nothing to
+/// deliver, e.g. an empty capture).
+pub fn deliver(how: Finish, image: Option<Pixmap>, cx: &mut App) {
+    match (how, image) {
+        (Finish::Copy, Some(image)) => copy_to_clipboard(image, cx),
+        (Finish::Save, Some(image)) => {
+            let dir = cx.global::<AppState>().config.save_dir();
+            save_with_dialog(image, dir, cx);
+        }
+        (Finish::Cancel, _) => {}
+        (_, None) => log::warn!("nothing to deliver"),
+    }
+}
+
+fn copy_to_clipboard(image: Pixmap, cx: &mut App) {
     // Off the UI thread: large images take tens of milliseconds to hand over.
     cx.background_executor()
         .spawn(async move {
@@ -23,7 +47,7 @@ pub fn copy_to_clipboard(image: Pixmap, cx: &mut App) {
         .detach();
 }
 
-pub fn save_with_dialog(image: Pixmap, dir: PathBuf, cx: &mut App) {
+fn save_with_dialog(image: Pixmap, dir: PathBuf, cx: &mut App) {
     let name = chrono::Local::now().format("Screenshot %Y-%m-%d %H.%M.%S.png").to_string();
     // The dialog needs the app to be active (we're a background app on macOS).
     cx.activate(true);

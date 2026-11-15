@@ -1,94 +1,88 @@
-//! The full-screen capture overlay: draws the frozen screenshot and the editor
-//! state with gpui, and forwards input to [`bluesnap_core::Editor`].
+//! The editing view: draws an [`Editor`]'s image and annotations with gpui and
+//! forwards input to it. It is hosted on two surfaces:
 //!
-//! The editor works in screenshot pixels; gpui works in logical pixels. `scale`
-//! converts between them.
+//! - [`Surface::Capture`]: the full-screen overlay over the frozen screenshot,
+//!   shown 1:1 in device pixels, with window picking, a dimmed surrounding and
+//!   the toolbar following the selection;
+//! - [`Surface::Document`]: a normal window editing a whole image (a stitched
+//!   scrolling screenshot), fitted to the window width, scrollable, with the
+//!   toolbar at the top.
+//!
+//! The editor works in image pixels; [`Viewport`] maps them to the window.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use bluesnap_core::layout::{place_panels, place_size_label};
 use bluesnap_core::reading_order::join_lines;
-use bluesnap_core::render::{to_bgra_straight, to_rgba_straight};
-use bluesnap_core::{CursorKind, Editor, Pixmap, Point as Px, Rect as PxRect, RightClick, THEME_BLUE, TextKey};
-use bluesnap_platform::Platform;
+use bluesnap_core::render::to_rgba_straight;
+use bluesnap_core::{CursorKind, Editor, Rect as PxRect, RightClick, SelectionMode, THEME_BLUE, TextKey};
+use bluesnap_platform::{DisplayInfo, Platform};
 use gpui::{
-    App, Bounds, BorderStyle, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage,
-    SharedString, Styled, Task, UTF16Selection, Window, canvas, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
+    App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, RenderImage, ScrollWheelEvent, SharedString, Styled, Task, UTF16Selection, Window, canvas, div,
+    fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
-use crate::{AppState, output, toolbar};
+use crate::gpu_image::{ImageTiles, LayerCache, paint_tiles};
+use crate::output::{self, Finish};
+use crate::toolbar::{self, Action};
+use crate::viewport::Viewport;
+use crate::AppState;
 
 /// Selection border width, in logical pixels.
 const BORDER: f32 = 2.0;
 const HANDLE_RADIUS: f32 = 4.0;
 /// Gap between the selection and the floating panels, in logical pixels.
 const PANEL_GAP: f32 = 8.0;
+/// Document surface: inset of the toolbar and of the image, in logical pixels.
+const DOC_INSET: f32 = 12.0;
+const DOC_MARGIN: f32 = 16.0;
+/// Document surface: annotation layers are rendered for the visible rows plus
+/// this many screens above and below, snapped to `LAYER_SNAP` rows, so
+/// scrolling only re-renders occasionally.
+const LAYER_SNAP: f32 = 512.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Finish {
-    Cancel,
-    Copy,
-    Save,
+/// Where the editor is shown; see the module docs.
+pub enum Surface {
+    Capture {
+        /// The display this overlay covers, for starting a scrolling capture.
+        display: DisplayInfo,
+        /// Set when the OS withheld window contents; where to grant the permission.
+        permission_url: Option<&'static str>,
+    },
+    Document,
 }
 
-pub struct Overlay {
+pub struct EditorView {
     editor: Editor,
+    surface: Surface,
     focus: FocusHandle,
-    background: Arc<RenderImage>,
+    image: ImageTiles,
     /// Finished annotations, re-rasterized only when they change.
-    static_layer: Layer,
+    static_layer: LayerCache,
     /// The annotation being drawn, dragged or typed into.
-    active_layer: Layer,
-    /// Screenshot pixels per logical pixel.
-    scale: f32,
+    active_layer: LayerCache,
+    viewport: Viewport,
+    /// Document surface: how far the image is scrolled, in logical pixels.
+    scroll: f32,
+    /// Document surface: height of the toolbar area above the image.
+    top_bar: f32,
     finished: bool,
     /// Message shown over the selection (text recognition progress/result).
     status: Option<SharedString>,
     /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
-    /// Set when the OS withheld window contents; where to grant the permission.
-    permission_url: Option<&'static str>,
-    /// The display this overlay covers, for starting a scrolling capture.
-    display: bluesnap_platform::DisplayInfo,
 }
 
-/// Opaque BGRA screenshot pixels as a gpui image (gpui's native layout, so no copy).
-pub fn background_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<RenderImage> {
-    let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
-    Some(RenderImage::new(vec![image::Frame::new(buffer)]))
-}
-
-fn pixmap_image(pixmap: &Pixmap) -> Option<RenderImage> {
-    let buffer = image::RgbaImage::from_raw(pixmap.width(), pixmap.height(), to_bgra_straight(pixmap))?;
-    Some(RenderImage::new(vec![image::Frame::new(buffer)]))
-}
-
-/// One annotation layer uploaded to the GPU, tagged with the editor revision it shows.
-#[derive(Default)]
-struct Layer {
-    revision: Option<u64>,
-    image: Option<(PxRect, Arc<RenderImage>)>,
-}
-
-impl Layer {
-    fn sync(&mut self, revision: u64, render: impl FnOnce() -> Option<(PxRect, Pixmap)>, window: &mut Window) {
-        if self.revision == Some(revision) {
-            return;
-        }
-        self.revision = Some(revision);
-        let new = render().and_then(|(rect, pixmap)| Some((rect, Arc::new(pixmap_image(&pixmap)?))));
-        if let Some((_, old)) = std::mem::replace(&mut self.image, new) {
-            // Each version is a new texture; free the previous one from the atlas.
-            window.drop_image(old).ok();
-        }
-    }
+fn color(c: bluesnap_core::Color) -> Hsla {
+    rgb(c.to_hex()).into()
 }
 
 /// Shown when macOS returned a capture without window contents.
-fn permission_banner(url: &'static str, cx: &mut Context<Overlay>) -> impl IntoElement {
+fn permission_banner(url: &'static str, cx: &mut Context<EditorView>) -> impl IntoElement {
     div().absolute().top(px(16.0)).left_0().right_0().flex().justify_center().child(
         div()
             .flex()
@@ -122,24 +116,16 @@ fn permission_banner(url: &'static str, cx: &mut Context<Overlay>) -> impl IntoE
     )
 }
 
-fn color(c: bluesnap_core::Color) -> Hsla {
-    rgb(c.to_hex()).into()
-}
-
-impl Overlay {
-    pub fn new(
-        editor: Editor,
-        background: Arc<RenderImage>,
-        permission_url: Option<&'static str>,
-        display: bluesnap_platform::DisplayInfo,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        // However the window goes away (including OS-initiated closes), allow the next capture.
-        cx.on_release(|_, cx| {
-            log::debug!("overlay closed");
-            cx.global_mut::<AppState>().overlay = None;
-        })
-        .detach();
+impl EditorView {
+    pub fn new(editor: Editor, image: ImageTiles, surface: Surface, cx: &mut Context<Self>) -> Self {
+        if let Surface::Capture { .. } = surface {
+            // However the window goes away (including OS-initiated closes), allow the next capture.
+            cx.on_release(|_, cx| {
+                log::debug!("overlay closed");
+                cx.global_mut::<AppState>().overlay = None;
+            })
+            .detach();
+        }
         cx.background_executor()
             .spawn(async {
                 if let Err(e) = bluesnap_platform::native().prewarm_text_recognition() {
@@ -147,19 +133,20 @@ impl Overlay {
                 }
             })
             .detach();
-        let scale = editor.scale();
+        let viewport = Viewport::native(editor.scale());
         Self {
             editor,
+            surface,
             focus: cx.focus_handle(),
-            background,
-            static_layer: Layer::default(),
-            active_layer: Layer::default(),
-            scale,
+            image,
+            static_layer: LayerCache::default(),
+            active_layer: LayerCache::default(),
+            viewport,
+            scroll: 0.0,
+            top_bar: 0.0,
             finished: false,
             status: None,
             ocr: None,
-            permission_url,
-            display,
         }
     }
 
@@ -175,25 +162,66 @@ impl Overlay {
         &self.focus
     }
 
-    fn to_px(&self, p: Point<Pixels>) -> Px {
-        Px::new(f32::from(p.x) * self.scale, f32::from(p.y) * self.scale)
+    /// Places the image in the window for this frame.
+    fn layout(&mut self, window: &Window) {
+        let native = Viewport::native(window.scale_factor());
+        self.viewport = match self.surface {
+            Surface::Capture { .. } => native,
+            Surface::Document => {
+                let win = window.viewport_size();
+                let (w, h) = (f32::from(win.width), f32::from(win.height));
+                let image = self.editor.screen();
+                // Fit the width, never above the image's native resolution.
+                let zoom = native.zoom.min((w - 2.0 * DOC_MARGIN) / image.w).max(0.01);
+                let top = DOC_INSET + toolbar::panel_size(toolbar::DOCUMENT_TOOLBAR, 0.0).1 + DOC_INSET;
+                self.top_bar = top - DOC_INSET / 2.0;
+                let max_scroll = (top + image.h * zoom + DOC_MARGIN - h).max(0.0);
+                self.scroll = self.scroll.clamp(0.0, max_scroll);
+                let x = ((w - image.w * zoom) / 2.0).max(DOC_MARGIN);
+                Viewport { origin: point(px(x), px(top - self.scroll)), zoom }
+            }
+        };
+        self.editor.set_ui_scale(self.viewport.ui_scale());
     }
 
-    fn to_logical(&self, r: PxRect) -> Bounds<Pixels> {
-        let s = self.scale;
-        Bounds::new(point(px(r.x / s), px(r.y / s)), size(px(r.w / s), px(r.h / s)))
+    /// The image area annotation layers are rendered for.
+    fn layer_clip(&self, window: &Window) -> PxRect {
+        let screen = self.editor.screen();
+        match self.surface {
+            Surface::Capture { .. } => screen,
+            Surface::Document => {
+                let v = self.viewport.visible_image_rect(window.viewport_size());
+                let y0 = ((v.y - v.h) / LAYER_SNAP).floor() * LAYER_SNAP;
+                let y1 = ((v.bottom() + v.h) / LAYER_SNAP).ceil() * LAYER_SNAP;
+                PxRect::from_edges(0.0, y0.max(0.0), screen.w, y1.min(screen.h))
+            }
+        }
     }
 
-    fn logical_rect(&self, r: PxRect) -> PxRect {
-        let s = self.scale;
-        PxRect::new(r.x / s, r.y / s, r.w / s, r.h / s)
-    }
-
-    /// Re-rasterizes the annotation layers whose content changed since last frame.
+    /// Re-rasterizes the annotation layers whose content or clip changed.
     fn sync_layers(&mut self, window: &mut Window) {
+        let clip = self.layer_clip(window);
         let e = &self.editor;
-        self.static_layer.sync(e.static_layer_revision(), || e.render_static_layer(), window);
-        self.active_layer.sync(e.active_layer_revision(), || e.render_active_layer(), window);
+        self.static_layer.sync(e.static_layer_revision(), clip, || e.render_static_layer(clip), window);
+        self.active_layer.sync(e.active_layer_revision(), clip, || e.render_active_layer(clip), window);
+    }
+
+    /// Runs a toolbar action.
+    pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            Action::Tool(tool) => self.editor.toggle_tool(tool),
+            Action::Undo => {
+                self.editor.undo();
+            }
+            Action::Scrolling => self.start_scrolling_capture(window, cx),
+            Action::ToText => self.extract_text(window, cx),
+            Action::Edit => {}
+            Action::Save | Action::Cancel | Action::Done => {
+                if let Some(how) = action.finish() {
+                    self.finish(how, window, cx);
+                }
+            }
+        }
     }
 
     pub fn finish(&mut self, how: Finish, window: &mut Window, cx: &mut Context<Self>) {
@@ -205,24 +233,18 @@ impl Overlay {
             Finish::Copy | Finish::Save => self.editor.export(),
         };
         window.remove_window();
-        match (how, image) {
-            (Finish::Copy, Some(image)) => output::copy_to_clipboard(image, cx),
-            (Finish::Save, Some(image)) => {
-                let dir = cx.global::<AppState>().config.save_dir();
-                output::save_with_dialog(image, dir, cx);
-            }
-            _ => {}
-        }
+        output::deliver(how, image, cx);
     }
 
     /// Closes the overlay and starts capturing the selection while the user scrolls.
     /// Annotations aren't carried over: the result is assembled from live frames.
-    pub fn start_scrolling_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_scrolling_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Surface::Capture { display, .. } = &self.surface else { return };
         let Some(sel) = self.editor.selection() else { return };
         let sel = sel.round();
         let rect = bluesnap_platform::PixelRect { x: sel.x as i32, y: sel.y as i32, width: sel.w as i32, height: sel.h as i32 };
         let screen = self.editor.screen();
-        let (display, screen) = (self.display.clone(), (screen.w as i32, screen.h as i32));
+        let (display, screen) = (display.clone(), (screen.w as i32, screen.h as i32));
         self.finish(Finish::Cancel, window, cx);
         cx.defer(move |cx| {
             if let Err(e) = crate::scrolling::start(display, screen, rect, cx) {
@@ -236,8 +258,8 @@ impl Overlay {
     }
 
     /// Recognizes the text in the selection (as displayed, so mosaicked text stays
-    /// hidden), copies it to the clipboard and closes the overlay.
-    pub fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// hidden), copies it to the clipboard and closes the view.
+    fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ocr.is_some() {
             return;
         }
@@ -294,7 +316,12 @@ impl Overlay {
         if self.ocr.is_none() {
             self.status = None;
         }
-        let p = self.to_px(ev.position);
+        if let Surface::Document = self.surface
+            && f32::from(ev.position.y) < self.top_bar
+        {
+            return; // the toolbar area, over content scrolled out of view
+        }
+        let p = self.viewport.to_image(ev.position);
         match ev.button {
             MouseButton::Left => {
                 if ev.click_count >= 2 && self.editor.double_click(p) {
@@ -314,7 +341,7 @@ impl Overlay {
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
         let (revision, cursor) = (self.editor.revision(), self.editor.cursor());
-        self.editor.pointer_move(self.to_px(ev.position), ev.modifiers.shift);
+        self.editor.pointer_move(self.viewport.to_image(ev.position), ev.modifiers.shift);
         if self.editor.revision() != revision || self.editor.cursor() != cursor {
             cx.notify();
         }
@@ -322,8 +349,15 @@ impl Overlay {
 
     fn mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
         if ev.button == MouseButton::Left {
-            self.editor.pointer_up(self.to_px(ev.position));
+            self.editor.pointer_up(self.viewport.to_image(ev.position));
             cx.notify();
+        }
+    }
+
+    fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        if let Surface::Document = self.surface {
+            self.scroll -= f32::from(ev.delta.pixel_delta(window.line_height()).y);
+            cx.notify(); // clamped in `layout`
         }
     }
 
@@ -360,35 +394,49 @@ impl Overlay {
         cx.notify();
     }
 
-    fn scene(&self, entity: Entity<Self>) -> Scene {
+    fn scene(&self, entity: Entity<Self>, window: &Window) -> Scene {
         let e = &self.editor;
-        let handles = match e.selection() {
-            Some(sel) if e.toolbar_visible() || !e.is_picking() => {
-                bluesnap_core::geom::Handle::ALL.iter().map(|h| sel.handle_point(*h)).collect()
+        let v = &self.viewport;
+        let window_bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let (dim, selection_frame, backdrop) = match self.surface {
+            Surface::Capture { .. } => {
+                let active = e.active_rect().map(|r| v.to_window(r));
+                let handles = match e.selection() {
+                    Some(sel) if e.selection_mode() == SelectionMode::Pick => bluesnap_core::geom::Handle::ALL
+                        .iter()
+                        .map(|h| v.point_to_window(sel.handle_point(*h)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                (Some(active), active.map(|a| (a, handles)), None)
             }
-            _ => Vec::new(),
+            Surface::Document => (None, None, Some(rgb(0xE9EAEE).into())),
         };
-        let to_point = |p: Px| point(px(p.x / self.scale), px(p.y / self.scale));
-        let screen = self.to_logical(e.screen());
+        let top_bar = match self.surface {
+            Surface::Capture { .. } => None,
+            Surface::Document => Some(px(self.top_bar)),
+        };
         Scene {
             entity,
             focus: self.focus.clone(),
-            background: self.background.clone(),
-            background_size: screen.size,
+            backdrop,
+            top_bar,
+            image_bounds: v.to_window(e.screen()),
+            tiles: self.image.visible(v, window_bounds),
             layers: [&self.static_layer, &self.active_layer]
                 .into_iter()
-                .filter_map(|l| l.image.as_ref().map(|(r, img)| (self.to_logical(*r), img.clone())))
+                .filter_map(|l| l.image().map(|(r, img)| (v.to_window(*r), img.clone())))
                 .collect(),
-            clip: e.selection().map(|r| self.to_logical(r)),
-            active: e.active_rect().map(|r| self.to_logical(r)),
-            handles: handles.into_iter().map(to_point).collect(),
+            clip: e.selection().map(|r| v.to_window(r)),
+            dim,
+            selection_frame,
             shape_frame: e
                 .selected_frame()
-                .map(|(r, hs)| (self.to_logical(r), hs.into_iter().map(to_point).collect())),
-            text_frame: e.text_frame().map(|r| self.to_logical(r)),
+                .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
+            text_frame: e.text_frame().map(|r| v.to_window(r)),
             caret: e.text_caret_rect().map(|r| {
                 let color = e.current_style().map_or(THEME_BLUE, |(_, s)| s.color);
-                (self.to_logical(r), self::color(color))
+                (v.to_window(r), self::color(color))
             }),
             cursor: match e.cursor() {
                 CursorKind::Default => CursorStyle::Arrow,
@@ -403,17 +451,49 @@ impl Overlay {
             editing_text: e.is_editing_text(),
         }
     }
+
+    /// Where the toolbar and style bar go, in window coordinates.
+    fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
+        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool));
+        match self.surface {
+            Surface::Capture { .. } => {
+                let sel = self.editor.selection().unwrap_or_default();
+                let screen = self.viewport.to_window_rect(self.editor.screen());
+                let layout = place_panels(
+                    self.viewport.to_window_rect(sel),
+                    screen,
+                    toolbar::panel_size(toolbar::CAPTURE_TOOLBAR, 0.0),
+                    style,
+                    PANEL_GAP,
+                );
+                let at = |r: PxRect| Point { x: r.x, y: r.y };
+                (at(layout.toolbar), layout.style_bar.map(at))
+            }
+            Surface::Document => {
+                // Top-left, with the style bar beside the toolbar, or below if narrow.
+                let (tw, th) = toolbar::panel_size(toolbar::DOCUMENT_TOOLBAR, 0.0);
+                let width = f32::from(window.viewport_size().width);
+                let toolbar = Point { x: DOC_INSET, y: DOC_INSET };
+                let style = style.map(|(sw, sh)| {
+                    let beside = DOC_INSET + tw + PANEL_GAP;
+                    if beside + sw + DOC_INSET <= width {
+                        Point { x: beside, y: DOC_INSET + (th - sh) / 2.0 }
+                    } else {
+                        Point { x: DOC_INSET, y: DOC_INSET + th + PANEL_GAP }
+                    }
+                });
+                (toolbar, style)
+            }
+        }
+    }
 }
 
-impl Render for Overlay {
+impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Device pixels per logical pixel. The screenshot is drawn 1:1 in device
-        // pixels from the window origin, so it is never resampled, even if the
-        // window ends up a little larger or smaller than the display.
-        self.scale = window.scale_factor();
+        self.layout(window);
         self.sync_layers(window);
 
-        let scene = self.scene(cx.entity());
+        let scene = self.scene(cx.entity(), window);
         let mut root = div()
             .size_full()
             .relative()
@@ -428,31 +508,34 @@ impl Render for Overlay {
                 .size_full(),
             );
 
-        let screen = self.logical_rect(self.editor.screen());
-        if let Some(active) = self.editor.active_rect() {
-            let label = format!("{} × {}", active.w.round() as i32, active.h.round() as i32);
-            let at = place_size_label(self.logical_rect(active), screen, (90.0, 20.0), 6.0);
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(px(at.x))
-                    .top(px(at.y))
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(4.0))
-                    .bg(rgba(0x0000_00B3))
-                    .text_color(white())
-                    .text_size(px(12.0))
-                    .child(label),
-            );
-        }
-
-        if let Some(url) = self.permission_url {
-            root = root.child(permission_banner(url, cx));
+        if let Surface::Capture { permission_url, .. } = self.surface {
+            if let Some(active) = self.editor.active_rect() {
+                let label = format!("{} × {}", active.w.round() as i32, active.h.round() as i32);
+                let screen = self.viewport.to_window_rect(self.editor.screen());
+                let at = place_size_label(self.viewport.to_window_rect(active), screen, (90.0, 20.0), 6.0);
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(at.x))
+                        .top(px(at.y))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(0x0000_00B3))
+                        .text_color(white())
+                        .text_size(px(12.0))
+                        .child(label),
+                );
+            }
+            if let Some(url) = permission_url {
+                root = root.child(permission_banner(url, cx));
+            }
         }
 
         if let (Some(status), Some(sel)) = (&self.status, self.editor.selection()) {
-            let b = self.to_logical(sel);
+            // Centered on the visible part of the selection.
+            let full = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+            let b = self.viewport.to_window(sel).intersect(&full);
             root = root.child(
                 div()
                     .absolute()
@@ -476,17 +559,14 @@ impl Render for Overlay {
             );
         }
 
-        if let (true, Some(sel)) = (self.editor.toolbar_visible(), self.editor.selection()) {
-            let style = self.editor.current_style();
-            let layout = place_panels(
-                self.logical_rect(sel),
-                screen,
-                toolbar::toolbar_size(),
-                style.map(|(tool, _)| toolbar::style_bar_size(tool)),
-                PANEL_GAP,
-            );
-            root = root.child(toolbar::toolbar(self, layout.toolbar.x, layout.toolbar.y, cx));
-            if let (Some((tool, style)), Some(at)) = (style, layout.style_bar) {
+        if self.editor.toolbar_visible() {
+            let groups = match self.surface {
+                Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
+                Surface::Document => toolbar::DOCUMENT_TOOLBAR,
+            };
+            let (at, style_at) = self.panel_positions(window);
+            root = root.child(toolbar::toolbar(self, groups, at.x, at.y, cx));
+            if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
                 root = root.child(toolbar::style_bar(tool, style.size, style.color, at.x, at.y, cx));
             }
         }
@@ -494,17 +574,24 @@ impl Render for Overlay {
     }
 }
 
-/// Everything the canvas paints, captured in logical pixels.
+/// Everything the canvas paints, captured in window coordinates.
 struct Scene {
-    entity: Entity<Overlay>,
+    entity: Entity<EditorView>,
     focus: FocusHandle,
-    background: Arc<RenderImage>,
-    background_size: gpui::Size<Pixels>,
+    /// Document surface: color behind the image.
+    backdrop: Option<Hsla>,
+    /// Document surface: the toolbar area, covered so scrolled content doesn't
+    /// show around the toolbars.
+    top_bar: Option<Pixels>,
+    image_bounds: Bounds<Pixels>,
+    tiles: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
     /// Annotation layers, bottom to top, and the selection they are clipped to.
     layers: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
     clip: Option<Bounds<Pixels>>,
-    active: Option<Bounds<Pixels>>,
-    handles: Vec<Point<Pixels>>,
+    /// Capture surface: dim everything outside this (or everything, if `None`).
+    dim: Option<Option<Bounds<Pixels>>>,
+    /// Capture surface: the highlighted region's border and its resize handles.
+    selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
@@ -515,13 +602,17 @@ struct Scene {
 impl Scene {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let blue = color(THEME_BLUE);
-        let screen = Bounds::new(bounds.origin, self.background_size);
-        window.paint_image(screen, Corners::default(), self.background.clone(), 0, false).ok();
+        if let Some(backdrop) = self.backdrop {
+            window.paint_quad(fill(bounds, backdrop));
+            let frame = self.image_bounds.dilate(px(1.));
+            window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), rgba(0x0000_0026), BorderStyle::Solid));
+        }
+        paint_tiles(self.tiles, window);
 
         // Dim everything outside the highlighted region.
         let dim = rgba(0x0000_0073);
-        match self.active {
-            Some(a) => {
+        match self.dim {
+            Some(Some(a)) => {
                 let (l, t, r, b) = (a.left(), a.top(), a.right(), a.bottom());
                 let (w, h) = (bounds.size.width, bounds.size.height);
                 for (x0, y0, x1, y1) in [(px(0.), px(0.), w, t), (px(0.), b, w, h), (px(0.), t, l, b), (r, t, w, b)] {
@@ -530,7 +621,8 @@ impl Scene {
                     }
                 }
             }
-            None => window.paint_quad(fill(bounds, dim)),
+            Some(None) => window.paint_quad(fill(bounds, dim)),
+            None => {}
         }
 
         if let Some(clip) = self.clip {
@@ -541,15 +633,15 @@ impl Scene {
             });
         }
 
-        if let Some(a) = self.active {
+        if let Some((region, handles)) = &self.selection_frame {
             // Outside the region, so the border never covers captured pixels.
-            let border = a.dilate(px(BORDER));
+            let border = region.dilate(px(BORDER));
             window.paint_quad(quad(border, px(0.), transparent_black(), px(BORDER), blue, BorderStyle::Solid));
-        }
-        for p in &self.handles {
-            let r = px(HANDLE_RADIUS);
-            let b = Bounds::centered_at(*p, size(r * 2., r * 2.));
-            window.paint_quad(quad(b, r, blue, px(1.5), white(), BorderStyle::Solid));
+            for p in handles {
+                let r = px(HANDLE_RADIUS);
+                let b = Bounds::centered_at(*p, size(r * 2., r * 2.));
+                window.paint_quad(quad(b, r, blue, px(1.5), white(), BorderStyle::Solid));
+            }
         }
 
         if let Some((frame, handles)) = &self.shape_frame {
@@ -565,18 +657,29 @@ impl Scene {
         if let Some((caret, color)) = self.caret {
             window.paint_quad(fill(caret, color));
         }
+        if let (Some(height), Some(backdrop)) = (self.top_bar, self.backdrop) {
+            let bar = Bounds::new(bounds.origin, size(bounds.size.width, height));
+            window.paint_quad(fill(bar, backdrop));
+        }
 
         window.set_cursor_style(self.cursor, &hitbox);
         if self.editing_text {
             window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.entity.clone()), cx);
         }
 
-        // Presses only count on the canvas (panels above it occlude it); moves and
-        // releases are tracked everywhere so drags keep working over the panels.
+        // Presses and wheel only count on the canvas (panels above it occlude it);
+        // moves and releases are tracked everywhere so drags keep working over the panels.
         let entity = self.entity.clone();
+        let pressed = hitbox.clone();
         window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+            if phase == DispatchPhase::Bubble && pressed.is_hovered(window) {
                 entity.update(cx, |this, cx| this.mouse_down(ev, window, cx));
+            }
+        });
+        let entity = self.entity.clone();
+        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                entity.update(cx, |this, cx| this.scroll_wheel(ev, window, cx));
             }
         });
         let entity = self.entity.clone();
@@ -622,7 +725,7 @@ fn range_to_utf16(text: &str, r: &Range<usize>) -> Range<usize> {
     byte_to_utf16(text, r.start)..byte_to_utf16(text, r.end)
 }
 
-impl EntityInputHandler for Overlay {
+impl EntityInputHandler for EditorView {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -683,12 +786,12 @@ impl EntityInputHandler for Overlay {
     ) -> Option<Bounds<Pixels>> {
         let text = self.editor.text_content()?;
         let caret = self.editor.text_caret_rect_at(utf16_to_byte(text, range.start))?;
-        let b = self.to_logical(caret);
+        let b = self.viewport.to_window(caret);
         Some(Bounds::new(element.origin + b.origin, b.size))
     }
 
     fn character_index_for_point(&mut self, p: Point<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
-        let index = self.editor.text_index_at(self.to_px(p))?;
+        let index = self.editor.text_index_at(self.viewport.to_image(p))?;
         Some(byte_to_utf16(self.editor.text_content()?, index))
     }
 }

@@ -4,32 +4,35 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod assets;
+mod capture;
 mod config;
+mod document;
+mod editor_view;
+mod gpu_image;
 mod output;
-mod overlay;
 mod scrolling;
 mod toolbar;
+mod viewport;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Context as _;
-use bluesnap_core::{Document, Editor, FontSet, Rect};
+use bluesnap_core::FontSet;
 use bluesnap_platform::{Native, Platform, Tray, TrayCommand};
 use futures::StreamExt;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
     AnyWindowHandle, App, AppContext, Application, Bounds, Context, Global, IntoElement, ParentElement, Render,
-    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, size,
+    Styled, Window, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, size,
 };
 
 use crate::config::Config;
-use crate::overlay::Overlay;
 
 pub struct AppState {
     pub config: Config,
-    fonts: Arc<FontSet>,
+    pub(crate) fonts: Arc<FontSet>,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
     /// The running scrolling capture, if any.
@@ -123,7 +126,7 @@ fn register_hotkey(spec: &str, cx: &mut App) -> anyhow::Result<GlobalHotKeyManag
     cx.spawn(async move |cx| {
         while let Some(event) = rx.next().await {
             if event.id == id && event.state == HotKeyState::Pressed {
-                cx.update(start_capture).ok();
+                cx.update(capture::start_capture).ok();
             }
         }
     })
@@ -143,7 +146,7 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                 TrayCommand::Capture => {
                     // Let the menu finish closing so it isn't in the screenshot.
                     cx.background_executor().timer(Duration::from_millis(200)).await;
-                    cx.update(start_capture).ok();
+                    cx.update(capture::start_capture).ok();
                 }
                 TrayCommand::EditSettings => {
                     cx.update(|cx| match Config::path() {
@@ -161,93 +164,6 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
     })
     .detach();
     Ok(tray)
-}
-
-fn start_capture(cx: &mut App) {
-    // During a scrolling capture the hotkey means "done".
-    if let Some(session) = cx.global_mut::<AppState>().scrolling.take() {
-        session.update(cx, |s, cx| s.finish(scrolling::Finish::Copy, cx)).ok();
-        return;
-    }
-    if cx.global::<AppState>().overlay.is_some() {
-        log::debug!("hotkey ignored: a capture is already open");
-        return;
-    }
-    if let Err(e) = open_overlay(cx) {
-        log::error!("capture failed: {e:#}");
-    }
-}
-
-fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
-    let started = Instant::now();
-    let mut stages = Vec::new();
-    let platform = bluesnap_platform::native();
-    let capture = platform.capture_display_under_cursor()?;
-    stages.push(("capture", started.elapsed()));
-
-    let display = cx
-        .displays()
-        .into_iter()
-        .find(|d| u32::from(d.id()) == capture.display.id)
-        .context("captured display not known to gpui")?;
-
-    let (width, height) = (capture.image.width, capture.image.height);
-    let mut bgra = capture.image.bgrx;
-    anyhow::ensure!(bgra.len() == width as usize * height as usize * 4, "bad capture buffer");
-    let rgba = bluesnap_core::pixels::split_bgrx(&mut bgra);
-    let background = Arc::new(overlay::background_image(width, height, bgra).context("bad capture buffer")?);
-    stages.push(("gpu image", started.elapsed()));
-    let scale = capture.display.scale_factor;
-    let mosaic_block = (8.0 * scale).round() as u32;
-    let windows = capture
-        .windows
-        .iter()
-        .map(|w| Rect::new(w.x as f32, w.y as f32, w.width as f32, w.height as f32))
-        .collect();
-    let doc = Document::from_rgba(width, height, rgba, mosaic_block).context("bad capture buffer")?;
-    let fonts = cx.global::<AppState>().fonts.clone();
-    let editor = Editor::new(doc, fonts, windows, scale);
-    let permission_url = capture.permission_missing.then(|| platform.permission_settings_url()).flatten();
-    stages.push(("editor", started.elapsed()));
-
-    let options = WindowOptions {
-        window_bounds: Some(if Native::OVERLAY_FULLSCREEN {
-            WindowBounds::Fullscreen(display.bounds())
-        } else {
-            WindowBounds::Windowed(display.bounds())
-        }),
-        titlebar: None,
-        focus: true,
-        show: true,
-        kind: WindowKind::PopUp,
-        is_movable: false,
-        is_resizable: false,
-        is_minimizable: false,
-        display_id: Some(display.id()),
-        window_background: WindowBackgroundAppearance::Opaque,
-        ..Default::default()
-    };
-    let handle = cx.open_window(options, |_, cx| cx.new(|cx| Overlay::new(editor, background, permission_url, capture.display.clone(), cx)))?;
-    stages.push(("open window", started.elapsed()));
-    handle.update(cx, |view, window, _| {
-        if let Err(e) = platform.configure_overlay(window, &capture.display) {
-            log::warn!("overlay setup: {e:#}");
-        }
-        window.focus(view.focus_handle());
-        window.activate_window();
-        stages.push(("configure", started.elapsed()));
-        let stages = std::mem::take(&mut stages);
-        // Frame callbacks run before drawing, so the nested one runs once the
-        // first frame (including the screenshot texture upload) is presented.
-        window.on_next_frame(move |window, _| {
-            window.on_next_frame(move |_, _| {
-                let timeline: Vec<String> = stages.iter().map(|(name, t)| format!("{name} {t:.1?}")).collect();
-                log::debug!("overlay timeline: {}, first frame presented {:.1?}", timeline.join(", "), started.elapsed());
-            });
-        });
-    })?;
-    cx.global_mut::<AppState>().overlay = Some(handle.into());
-    Ok(())
 }
 
 /// Explains a problem the user has to fix (e.g. a hotkey another app owns).

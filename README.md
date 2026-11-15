@@ -17,8 +17,11 @@ Press the hotkey, then:
   on screen: the overlay closes, a blue frame marks the selection and a bar shows
   progress. Scroll the window under the frame (mouse wheel or trackpad; input passes
   through the frame) and bluesnap captures it about 10 times a second, stitching the
-  frames into one tall image. Sticky headers and footers appear once. Done (or the
-  hotkey again) copies it, Save writes a PNG, ✕ cancels. Scroll at a moderate
+  frames into one tall image. Sticky headers and footers appear once. The bar
+  next to the region has Edit, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
+  image, Save writes a PNG, ✕ cancels, and Edit opens it in a window with the
+  same tools as the capture toolbar (shapes, pen, mosaic, text, undo, To text,
+  Save, ✕, ✓), scrolled with the mouse wheel. Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
   scrolling back a little picks it up again. Content redrawn at fractional pixel
   offsets (display scaling, trackpads) is matched with sub-pixel accuracy. Only
@@ -50,7 +53,14 @@ crates/
               macos.rs    CoreGraphics capture and window list, AppKit overlay setup
               linux.rs    stub (builds, capture returns an error)
   ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
-  app/        bluesnap: the GPUI frontend. Hotkey, overlay window, toolbar, clipboard, save.
+  app/        bluesnap: the GPUI frontend.
+              editor_view.rs  the editing view, on two surfaces: the full-screen capture
+                              overlay and a document window (scrolling screenshots)
+              capture.rs      hotkey -> capture -> overlay; document.rs opens a document
+              scrolling.rs    scrolling capture session (dim layer, bar, stitching loop)
+              toolbar.rs      one table of toolbar actions; toolbars are lists of them
+              viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU images
+              output.rs       copy / save / cancel
 packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
 third_party/xattr   patched copy of a gpui dependency (see below)
 ```

@@ -31,6 +31,16 @@ pub enum TextKey {
     Newline,
 }
 
+/// How the selection behaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// Capture: starts empty, the user picks a window or drags a region, then can
+    /// move and resize it.
+    Pick,
+    /// Document editing: the whole image is selected and stays that way.
+    Fixed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightClick {
     /// Nothing selected yet: the frontend should end the capture.
@@ -59,7 +69,14 @@ struct TextEdit {
 pub struct Editor {
     doc: Document,
     fonts: Arc<FontSet>,
+    /// Content scale: screenshot pixels per logical pixel, for stroke widths and
+    /// font sizes.
     scale: f32,
+    /// Interaction scale: screenshot pixels per logical pixel *on screen right
+    /// now*, for hit radii and drag thresholds. Differs from `scale` when the
+    /// image is shown zoomed.
+    ui_scale: f32,
+    mode: SelectionMode,
     /// Candidate window rectangles, topmost first.
     windows: Vec<Rect>,
     pointer: Point,
@@ -89,6 +106,8 @@ impl Editor {
             doc,
             fonts,
             scale,
+            ui_scale: scale,
+            mode: SelectionMode::Pick,
             windows,
             pointer: Point::default(),
             hover: None,
@@ -106,6 +125,26 @@ impl Editor {
         };
         editor.update_hover();
         editor
+    }
+
+    /// An editor for a whole image (e.g. a stitched scrolling screenshot): the
+    /// selection is the image and can't be changed, only annotated.
+    pub fn for_document(doc: Document, fonts: Arc<FontSet>, scale: f32) -> Self {
+        let mut editor = Self::new(doc, fonts, Vec::new(), scale);
+        editor.mode = SelectionMode::Fixed;
+        editor.selection = Some(editor.screen());
+        editor.hover = None;
+        editor
+    }
+
+    pub fn selection_mode(&self) -> SelectionMode {
+        self.mode
+    }
+
+    /// Screenshot pixels per on-screen logical pixel, when the frontend shows the
+    /// image zoomed. Keeps handles and thresholds the same size on screen.
+    pub fn set_ui_scale(&mut self, ui_scale: f32) {
+        self.ui_scale = ui_scale;
     }
 
     fn metrics(&self) -> Metrics<'_> {
@@ -225,7 +264,7 @@ impl Editor {
         let p = self.pointer;
         let Some(sel) = self.selection else { return CursorKind::Crosshair };
         if let Some(edit) = &self.text
-            && self.shapes[edit.idx].bounds(self.metrics()).inflate(4.0 * self.scale).contains(p)
+            && self.shapes[edit.idx].bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)
         {
             return CursorKind::Text;
         }
@@ -235,7 +274,7 @@ impl Editor {
                 _ => CursorKind::Crosshair,
             };
         }
-        if let Some(h) = sel.handle_at(p, HANDLE_HIT_RADIUS * self.scale) {
+        if let Some(h) = self.selection_handle_at(sel, p) {
             return h.cursor();
         }
         if self.shape_at(p).is_some() {
@@ -244,7 +283,7 @@ impl Editor {
         match self.tool {
             Some(Tool::Text) if sel.contains(p) => CursorKind::Text,
             Some(_) if sel.contains(p) => CursorKind::Crosshair,
-            None if sel.contains(p) => CursorKind::Move,
+            None if sel.contains(p) && self.mode == SelectionMode::Pick => CursorKind::Move,
             _ => CursorKind::Default,
         }
     }
@@ -254,9 +293,17 @@ impl Editor {
         self.shapes.iter().rposition(|s| s.hit(p, m))
     }
 
+    /// The selection's resize handle under `p`, if the selection can be resized.
+    fn selection_handle_at(&self, sel: Rect, p: Point) -> Option<Handle> {
+        match self.mode {
+            SelectionMode::Pick => sel.handle_at(p, HANDLE_HIT_RADIUS * self.ui_scale),
+            SelectionMode::Fixed => None,
+        }
+    }
+
     fn shape_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
         let idx = self.selected?;
-        let radius = HANDLE_HIT_RADIUS * self.scale;
+        let radius = HANDLE_HIT_RADIUS * self.ui_scale;
         self.shapes[idx]
             .handles()
             .into_iter()
@@ -277,7 +324,7 @@ impl Editor {
 
         if let Some(edit) = self.text.clone() {
             let shape = &self.shapes[edit.idx];
-            if shape.bounds(self.metrics()).inflate(4.0 * self.scale).contains(p) {
+            if shape.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p) {
                 self.set_caret_from_point(p);
             } else {
                 self.finish_text();
@@ -297,7 +344,7 @@ impl Editor {
             self.touch_shapes();
             return;
         }
-        if let Some(handle) = sel.handle_at(p, HANDLE_HIT_RADIUS * self.scale) {
+        if let Some(handle) = self.selection_handle_at(sel, p) {
             self.drag = Some(Drag::SelResize { handle, orig: sel, start: p });
             return;
         }
@@ -314,7 +361,8 @@ impl Editor {
         }
         match self.tool {
             Some(tool) => self.start_shape(tool, p),
-            None => self.drag = Some(Drag::SelMove { orig: sel, start: p }),
+            None if self.mode == SelectionMode::Pick => self.drag = Some(Drag::SelMove { orig: sel, start: p }),
+            None => {}
         }
     }
 
@@ -360,7 +408,7 @@ impl Editor {
             return;
         };
         let screen = self.doc.bounds();
-        let scale = self.scale;
+        let scale = self.ui_scale;
         let shape_drag = matches!(drag, Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. });
         match drag {
             Drag::Pick { start, moved } => {
@@ -415,7 +463,7 @@ impl Editor {
         match drag {
             Drag::Pick { start, moved } => {
                 let r = Rect::from_points(start, p).intersect(&self.screen());
-                let min = DRAG_THRESHOLD * self.scale;
+                let min = DRAG_THRESHOLD * self.ui_scale;
                 self.selection = match r {
                     Some(r) if moved && r.w >= min && r.h >= min => Some(r.round()),
                     _ => self.hover,
@@ -455,7 +503,7 @@ impl Editor {
             self.finish_text();
             return RightClick::Handled;
         }
-        if self.drag.is_some() || !self.shapes.is_empty() {
+        if self.drag.is_some() || !self.shapes.is_empty() || self.mode == SelectionMode::Fixed {
             return RightClick::Handled;
         }
         if self.selection.is_none() {
@@ -683,26 +731,30 @@ impl Editor {
     /// Every annotation except the active one, over the area they cover. This is
     /// independent of the selection (the frontend clips to it), so it only needs
     /// re-rendering when a shape is committed, deleted, restyled or undone.
-    pub fn render_static_layer(&self) -> Option<(Rect, Pixmap)> {
+    ///
+    /// Only the part inside `clip` is rendered (pass [`Self::screen`] for all of
+    /// it); tall documents pass the visible area to keep textures small.
+    pub fn render_static_layer(&self, clip: Rect) -> Option<(Rect, Pixmap)> {
         let active = self.active_index();
         let shapes: Vec<&Shape> =
             self.shapes.iter().enumerate().filter(|(i, _)| Some(*i) != active).map(|(_, s)| s).collect();
-        self.render_shapes(&shapes, None)
+        self.render_shapes(&shapes, None, clip)
     }
 
     /// The shape being drawn, dragged or typed into, over just its own bounds, so
     /// each mouse move or keystroke re-rasterizes only that shape. While active it
     /// is drawn above the others; it drops back to its place when released.
-    pub fn render_active_layer(&self) -> Option<(Rect, Pixmap)> {
+    /// Clipped to `clip` like [`Self::render_static_layer`].
+    pub fn render_active_layer(&self, clip: Rect) -> Option<(Rect, Pixmap)> {
         let idx = self.active_index()?;
         let underline = self.text.as_ref().and_then(|e| Some((0, e.marked.clone()?)));
-        self.render_shapes(&[&self.shapes[idx]], underline)
+        self.render_shapes(&[&self.shapes[idx]], underline, clip)
     }
 
-    fn render_shapes(&self, shapes: &[&Shape], underline: Option<render::Underline>) -> Option<(Rect, Pixmap)> {
+    fn render_shapes(&self, shapes: &[&Shape], underline: Option<render::Underline>, clip: Rect) -> Option<(Rect, Pixmap)> {
         let m = self.metrics();
         let bounds = shapes.iter().map(|s| s.bounds(m)).reduce(|a, b| a.union(&b))?;
-        let region = bounds.inflate(1.0).round_out().intersect(&self.screen())?;
+        let region = bounds.inflate(1.0).round_out().intersect(&self.screen())?.intersect(&clip.round_out())?;
         let pixmap = render::render_layer(&self.doc, region, shapes, m, underline)?;
         Some((region, pixmap))
     }
@@ -868,13 +920,13 @@ mod tests {
         assert_eq!(e.static_layer_revision(), static_rev);
         assert!(e.active_layer_revision() > active_rev);
         // The active layer covers only the stroke; the rectangle stays in the static one.
-        let (active, _) = e.render_active_layer().unwrap();
+        let (active, _) = e.render_active_layer(e.screen()).unwrap();
         assert!(active.x > 150.0 && active.w < 100.0);
-        let (fixed, _) = e.render_static_layer().unwrap();
+        let (fixed, _) = e.render_static_layer(e.screen()).unwrap();
         assert!(fixed.right() < 100.0);
         e.pointer_up(Point::new(240.0, 230.0));
-        assert!(e.render_active_layer().is_none());
-        assert!(e.render_static_layer().unwrap().0.right() > 200.0);
+        assert!(e.render_active_layer(e.screen()).is_none());
+        assert!(e.render_static_layer(e.screen()).unwrap().0.right() > 200.0);
     }
 
     #[test]
@@ -888,6 +940,62 @@ mod tests {
         drag(&mut e, (150.0, 150.0), (170.0, 160.0));
         assert_eq!(e.selection(), Some(Rect::new(70.0, 60.0, 200.0, 150.0)));
         assert_eq!((e.static_layer_revision(), e.active_layer_revision()), revs);
+    }
+
+    fn document_editor() -> Editor {
+        let doc = Document::from_rgba(400, 3000, vec![255; 400 * 3000 * 4], 8).unwrap();
+        Editor::for_document(doc, Arc::new(FontSet::empty()), 1.0)
+    }
+
+    #[test]
+    fn document_selection_is_the_image_and_never_changes() {
+        let mut e = document_editor();
+        let image = Rect::new(0.0, 0.0, 400.0, 3000.0);
+        assert_eq!(e.selection(), Some(image));
+        assert!(e.toolbar_visible());
+        // Dragging the body or an edge without a tool changes nothing.
+        drag(&mut e, (200.0, 200.0), (260.0, 300.0));
+        drag(&mut e, (400.0, 1500.0), (300.0, 1500.0));
+        assert_eq!(e.selection(), Some(image));
+        assert_eq!(e.cursor(), CursorKind::Default);
+        assert_eq!(e.right_click(), RightClick::Handled);
+        assert_eq!(e.selection(), Some(image));
+    }
+
+    #[test]
+    fn document_annotations_export_with_the_whole_image() {
+        let mut e = document_editor();
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (50.0, 2500.0), (150.0, 2600.0));
+        drag(&mut e, (60.0, 2510.0), (70.0, 2520.0)); // inside: draws a second one
+        assert_eq!(e.shapes.len(), 2);
+        let out = e.export().unwrap();
+        assert_eq!((out.width(), out.height()), (400, 3000));
+        let px = out.pixel(50, 2550).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue()), (0xF5, 0x22, 0x2D));
+    }
+
+    #[test]
+    fn ui_scale_sets_handle_hit_radius_on_screen() {
+        let mut e = editor();
+        drag(&mut e, (10.0, 20.0), (110.0, 80.0));
+        // 12 px from the corner: outside the 8 px radius at 1:1 ...
+        e.pointer_move(Point::new(122.0, 80.0), false);
+        assert_eq!(e.cursor(), CursorKind::Default);
+        // ... inside it when one on-screen pixel is two image pixels.
+        e.set_ui_scale(2.0);
+        e.pointer_move(Point::new(122.0, 80.5), false);
+        assert_eq!(e.cursor(), CursorKind::ResizeNwSe);
+    }
+
+    #[test]
+    fn layers_are_clipped() {
+        let mut e = document_editor();
+        e.toggle_tool(Tool::Pen);
+        drag(&mut e, (100.0, 100.0), (100.0, 2900.0));
+        let (region, pixmap) = e.render_static_layer(Rect::new(0.0, 1000.0, 400.0, 500.0)).unwrap();
+        assert!(region.y >= 1000.0 && region.bottom() <= 1500.0);
+        assert_eq!(pixmap.height() as f32, region.h);
     }
 
     #[test]

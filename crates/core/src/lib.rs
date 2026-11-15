@@ -15,7 +15,7 @@ pub mod stitch;
 pub mod style;
 pub mod text;
 
-pub use editor::{Editor, RightClick, TextKey};
+pub use editor::{Editor, RightClick, SelectionMode, TextKey};
 pub use geom::{CursorKind, Point, Rect};
 pub use render::Document;
 pub use style::{Color, PALETTE, SizeLevel, Style, THEME_BLUE, Tool};
