@@ -20,8 +20,7 @@ pub fn open(image: Pixmap, scale: f32, display: Option<DisplayId>, cx: &mut App)
     // Opaque, so premultiplied and straight alpha are the same bytes.
     let rgba = image.take();
     let tiles = ImageTiles::from_bgra(width, height, swap_red_blue(&rgba)).context("bad image")?;
-    let mosaic_block = (8.0 * scale).round() as u32;
-    let doc = Document::from_rgba(width, height, rgba, mosaic_block).context("bad image")?;
+    let doc = Document::from_rgba(width, height, rgba).context("bad image")?;
     let fonts = cx.global::<AppState>().fonts.clone();
     let editor = Editor::for_document(doc, fonts, scale);
 

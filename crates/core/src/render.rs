@@ -2,7 +2,8 @@
 //!
 //! The same code renders the live annotation layer and the final exported image.
 
-use std::cell::OnceCell;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use tiny_skia::{
@@ -11,22 +12,21 @@ use tiny_skia::{
 
 use crate::geom::{Point, Rect};
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
-use crate::pixels::{crop, pixelate, pixmap_from_rgba};
-use crate::shape::{Geometry, Metrics, Shape, arrow_head_len};
-use crate::style::Color;
+use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
+use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len};
+use crate::style::{Color, REDACT_GRAY, RedactEffect};
 
 /// The frozen screenshot an editing session works on.
 pub struct Document {
     image: Pixmap,
-    mosaic_block: u32,
-    mosaic: OnceCell<Pixmap>,
+    effects: EffectCache,
 }
 
 impl Document {
     /// Wraps opaque RGBA8 pixels. Returns `None` if `rgba` does not match the size.
-    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>, mosaic_block: u32) -> Option<Self> {
+    pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
         let image = pixmap_from_rgba(width, height, rgba)?;
-        Some(Self { image, mosaic_block: mosaic_block.max(2), mosaic: OnceCell::new() })
+        Some(Self { image, effects: EffectCache::default() })
     }
 
     pub fn width(&self) -> u32 {
@@ -45,10 +45,107 @@ impl Document {
         &self.image
     }
 
-    /// Pixelated copy of the screenshot, computed on first use.
-    fn mosaic(&self) -> &Pixmap {
-        self.mosaic.get_or_init(|| pixelate(&self.image, self.mosaic_block))
+    /// The screenshot under `area` with `effect` applied at `amount` (see
+    /// [`RedactEffect::amount`]), and the image position of its top-left corner
+    /// (the area is rounded out to whole tiles).
+    pub fn effect_region(&self, effect: RedactEffect, amount: u32, area: Rect) -> Option<(Pixmap, (u32, u32))> {
+        self.effects.region(&self.image, effect, amount, area)
     }
+}
+
+/// Side of a cached effect tile, in pixels.
+const EFFECT_TILE: u32 = 256;
+/// Effect variants (effect and amount) kept; slider drags cycle through many.
+const EFFECT_VARIANTS: usize = 4;
+
+/// Effect images of the screenshot, computed in tiles on demand so only the
+/// pixels under redactions are ever processed, even in very large images.
+#[derive(Default)]
+struct EffectCache {
+    /// Most recently used last; tiles keyed by (column, row).
+    variants: RefCell<Vec<((RedactEffect, u32), EffectTiles)>>,
+}
+
+/// One effect variant's computed tiles, by (column, row).
+type EffectTiles = HashMap<(u32, u32), Pixmap>;
+
+impl EffectCache {
+    fn region(&self, image: &Pixmap, effect: RedactEffect, amount: u32, area: Rect) -> Option<(Pixmap, (u32, u32))> {
+        let (w, h) = (image.width(), image.height());
+        let area = area.round_out().intersect(&Rect::new(0.0, 0.0, w as f32, h as f32))?;
+        let (c0, c1) = (area.x as u32 / EFFECT_TILE, (area.right() as u32).div_ceil(EFFECT_TILE));
+        let (r0, r1) = (area.y as u32 / EFFECT_TILE, (area.bottom() as u32).div_ceil(EFFECT_TILE));
+        let mut variants = self.variants.borrow_mut();
+        let key = (effect, amount);
+        let at = match variants.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                if variants.len() == EFFECT_VARIANTS {
+                    variants.remove(0);
+                }
+                variants.push((key, HashMap::new()));
+                variants.len() - 1
+            }
+        };
+        let entry = variants.remove(at);
+        variants.push(entry);
+        let tiles = &mut variants.last_mut().expect("just pushed").1;
+
+        let tile_rect = |(col, row): (u32, u32)| {
+            Rect::from_edges(
+                (col * EFFECT_TILE) as f32,
+                (row * EFFECT_TILE) as f32,
+                ((col + 1) * EFFECT_TILE).min(w) as f32,
+                ((row + 1) * EFFECT_TILE).min(h) as f32,
+            )
+        };
+        let wanted: Vec<(u32, u32)> = (r0..r1).flat_map(|row| (c0..c1).map(move |col| (col, row))).collect();
+        let missing: Vec<(u32, u32)> = wanted.iter().copied().filter(|k| !tiles.contains_key(k)).collect();
+        for (key, tile) in missing.iter().zip(par_map(&missing, |&k| effect_tile(image, effect, amount, tile_rect(k)))) {
+            tiles.insert(*key, tile?);
+        }
+
+        let (x0, y0) = (c0 * EFFECT_TILE, r0 * EFFECT_TILE);
+        let (x1, y1) = ((c1 * EFFECT_TILE).min(w), (r1 * EFFECT_TILE).min(h));
+        let mut out = Pixmap::new(x1 - x0, y1 - y0)?;
+        let out_stride = (x1 - x0) as usize * 4;
+        for key in wanted {
+            let (tile, pixels) = (tile_rect(key), &tiles[&key]);
+            let (tx, ty) = (tile.x as u32 - x0, tile.y as u32 - y0);
+            let tile_stride = pixels.width() as usize * 4;
+            for (i, line) in pixels.data().chunks_exact(tile_stride).enumerate() {
+                let at = (ty as usize + i) * out_stride + tx as usize * 4;
+                out.data_mut()[at..at + tile_stride].copy_from_slice(line);
+            }
+        }
+        Some((out, (x0, y0)))
+    }
+}
+
+/// `effect` over `tile` of `image`, reading enough pixels around it that the
+/// result equals applying the effect to the whole image.
+fn effect_tile(image: &Pixmap, effect: RedactEffect, amount: u32, tile: Rect) -> Option<Pixmap> {
+    let (w, h) = (image.width(), image.height());
+    let (tx0, ty0, tx1, ty1) = (tile.x as u32, tile.y as u32, tile.right() as u32, tile.bottom() as u32);
+    let (sx0, sy0, sx1, sy1) = match effect {
+        // Blocks on one grid for the whole image.
+        RedactEffect::Mosaic => {
+            let snap = |v: u32| (v / amount) * amount;
+            let up = |v: u32, max: u32| (v.div_ceil(amount) * amount).min(max);
+            (snap(tx0), snap(ty0), up(tx1, w), up(ty1, h))
+        }
+        RedactEffect::Blur => {
+            let m = blur_margin(amount as f32 / 2.0) as u32;
+            (tx0.saturating_sub(m), ty0.saturating_sub(m), (tx1 + m).min(w), (ty1 + m).min(h))
+        }
+        RedactEffect::Gray => return None,
+    };
+    let source = crop(image, sx0, sy0, sx1 - sx0, sy1 - sy0)?;
+    let done = match effect {
+        RedactEffect::Mosaic => pixelate(&source, amount),
+        _ => gaussian_blur(&source, amount as f32 / 2.0),
+    };
+    crop(&done, tx0 - sx0, ty0 - sy0, tx1 - tx0, ty1 - ty0)
 }
 
 /// IME composition underline for a text shape: (index into the rendered shapes, byte range in its content).
@@ -114,19 +211,42 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
             }
         }
-        Geometry::Mosaic(pts) => {
-            if let Some(path) = smooth_path(pts) {
-                let paint = Paint {
-                    shader: Pattern::new(
-                        doc.mosaic().as_ref(),
-                        SpreadMode::Pad,
-                        FilterQuality::Nearest,
-                        1.0,
-                        Transform::identity(),
-                    ),
-                    ..Paint::default()
-                };
-                pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
+        Geometry::Redact { area, effect, strength } => {
+            let region;
+            let paint = match effect {
+                RedactEffect::Gray => solid(REDACT_GRAY),
+                _ => {
+                    // The effect over just the area this shape covers.
+                    let amount = effect.amount(*strength, m.scale);
+                    let Some((pixels, (x0, y0))) = doc.effect_region(*effect, amount, shape.bounds(m)) else {
+                        return;
+                    };
+                    region = pixels;
+                    let mut paint = Paint {
+                        shader: Pattern::new(
+                            region.as_ref(),
+                            SpreadMode::Pad,
+                            FilterQuality::Nearest,
+                            1.0,
+                            Transform::from_translate(x0 as f32, y0 as f32),
+                        ),
+                        ..Paint::default()
+                    };
+                    paint.anti_alias = true;
+                    paint
+                }
+            };
+            match area {
+                RedactShape::Brush(pts) => {
+                    if let Some(path) = smooth_path(pts) {
+                        pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
+                    }
+                }
+                RedactShape::Rect(r) => {
+                    if let Some(rect) = tiny_skia::Rect::from_xywh(r.x, r.y, r.w, r.h) {
+                        pixmap.fill_rect(rect, &paint, ts, None);
+                    }
+                }
             }
         }
         Geometry::Text { origin, content } => {
@@ -204,7 +324,7 @@ fn draw_underline(pixmap: &mut Pixmap, shape: &Shape, m: Metrics, range: Range<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{PALETTE, SizeLevel, Style};
+    use crate::style::{PALETTE, RedactEffect, SizeLevel, Style};
     use crate::text::FontSet;
 
     fn doc(w: u32, h: u32) -> Document {
@@ -216,7 +336,7 @@ mod tests {
                 rgba[i..i + 3].copy_from_slice(&[0, 0, 0]);
             }
         }
-        Document::from_rgba(w, h, rgba, 8).unwrap()
+        Document::from_rgba(w, h, rgba).unwrap()
     }
 
     #[test]
@@ -238,5 +358,62 @@ mod tests {
         assert_eq!((px.red(), px.green(), px.blue()), (255, 255, 255));
     }
 
+    fn noise_doc(w: u32, h: u32) -> Document {
+        let mut seed = 99u32;
+        let rgba = (0..w * h)
+            .flat_map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let [r, g, b, _] = seed.to_le_bytes();
+                [r, g, b, 255]
+            })
+            .collect();
+        Document::from_rgba(w, h, rgba).unwrap()
+    }
 
+    #[test]
+    fn effect_bands_match_the_whole_image_effect() {
+        let d = noise_doc(600, 700);
+        // An area spanning tile boundaries (256) in both directions, ending
+        // inside the last, partial tiles.
+        let area = Rect::from_edges(200.0, 200.0, 590.0, 610.0);
+        for (effect, amount) in [(RedactEffect::Mosaic, 12), (RedactEffect::Blur, 9)] {
+            let (region, (x0, y0)) = d.effect_region(effect, amount, area).unwrap();
+            assert_eq!((x0, y0, region.width(), region.height()), (0, 0, 600, 700));
+            let whole = match effect {
+                RedactEffect::Mosaic => crate::pixels::pixelate(d.image(), amount),
+                _ => crate::pixels::gaussian_blur(d.image(), amount as f32 / 2.0),
+            };
+            assert!(region.data() == whole.data(), "{effect:?} tiles differ from the whole-image effect");
+            // A second, smaller request comes from the same cached tiles.
+            let (part, (px0, py0)) = d.effect_region(effect, amount, Rect::new(300.0, 300.0, 10.0, 10.0)).unwrap();
+            assert_eq!((px0, py0), (256, 256));
+            assert_eq!(part.pixel(50, 50), whole.pixel(306, 306));
+        }
+    }
+
+    #[test]
+    fn redactions_hide_only_their_area() {
+        use crate::shape::RedactShape;
+        let d = noise_doc(120, 120);
+        let fonts = FontSet::empty();
+        let m = Metrics { scale: 1.0, fonts: &fonts };
+        let area = |effect| Shape {
+            geometry: Geometry::Redact { area: RedactShape::Rect(Rect::new(20.0, 20.0, 40.0, 40.0)), effect, strength: 0.5 },
+            style: Style::default(),
+        };
+        for effect in [RedactEffect::Gray, RedactEffect::Blur, RedactEffect::Mosaic] {
+            let out = export(&d, d.bounds(), &[area(effect)], m).unwrap();
+            let inside = out.pixel(40, 40).unwrap();
+            let orig = d.image().pixel(40, 40).unwrap();
+            if effect == RedactEffect::Gray {
+                assert_eq!((inside.red(), inside.green(), inside.blue()), (0x8C, 0x8C, 0x8C));
+            } else {
+                assert_ne!(inside, orig, "{effect:?} left the pixel as is");
+            }
+            // Outside the area, untouched.
+            for (x, y) in [(5, 5), (70, 40), (40, 70), (100, 100)] {
+                assert_eq!(out.pixel(x, y), d.image().pixel(x, y), "{effect:?} changed ({x}, {y})");
+            }
+        }
+    }
 }

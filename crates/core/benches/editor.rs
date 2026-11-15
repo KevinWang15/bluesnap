@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::render::{swap_red_blue, to_bgra_straight};
-use bluesnap_core::{Document, Editor, FontSet, Point, Rect, Tool};
+use bluesnap_core::{Document, Editor, FontSet, Point, RedactArea, RedactEffect, Rect, Tool};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const W4K: u32 = 3840;
@@ -39,7 +39,7 @@ fn fonts() -> Arc<FontSet> {
 }
 
 fn editor(w: u32, h: u32) -> Editor {
-    let doc = Document::from_rgba(w, h, screenshot(w, h), 16).unwrap();
+    let doc = Document::from_rgba(w, h, screenshot(w, h)).unwrap();
     let windows = (0..50).map(|i| Rect::new(i as f32 * 30.0, i as f32 * 20.0, 800.0, 600.0)).collect();
     Editor::new(doc, fonts(), windows, 2.0)
 }
@@ -57,7 +57,7 @@ fn drag(e: &mut Editor, from: (f32, f32), to: (f32, f32)) {
 fn annotated(w: u32, h: u32) -> Editor {
     let mut e = editor(w, h);
     drag(&mut e, (0.0, 0.0), (w as f32, h as f32));
-    let tools = [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Pen, Tool::Mosaic];
+    let tools = [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Pen, Tool::Redact];
     for i in 0..20 {
         let tool = tools[i % tools.len()];
         e.toggle_tool(tool);
@@ -115,7 +115,7 @@ fn startup(c: &mut Criterion) {
         b.iter_batched(
             || rgba.clone(),
             |rgba| {
-                let doc = Document::from_rgba(W4K, H4K, rgba, 16).unwrap();
+                let doc = Document::from_rgba(W4K, H4K, rgba).unwrap();
                 black_box(Editor::new(doc, Arc::new(FontSet::empty()), Vec::new(), 2.0))
             },
             BatchSize::LargeInput,
@@ -205,7 +205,7 @@ fn output(c: &mut Criterion) {
             || {
                 let mut e = editor(W4K, H4K);
                 drag(&mut e, (0.0, 0.0), (W4K as f32, H4K as f32));
-                e.toggle_tool(Tool::Mosaic);
+                e.toggle_tool(Tool::Redact);
                 e
             },
             |mut e| {
@@ -218,5 +218,46 @@ fn output(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, startup, frames, output);
+fn redaction(c: &mut Criterion) {
+    let mut g = c.benchmark_group("redact");
+    g.sample_size(10);
+    // Dragging the strength slider on a selected 1200x800 blur area: each step
+    // re-blurs the rows under it and re-renders the layer.
+    g.bench_function("blur_slider_frame/4k_1200x800_area", |b| {
+        let mut e = editor(W4K, H4K);
+        drag(&mut e, (0.0, 0.0), (W4K as f32, H4K as f32));
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
+        drag(&mut e, (800.0, 600.0), (2000.0, 1400.0));
+        let mut presenter = Presenter::default();
+        presenter.present(&e);
+        e.begin_continuous_edit();
+        let mut i = 0u32;
+        b.iter(|| {
+            i += 1;
+            e.set_redaction(|r| r.strength = (i % 50) as f32 / 50.0);
+            black_box(presenter.present(&e))
+        });
+        e.end_continuous_edit();
+    });
+    g.bench_function("blur_effect/4k_1200x800_area", |b| {
+        let doc = Document::from_rgba(W4K, H4K, screenshot(W4K, H4K)).unwrap();
+        let mut amount = 10;
+        b.iter(|| {
+            amount = 10 + (amount + 1) % 30;
+            black_box(doc.effect_region(RedactEffect::Blur, amount, Rect::new(800.0, 600.0, 1200.0, 800.0)))
+        });
+    });
+    g.bench_function("blur_rows/1600x30000_doc_1000_rows", |b| {
+        let doc = Document::from_rgba(1600, 30_000, screenshot(1600, 30_000)).unwrap();
+        let mut amount = 10;
+        b.iter(|| {
+            amount = 10 + (amount + 1) % 30; // new amount each time: no cache hits
+            black_box(doc.effect_region(RedactEffect::Blur, amount, Rect::new(0.0, 14_000.0, 1600.0, 1000.0)))
+        });
+    });
+    g.finish();
+}
+
+criterion_group!(benches, startup, frames, output, redaction);
 criterion_main!(benches);

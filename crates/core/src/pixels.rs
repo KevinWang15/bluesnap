@@ -10,7 +10,27 @@ fn threads_for(len: usize) -> usize {
     if len < PARALLEL_MIN_BYTES {
         return 1;
     }
+    threads()
+}
+
+/// Threads to split work across.
+fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+}
+
+/// `f` over each of `items`, in parallel, results in order.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() < 2 {
+        return items.iter().map(f).collect();
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = items.len().div_ceil(cores);
+    std::thread::scope(|scope| {
+        let f = &f;
+        let handles: Vec<_> =
+            items.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<_>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().expect("worker thread panicked")).collect()
+    })
 }
 
 /// Runs `f` over matching pieces of `dst` and `src`, in parallel for large buffers.
@@ -159,6 +179,132 @@ pub fn pixelate(src: &Pixmap, block: u32) -> Pixmap {
     out
 }
 
+/// Box widths whose three successive passes approximate a gaussian of `sigma`
+/// (Kovesi, "Fast almost-Gaussian filtering").
+fn gaussian_boxes(sigma: f32) -> [usize; 3] {
+    let n = 3.0;
+    let ideal = (12.0 * sigma * sigma / n + 1.0).sqrt();
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
+    }
+    let lower = lower.max(1);
+    let wl = lower as f32;
+    let m = ((12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) / (-4.0 * wl - 4.0)).round() as i32;
+    std::array::from_fn(|i| if (i as i32) < m { lower as usize } else { lower as usize + 2 })
+}
+
+/// Rows of context a gaussian blur of `sigma` needs on each side.
+pub fn blur_margin(sigma: f32) -> usize {
+    gaussian_boxes(sigma).iter().map(|w| w / 2).sum::<usize>() + 1
+}
+
+/// Rounded division by a box window's size, as a multiply and shift.
+#[derive(Clone, Copy)]
+struct Mean {
+    reciprocal: u32,
+    half: u32,
+}
+
+impl Mean {
+    const SHIFT: u32 = 16;
+
+    fn new(radius: usize) -> Self {
+        let window = (2 * radius + 1) as u32;
+        Self { reciprocal: (1u32 << Self::SHIFT).div_ceil(window), half: window / 2 }
+    }
+
+    /// `sum / window`, rounded; `sum` is at most 255 × window.
+    fn of(self, sum: u32) -> u8 {
+        (((sum + self.half) * self.reciprocal) >> Self::SHIFT).min(255) as u8
+    }
+}
+
+/// Box blur of `radius` along each row of `src` into `dst`, edges extended.
+/// Rows are independent, so they are split across threads.
+fn box_rows(src: &[u8], dst: &mut [u8], width: usize, radius: usize) {
+    let mean = Mean::new(radius);
+    let stride = width * 4;
+    let px = |row: &[u8], i: isize| -> [u32; 4] {
+        let p = i.clamp(0, width as isize - 1) as usize * 4;
+        [row[p] as u32, row[p + 1] as u32, row[p + 2] as u32, row[p + 3] as u32]
+    };
+    par_zip(dst, src, stride, |dst, src| {
+        for (out, row) in dst.chunks_exact_mut(stride).zip(src.chunks_exact(stride)) {
+            let r = radius as isize;
+            let mut sum = [0u32; 4];
+            for i in -r..=r {
+                let p = px(row, i);
+                (0..4).for_each(|c| sum[c] += p[c]);
+            }
+            for (x, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                (0..4).for_each(|c| o[c] = mean.of(sum[c]));
+                let (add, sub) = (x as isize + r + 1, x as isize - r);
+                if sub >= 0 && (add as usize) < width {
+                    // Interior: no clamping.
+                    let (a, b) = (&row[add as usize * 4..add as usize * 4 + 4], &row[sub as usize * 4..sub as usize * 4 + 4]);
+                    (0..4).for_each(|c| sum[c] = sum[c] + a[c] as u32 - b[c] as u32);
+                } else {
+                    let (a, b) = (px(row, add), px(row, sub));
+                    (0..4).for_each(|c| sum[c] = sum[c] + a[c] - b[c]);
+                }
+            }
+        }
+    });
+}
+
+/// Box blur of `radius` down each column of `src` into `dst`, edges extended:
+/// running sums over a band of rows' worth of columns at once, so memory is
+/// read sequentially. Bands of output rows are independent and split across
+/// threads (each starts its sums from its own first row).
+fn box_columns(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    let mean = Mean::new(radius);
+    let stride = width * 4;
+    let row = |y: isize| {
+        let y = y.clamp(0, height as isize - 1) as usize;
+        &src[y * stride..(y + 1) * stride]
+    };
+    let threads = threads_for(dst.len());
+    let band = height.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (i, out) in dst.chunks_mut(band * stride).enumerate() {
+            scope.spawn(move || {
+                let y0 = (i * band) as isize;
+                let r = radius as isize;
+                let mut sum = vec![0u32; stride];
+                for y in y0 - r..=y0 + r {
+                    sum.iter_mut().zip(row(y)).for_each(|(s, v)| *s += *v as u32);
+                }
+                for (dy, line) in out.chunks_exact_mut(stride).enumerate() {
+                    line.iter_mut().zip(&sum).for_each(|(o, s)| *o = mean.of(*s));
+                    let y = y0 + dy as isize;
+                    let (add, sub) = (row(y + r + 1), row(y - r));
+                    sum.iter_mut().zip(add).zip(sub).for_each(|((s, a), b)| *s = *s + *a as u32 - *b as u32);
+                }
+            });
+        }
+    });
+}
+
+/// Approximately gaussian blur of `sigma` pixels, edges extended.
+pub fn gaussian_blur(src: &Pixmap, sigma: f32) -> Pixmap {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let mut a = src.data().to_vec();
+    let mut b = vec![0u8; a.len()];
+    let boxes = gaussian_boxes(sigma);
+    // Box blurs are separable and commute: all horizontal passes, then all
+    // vertical, alternating between two buffers.
+    for r in boxes.into_iter().filter(|b| *b > 1).map(|b| b / 2) {
+        box_rows(&a, &mut b, w, r);
+        std::mem::swap(&mut a, &mut b);
+    }
+    for r in boxes.into_iter().filter(|b| *b > 1).map(|b| b / 2) {
+        box_columns(&a, &mut b, w, h, r);
+        std::mem::swap(&mut a, &mut b);
+    }
+    pixmap_from_rgba(src.width(), src.height(), a).expect("same size as the source")
+}
+
 /// Wraps `rgba` (premultiplied, or opaque) as a pixmap.
 pub fn pixmap_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Pixmap> {
     Pixmap::from_vec(rgba, IntSize::from_wh(width, height)?)
@@ -250,6 +396,35 @@ mod tests {
         assert_eq!(&bgrx[..8], &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(&rgba[..8], &[3, 2, 1, 255, 6, 5, 4, 255]);
         assert!(bgrx.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+    }
+
+    #[test]
+    fn blur_smooths_but_keeps_the_average() {
+        let src = noise(120, 90);
+        let out = gaussian_blur(&src, 4.0);
+        let stats = |p: &Pixmap| {
+            let v: Vec<f64> = p.data().chunks(4).map(|c| c[0] as f64).collect();
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64;
+            (mean, var)
+        };
+        let ((m0, v0), (m1, v1)) = (stats(&src), stats(&out));
+        assert!((m0 - m1).abs() < 2.0, "mean {m0} -> {m1}");
+        assert!(v1 < v0 / 10.0, "variance {v0} -> {v1}");
+        assert!(out.data().chunks(4).all(|c| c[3] == 255));
+    }
+
+    #[test]
+    fn blurring_a_band_with_its_margin_matches_the_whole_image() {
+        let src = noise(80, 200);
+        let sigma = 3.5;
+        let whole = gaussian_blur(&src, sigma);
+        let margin = blur_margin(sigma) as u32;
+        let (b0, b1) = (60u32, 130u32);
+        let (s0, s1) = (b0 - margin, (b1 + margin).min(200));
+        let band = gaussian_blur(&crop(&src, 0, s0, 80, s1 - s0).unwrap(), sigma);
+        let got = crop(&band, 0, b0 - s0, 80, b1 - b0).unwrap();
+        assert!(got.data() == crop(&whole, 0, b0, 80, b1 - b0).unwrap().data());
     }
 
     #[test]

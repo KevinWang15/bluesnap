@@ -1,7 +1,7 @@
 //! Annotation shapes: geometry, hit testing and editing handles.
 
 use crate::geom::{Handle, Point, Rect, distance_to_segment};
-use crate::style::{Style, Tool};
+use crate::style::{RedactEffect, Style, Tool};
 use crate::text::FontSet;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10,9 +10,19 @@ pub enum Geometry {
     Ellipse(Rect),
     Arrow { from: Point, to: Point },
     Pen(Vec<Point>),
-    Mosaic(Vec<Point>),
+    /// Hides what's under `area` with `effect`; `strength` is the 0..=1 slider
+    /// value (see [`RedactEffect::amount`]).
+    Redact { area: RedactShape, effect: RedactEffect, strength: f32 },
     /// `origin` is the top-left corner of the first line.
     Text { origin: Point, content: String },
+}
+
+/// The area a redaction covers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RedactShape {
+    /// A freehand stroke, as wide as the shape's brush size.
+    Brush(Vec<Point>),
+    Rect(Rect),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,7 +54,7 @@ impl Shape {
             Geometry::Ellipse(_) => Tool::Ellipse,
             Geometry::Arrow { .. } => Tool::Arrow,
             Geometry::Pen(_) => Tool::Pen,
-            Geometry::Mosaic(_) => Tool::Mosaic,
+            Geometry::Redact { .. } => Tool::Redact,
             Geometry::Text { .. } => Tool::Text,
         }
     }
@@ -60,7 +70,14 @@ impl Shape {
             Geometry::Ellipse(r) => Geometry::Ellipse(r.translate(d)),
             Geometry::Arrow { from, to } => Geometry::Arrow { from: *from + d, to: *to + d },
             Geometry::Pen(pts) => Geometry::Pen(pts.iter().map(|p| *p + d).collect()),
-            Geometry::Mosaic(pts) => Geometry::Mosaic(pts.iter().map(|p| *p + d).collect()),
+            Geometry::Redact { area, effect, strength } => Geometry::Redact {
+                area: match area {
+                    RedactShape::Brush(pts) => RedactShape::Brush(pts.iter().map(|p| *p + d).collect()),
+                    RedactShape::Rect(r) => RedactShape::Rect(r.translate(d)),
+                },
+                effect: *effect,
+                strength: *strength,
+            },
             Geometry::Text { origin, content } => Geometry::Text { origin: *origin + d, content: content.clone() },
         };
         Shape { geometry, style: self.style }
@@ -72,7 +89,10 @@ impl Shape {
         match &self.geometry {
             Geometry::Rect(r) | Geometry::Ellipse(r) => r.inflate(w / 2.0 + 1.0),
             Geometry::Arrow { from, to } => Rect::from_points(*from, *to).inflate(arrow_head_len(w) + 1.0),
-            Geometry::Pen(pts) | Geometry::Mosaic(pts) => points_bounds(pts).inflate(w / 2.0 + 1.0),
+            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+                points_bounds(pts).inflate(w / 2.0 + 1.0)
+            }
+            Geometry::Redact { area: RedactShape::Rect(r), .. } => *r,
             Geometry::Text { origin, content } => {
                 let layout = m.fonts.layout(content, w);
                 Rect::new(origin.x, origin.y, layout.width.max(w / 2.0), layout.height())
@@ -81,7 +101,8 @@ impl Shape {
     }
 
     /// Whether `p` grabs this shape. Outlines are hit only near the stroke so that
-    /// one can still draw inside a rectangle or ellipse.
+    /// one can still draw inside a rectangle or ellipse; redaction areas are
+    /// filled, so anywhere inside counts.
     pub fn hit(&self, p: Point, m: Metrics) -> bool {
         let w = self.size_px(m.scale);
         let tol = w / 2.0 + 5.0 * m.scale;
@@ -99,17 +120,18 @@ impl Shape {
                 (d - 1.0).abs() * a.min(b) <= tol
             }
             Geometry::Arrow { from, to } => distance_to_segment(p, *from, *to) <= tol.max(arrow_head_len(w) / 2.0),
-            Geometry::Pen(pts) | Geometry::Mosaic(pts) => {
+            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 pts.windows(2).any(|s| distance_to_segment(p, s[0], s[1]) <= tol)
                     || pts.first().is_some_and(|q| q.distance(p) <= tol)
             }
+            Geometry::Redact { area: RedactShape::Rect(r), .. } => r.inflate(5.0 * m.scale).contains(p),
             Geometry::Text { .. } => self.bounds(m).inflate(4.0 * m.scale).contains(p),
         }
     }
 
     pub fn handles(&self) -> Vec<(EditHandle, Point)> {
         match &self.geometry {
-            Geometry::Rect(r) | Geometry::Ellipse(r) => {
+            Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
                 Handle::ALL.iter().map(|h| (EditHandle::Bounds(*h), r.handle_point(*h))).collect()
             }
             Geometry::Arrow { from, to } => vec![(EditHandle::ArrowFrom, *from), (EditHandle::ArrowTo, *to)],
@@ -122,6 +144,9 @@ impl Shape {
         let geometry = match (&self.geometry, handle) {
             (Geometry::Rect(r), EditHandle::Bounds(h)) => Geometry::Rect(r.resized(h, delta)),
             (Geometry::Ellipse(r), EditHandle::Bounds(h)) => Geometry::Ellipse(r.resized(h, delta)),
+            (Geometry::Redact { area: RedactShape::Rect(r), effect, strength }, EditHandle::Bounds(h)) => {
+                Geometry::Redact { area: RedactShape::Rect(r.resized(h, delta)), effect: *effect, strength: *strength }
+            }
             (Geometry::Arrow { from, to }, EditHandle::ArrowFrom) => Geometry::Arrow { from: *from + delta, to: *to },
             (Geometry::Arrow { from, to }, EditHandle::ArrowTo) => Geometry::Arrow { from: *from, to: *to + delta },
             (g, _) => g.clone(),
@@ -132,9 +157,11 @@ impl Shape {
     /// True for shapes too small to keep after the user releases the mouse.
     pub fn is_degenerate(&self) -> bool {
         match &self.geometry {
-            Geometry::Rect(r) | Geometry::Ellipse(r) => r.w < 2.0 || r.h < 2.0,
+            Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
+                r.w < 2.0 || r.h < 2.0
+            }
             Geometry::Arrow { from, to } => from.distance(*to) < 4.0,
-            Geometry::Pen(pts) | Geometry::Mosaic(pts) => pts.len() < 2,
+            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => pts.len() < 2,
             Geometry::Text { content, .. } => content.is_empty(),
         }
     }
@@ -181,5 +208,22 @@ mod tests {
         };
         let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0));
         assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0) });
+    }
+
+    #[test]
+    fn redaction_areas_are_hit_inside_and_resize_like_rectangles() {
+        let fonts = FontSet::empty();
+        let s = Shape {
+            geometry: Geometry::Redact {
+                area: RedactShape::Rect(Rect::new(0.0, 0.0, 200.0, 100.0)),
+                effect: RedactEffect::Blur,
+                strength: 0.5,
+            },
+            style: Style::default(),
+        };
+        assert!(s.hit(Point::new(100.0, 50.0), metrics(&fonts)));
+        assert_eq!(s.handles().len(), 8);
+        let moved = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(20.0, 0.0));
+        assert_eq!(moved.bounds(metrics(&fonts)), Rect::new(0.0, 0.0, 220.0, 100.0));
     }
 }

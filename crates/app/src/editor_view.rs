@@ -75,6 +75,8 @@ pub struct EditorView {
     status: Option<SharedString>,
     /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
+    /// While the redact strength slider is dragged: its style bar's window x.
+    slider: Option<f32>,
 }
 
 fn color(c: bluesnap_core::Color) -> Hsla {
@@ -147,6 +149,7 @@ impl EditorView {
             finished: false,
             status: None,
             ocr: None,
+            slider: None,
         }
     }
 
@@ -257,7 +260,7 @@ impl EditorView {
         self.ocr.is_some()
     }
 
-    /// Recognizes the text in the selection (as displayed, so mosaicked text stays
+    /// Recognizes the text in the selection (as displayed, so redacted text stays
     /// hidden), copies it to the clipboard and closes the view.
     fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ocr.is_some() {
@@ -312,6 +315,22 @@ impl EditorView {
         cx.notify();
     }
 
+    /// A press on the redact strength slider: jumps to the pointer and follows
+    /// it until release, as one undo step.
+    pub fn press_slider(&mut self, x: Pixels, window: &Window) {
+        let Some(bar) = self.panel_positions(window).1 else { return };
+        self.editor.begin_continuous_edit();
+        self.slider = Some(bar.x);
+        self.drag_slider(x);
+    }
+
+    fn drag_slider(&mut self, x: Pixels) {
+        if let Some(bar_x) = self.slider {
+            let strength = toolbar::slider_value(bar_x, f32::from(x));
+            self.editor.set_redaction(|r| r.strength = strength);
+        }
+    }
+
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.ocr.is_none() {
             self.status = None;
@@ -340,15 +359,22 @@ impl EditorView {
     }
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let (revision, cursor) = (self.editor.revision(), self.editor.cursor());
+        if self.slider.is_some() {
+            self.drag_slider(ev.position.x);
+            return cx.notify();
+        }
+        let before = (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring());
         self.editor.pointer_move(self.viewport.to_image(ev.position), ev.modifiers.shift);
-        if self.editor.revision() != revision || self.editor.cursor() != cursor {
+        if (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring()) != before {
             cx.notify();
         }
     }
 
     fn mouse_up(&mut self, ev: &MouseUpEvent, cx: &mut Context<Self>) {
-        if ev.button == MouseButton::Left {
+        if ev.button == MouseButton::Left && self.slider.take().is_some() {
+            self.editor.end_continuous_edit();
+            cx.notify();
+        } else if ev.button == MouseButton::Left {
             self.editor.pointer_up(self.viewport.to_image(ev.position));
             cx.notify();
         }
@@ -434,6 +460,7 @@ impl EditorView {
                 .selected_frame()
                 .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
             text_frame: e.text_frame().map(|r| v.to_window(r)),
+            brush_ring: e.brush_ring().map(|(c, r)| (v.point_to_window(c), px(r * v.zoom))),
             caret: e.text_caret_rect().map(|r| {
                 let color = e.current_style().map_or(THEME_BLUE, |(_, s)| s.color);
                 (v.to_window(r), self::color(color))
@@ -567,7 +594,10 @@ impl Render for EditorView {
             let (at, style_at) = self.panel_positions(window);
             root = root.child(toolbar::toolbar(self, groups, at.x, at.y, cx));
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
-                root = root.child(toolbar::style_bar(tool, style.size, style.color, at.x, at.y, cx));
+                root = root.child(match self.editor.current_redaction() {
+                    Some(redaction) => toolbar::redact_bar(redaction, style.size, at.x, at.y, cx),
+                    None => toolbar::style_bar(tool, style.size, style.color, at.x, at.y, cx),
+                });
             }
         }
         root
@@ -594,6 +624,8 @@ struct Scene {
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
+    /// The redact brush's outline at the pointer: center and radius.
+    brush_ring: Option<(Point<Pixels>, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
     cursor: CursorStyle,
     editing_text: bool,
@@ -631,6 +663,14 @@ impl Scene {
                     window.paint_image(b, Corners::default(), image, 0, false).ok();
                 }
             });
+        }
+
+        // Over the canvas only, not over the panels.
+        if let Some((center, r)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
+            let ring = Bounds::centered_at(center, size(r * 2., r * 2.));
+            // A white ring between two dark ones shows on any background.
+            window.paint_quad(quad(ring.dilate(px(1.)), r + px(1.), transparent_black(), px(3.5), rgba(0x0000_0059), BorderStyle::Solid));
+            window.paint_quad(quad(ring, r, transparent_black(), px(1.5), white(), BorderStyle::Solid));
         }
 
         if let Some((region, handles)) = &self.selection_frame {

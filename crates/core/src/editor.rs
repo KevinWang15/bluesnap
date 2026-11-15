@@ -9,8 +9,8 @@ use tiny_skia::Pixmap;
 
 use crate::geom::{CursorKind, Handle, Point, Rect};
 use crate::render::{self, Document};
-use crate::shape::{EditHandle, Geometry, Metrics, Shape};
-use crate::style::{Color, SizeLevel, Style, Tool};
+use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
+use crate::style::{Color, RedactArea, Redaction, SizeLevel, Style, Tool};
 use crate::text::FontSet;
 
 /// Movement (in logical pixels) before a press turns into a drag.
@@ -89,6 +89,11 @@ pub struct Editor {
     selected: Option<usize>,
     tool: Option<Tool>,
     styles: [Style; Tool::ALL.len()],
+    /// The redact tool's settings for new redactions.
+    redaction: Redaction,
+    /// Inside `begin_continuous_edit` .. `end_continuous_edit`; `true` once an
+    /// undo snapshot was taken for it.
+    continuous: Option<bool>,
     text: Option<TextEdit>,
     revision: u64,
     /// Bumped when shapes other than the active one change (see [`Self::render_static_layer`]).
@@ -118,6 +123,8 @@ impl Editor {
             selected: None,
             tool: None,
             styles: [Style::default(); Tool::ALL.len()],
+            redaction: Redaction::default(),
+            continuous: None,
             text: None,
             revision: 0,
             static_revision: 0,
@@ -228,6 +235,83 @@ impl Editor {
             return Some((shape.tool(), shape.style));
         }
         self.tool.map(|t| (t, self.styles[t.index()]))
+    }
+
+    /// The redaction settings the style bar should show: the selected
+    /// redaction's, else the redact tool's when it is active.
+    pub fn current_redaction(&self) -> Option<Redaction> {
+        if let Some(shape) = self.selected.and_then(|i| self.shapes.get(i)) {
+            return match &shape.geometry {
+                Geometry::Redact { area, effect, strength } => Some(Redaction {
+                    effect: *effect,
+                    area: match area {
+                        RedactShape::Brush(_) => RedactArea::Brush,
+                        RedactShape::Rect(_) => RedactArea::Rect,
+                    },
+                    strength: *strength,
+                }),
+                _ => None,
+            };
+        }
+        (self.tool == Some(Tool::Redact)).then_some(self.redaction)
+    }
+
+    /// Changes the redact settings, and the selected redaction's effect and
+    /// strength. A shape's area kind can't change, so switching the area
+    /// instead leaves the selection to draw new redactions with it. Inside a
+    /// continuous edit, all changes share one undo step.
+    pub fn set_redaction(&mut self, f: impl Fn(&mut Redaction)) {
+        let area = self.redaction.area;
+        f(&mut self.redaction);
+        if self.redaction.area != area && self.selected.is_some() {
+            self.finish_text();
+            self.selected = None;
+            self.tool = Some(Tool::Redact);
+            return self.touch();
+        }
+        let Some(idx) = self.selected else { return self.touch() };
+        let Geometry::Redact { effect, strength, .. } = &self.shapes[idx].geometry else { return self.touch() };
+        let mut changed = Redaction { effect: *effect, area: self.redaction.area, strength: *strength };
+        f(&mut changed);
+        let record = match self.continuous {
+            Some(true) => false,
+            Some(false) => {
+                self.continuous = Some(true);
+                true
+            }
+            None => true,
+        };
+        if record {
+            self.begin_change();
+        }
+        if let Geometry::Redact { effect, strength, .. } = &mut self.shapes[idx].geometry {
+            (*effect, *strength) = (changed.effect, changed.strength);
+        }
+        if self.continuous.is_none() {
+            self.end_change();
+        }
+        self.touch_shapes();
+    }
+
+    /// Starts a run of changes that should undo as one (a slider drag).
+    pub fn begin_continuous_edit(&mut self) {
+        self.continuous = Some(false);
+    }
+
+    pub fn end_continuous_edit(&mut self) {
+        if self.continuous.take() == Some(true) {
+            self.end_change();
+        }
+    }
+
+    /// Where to show the redact brush's outline (center and radius), when the
+    /// next press would paint with it.
+    pub fn brush_ring(&self) -> Option<(Point, f32)> {
+        let painting = matches!(self.drag, None | Some(Drag::Create { .. }));
+        let brush = self.tool == Some(Tool::Redact) && self.redaction.area == RedactArea::Brush;
+        let inside = self.selection.is_some_and(|s| s.contains(self.pointer));
+        (painting && brush && inside && self.text.is_none())
+            .then(|| (self.pointer, self.styles[Tool::Redact.index()].size.logical_px(Tool::Redact) * self.scale / 2.0))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -373,7 +457,14 @@ impl Editor {
             Tool::Ellipse => Geometry::Ellipse(Rect::from_points(p, p)),
             Tool::Arrow => Geometry::Arrow { from: p, to: p },
             Tool::Pen => Geometry::Pen(vec![p]),
-            Tool::Mosaic => Geometry::Mosaic(vec![p]),
+            Tool::Redact => Geometry::Redact {
+                area: match self.redaction.area {
+                    RedactArea::Brush => RedactShape::Brush(vec![p]),
+                    RedactArea::Rect => RedactShape::Rect(Rect::from_points(p, p)),
+                },
+                effect: self.redaction.effect,
+                strength: self.redaction.strength,
+            },
             Tool::Text => {
                 // Center the first line vertically on the click.
                 let size = style.size.logical_px(Tool::Text) * self.scale;
@@ -427,9 +518,13 @@ impl Editor {
                 let start = *start;
                 let shape = &mut self.shapes[*idx];
                 match &mut shape.geometry {
-                    Geometry::Rect(r) | Geometry::Ellipse(r) => *r = Rect::from_points(start, constrained(start, p, constrain)),
+                    Geometry::Rect(r)
+                    | Geometry::Ellipse(r)
+                    | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
+                        *r = Rect::from_points(start, constrained(start, p, constrain))
+                    }
                     Geometry::Arrow { to, .. } => *to = p,
-                    Geometry::Pen(pts) | Geometry::Mosaic(pts) => {
+                    Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                         if pts.last().is_none_or(|last| last.distance(p) >= MIN_STROKE_STEP * scale) {
                             pts.push(p);
                         }
@@ -781,7 +876,7 @@ mod tests {
     use super::*;
 
     fn editor() -> Editor {
-        let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4], 8).unwrap();
+        let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4]).unwrap();
         let windows = vec![Rect::new(50.0, 50.0, 100.0, 100.0), Rect::new(0.0, 0.0, 300.0, 200.0)];
         Editor::new(doc, Arc::new(FontSet::empty()), windows, 1.0)
     }
@@ -943,7 +1038,7 @@ mod tests {
     }
 
     fn document_editor() -> Editor {
-        let doc = Document::from_rgba(400, 3000, vec![255; 400 * 3000 * 4], 8).unwrap();
+        let doc = Document::from_rgba(400, 3000, vec![255; 400 * 3000 * 4]).unwrap();
         Editor::for_document(doc, Arc::new(FontSet::empty()), 1.0)
     }
 
@@ -996,6 +1091,59 @@ mod tests {
         let (region, pixmap) = e.render_static_layer(Rect::new(0.0, 1000.0, 400.0, 500.0)).unwrap();
         assert!(region.y >= 1000.0 && region.bottom() <= 1500.0);
         assert_eq!(pixmap.height() as f32, region.h);
+    }
+
+    #[test]
+    fn redact_areas_follow_the_settings_and_slider_drags_undo_once() {
+        use crate::style::RedactEffect;
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Redact);
+        assert_eq!(e.current_redaction(), Some(Redaction::default()));
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
+        drag(&mut e, (50.0, 50.0), (150.0, 120.0));
+        let Geometry::Redact { area: RedactShape::Rect(r), effect, .. } = &e.shapes[0].geometry else { panic!() };
+        assert_eq!((*r, *effect), (Rect::new(50.0, 50.0, 100.0, 70.0), RedactEffect::Blur));
+        // The new redaction is selected; a slider drag changes it, as one undo step.
+        let undo_depth = e.history.len();
+        e.begin_continuous_edit();
+        for i in 0..10 {
+            e.set_redaction(|r| r.strength = i as f32 / 10.0);
+        }
+        e.end_continuous_edit();
+        assert_eq!(e.history.len(), undo_depth + 1);
+        assert_eq!(e.current_redaction().unwrap().strength, 0.9);
+        assert!(e.undo());
+        assert_eq!(e.current_redaction(), Some(Redaction { area: RedactArea::Rect, effect: RedactEffect::Blur, strength: 0.9 }));
+        let Geometry::Redact { strength, .. } = &e.shapes[0].geometry else { panic!() };
+        assert_eq!(*strength, Redaction::default().strength);
+    }
+
+    #[test]
+    fn switching_area_with_a_redaction_selected_leaves_it_alone() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| r.area = RedactArea::Rect);
+        drag(&mut e, (50.0, 50.0), (150.0, 120.0));
+        assert!(e.selected.is_some());
+        let before = e.shapes.clone();
+        e.set_redaction(|r| r.area = RedactArea::Brush);
+        assert_eq!((e.selected, e.tool), (None, Some(Tool::Redact)));
+        assert_eq!(e.current_redaction().unwrap().area, RedactArea::Brush);
+        assert_eq!(e.shapes, before);
+    }
+
+    #[test]
+    fn brush_ring_shows_only_for_the_redact_brush() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.pointer_move(Point::new(100.0, 100.0), false);
+        assert_eq!(e.brush_ring(), None);
+        e.toggle_tool(Tool::Redact);
+        assert_eq!(e.brush_ring(), Some((Point::new(100.0, 100.0), 12.0)));
+        e.set_redaction(|r| r.area = RedactArea::Rect);
+        assert_eq!(e.brush_ring(), None);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! colors), the editor's toolbar and style bar, and building blocks other
 //! panels (the scrolling-capture bar) reuse.
 
-use bluesnap_core::{Color, PALETTE, SizeLevel, THEME_BLUE, Tool};
+use bluesnap_core::{Color, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
 use gpui::{
     AnyElement, AnyView, App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
@@ -18,6 +18,16 @@ const SEP: f32 = 1.0 + 2.0 * 4.0; // 1px line with 4px margins
 const BUTTON: f32 = 32.0;
 const ICON: f32 = 20.0;
 const STYLE_BUTTON: f32 = 24.0;
+const STYLE_ICON: f32 = 16.0;
+/// The panel's border, included in its size.
+const BORDER: f32 = 1.0;
+/// The redact strength slider: its width, the inset of the track's ends (room
+/// for the thumb), and the thumb's diameter.
+const SLIDER: f32 = 120.0;
+const SLIDER_INSET: f32 = 9.0;
+const THUMB: f32 = 14.0;
+/// Redact style bar buttons before the slider: area and effect segments.
+const REDACT_SEGMENTS: usize = RedactArea::ALL.len() + RedactEffect::ALL.len();
 
 /// A toolbar button's meaning. Each toolbar lists the actions it offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +49,7 @@ impl Action {
             Action::Tool(Tool::Ellipse) => "icons/ellipse.svg",
             Action::Tool(Tool::Arrow) => "icons/arrow.svg",
             Action::Tool(Tool::Pen) => "icons/pen.svg",
-            Action::Tool(Tool::Mosaic) => "icons/mosaic.svg",
+            Action::Tool(Tool::Redact) => "icons/mosaic.svg",
             Action::Tool(Tool::Text) => "icons/text.svg",
             Action::Undo => "icons/undo.svg",
             Action::Scrolling => "icons/scroll.svg",
@@ -57,7 +67,7 @@ impl Action {
             Action::Tool(Tool::Ellipse) => "Ellipse",
             Action::Tool(Tool::Arrow) => "Arrow",
             Action::Tool(Tool::Pen) => "Pen",
-            Action::Tool(Tool::Mosaic) => "Mosaic",
+            Action::Tool(Tool::Redact) => "Redact",
             Action::Tool(Tool::Text) => "Text",
             Action::Undo => "Undo",
             Action::Scrolling => "Scrolling screenshot: scroll the window to capture more",
@@ -93,7 +103,7 @@ const TOOLS: [Action; 6] = [
     Action::Tool(Tool::Ellipse),
     Action::Tool(Tool::Arrow),
     Action::Tool(Tool::Pen),
-    Action::Tool(Tool::Mosaic),
+    Action::Tool(Tool::Redact),
     Action::Tool(Tool::Text),
 ];
 /// How every toolbar ends.
@@ -114,19 +124,39 @@ pub fn panel_size(groups: &[&[Action]], extra: f32) -> (f32, f32) {
     let has_extra = extra > 0.0;
     let separators = (groups.len() + usize::from(has_extra)).saturating_sub(1);
     let children = buttons + separators + usize::from(has_extra);
-    let width = 2.0 * PAD
+    let width = 2.0 * (BORDER + PAD)
         + buttons as f32 * BUTTON
         + separators as f32 * SEP
         + extra
         + children.saturating_sub(1) as f32 * GAP;
-    (width, 2.0 * PAD + BUTTON)
+    (width, 2.0 * (BORDER + PAD) + BUTTON)
 }
 
-/// Logical size of the style bar: 3 sizes, then (if the tool has a color) | 6 colors.
+/// Logical size of the style bar: 3 sizes, then (if the tool has a color) | 6
+/// colors. The redact tool's bar is area | effect | strength slider | 3 sizes.
 pub fn style_bar_size(tool: Tool) -> (f32, f32) {
-    let (buttons, seps) = if tool.uses_color() { (3.0 + PALETTE.len() as f32, 1.0) } else { (3.0, 0.0) };
-    let children = buttons + seps;
-    (2.0 * PAD + buttons * STYLE_BUTTON + seps * SEP + (children - 1.0) * GAP, 2.0 * PAD + STYLE_BUTTON)
+    let (buttons, seps, extra) = match tool {
+        Tool::Redact => (REDACT_SEGMENTS + 3, 3, SLIDER),
+        _ if tool.uses_color() => (3 + PALETTE.len(), 1, 0.0),
+        _ => (3, 0, 0.0),
+    };
+    let children = buttons + seps + usize::from(extra > 0.0);
+    let width =
+        2.0 * (BORDER + PAD) + buttons as f32 * STYLE_BUTTON + seps as f32 * SEP + extra + (children - 1) as f32 * GAP;
+    (width, 2.0 * (BORDER + PAD) + STYLE_BUTTON)
+}
+
+/// Window x of the strength slider's 0 and 1 for a redact style bar at `bar_x`.
+fn slider_ends(bar_x: f32) -> (f32, f32) {
+    let before = REDACT_SEGMENTS as f32 * STYLE_BUTTON + 2.0 * SEP + (REDACT_SEGMENTS + 2) as f32 * GAP;
+    let start = bar_x + BORDER + PAD + before + SLIDER_INSET;
+    (start, start + SLIDER - 2.0 * SLIDER_INSET)
+}
+
+/// The strength for the pointer at window x `x` on a redact style bar at `bar_x`.
+pub fn slider_value(bar_x: f32, x: f32) -> f32 {
+    let (lo, hi) = slider_ends(bar_x);
+    ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
 }
 
 fn hsla(c: Color) -> Hsla {
@@ -176,7 +206,7 @@ fn floating_panel((w, h): (f32, f32), x: f32, y: f32) -> Div {
 }
 
 pub fn separator() -> Div {
-    div().w(px(1.0)).h(px(20.0)).mx(px(4.0)).bg(rgba(0x0000_0022))
+    div().flex_none().w(px(1.0)).h(px(20.0)).mx(px(4.0)).bg(rgba(0x0000_0022))
 }
 
 /// The button for `action`; the caller attaches what it does. `active` shows
@@ -237,35 +267,59 @@ pub fn toolbar(view: &EditorView, groups: &[&[Action]], x: f32, y: f32, cx: &mut
     bar.into_any_element()
 }
 
-pub fn style_bar(tool: Tool, size: SizeLevel, color: Color, x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
-    let mut bar = floating_panel(style_bar_size(tool), x, y);
+/// A small style bar button: the caller adds its content and what it does.
+fn style_button(active: bool) -> Div {
+    div()
+        .size(px(STYLE_BUTTON))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .when(active, |d| d.bg(rgba(0x1677_FF1F)))
+}
+
+/// One choice of a segmented control: an icon, highlighted when chosen.
+fn segment(label: &'static str, icon: &'static str, active: bool) -> Stateful<Div> {
+    let color = if active { hsla(THEME_BLUE) } else { rgb(0x444444).into() };
+    style_button(active)
+        .id(label)
+        .tooltip(tooltip(label))
+        .cursor_pointer()
+        .when(!active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
+        .child(svg().path(icon).size(px(STYLE_ICON)).text_color(color))
+}
+
+/// Brush size dots; grayed out and inert when `enabled` is false.
+fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<EditorView>) -> Div {
     for (level, dot) in SizeLevel::ALL.into_iter().zip([4.0, 8.0, 12.0]) {
-        let active = level == size;
-        bar = bar.child(
-            div()
-                .size(px(STYLE_BUTTON))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.0))
+        let active = enabled && level == size;
+        let color: Hsla = match (active, enabled) {
+            (true, _) => hsla(THEME_BLUE),
+            (_, false) => rgb(0xC8C8C8).into(),
+            _ => rgb(0x555555).into(),
+        };
+        let button = style_button(active).child(div().size(px(dot)).rounded_full().bg(color));
+        bar = bar.child(if enabled {
+            button
                 .cursor_pointer()
-                .when(active, |d| d.bg(rgba(0x1677_FF1F)))
                 .when(!active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
-                .child(div().size(px(dot)).rounded_full().bg(if active { hsla(THEME_BLUE) } else { rgb(0x555555).into() }))
-                .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().set_size(level))),
-        );
+                .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().set_size(level)))
+        } else {
+            button
+        });
     }
+    bar
+}
+
+pub fn style_bar(tool: Tool, size: SizeLevel, color: Color, x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
+    let mut bar = size_dots(floating_panel(style_bar_size(tool), x, y), size, true, cx);
     if tool.uses_color() {
         bar = bar.child(separator());
         for c in PALETTE {
             let active = c == color;
             bar = bar.child(
-                div()
-                    .size(px(STYLE_BUTTON))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.0))
+                style_button(false)
                     .cursor_pointer()
                     .when(active, |d| d.border_2().border_color(hsla(THEME_BLUE)))
                     .child(div().size(px(16.0)).rounded(px(3.0)).bg(hsla(c)).border_1().border_color(rgba(0x0000_0033)))
@@ -276,6 +330,88 @@ pub fn style_bar(tool: Tool, size: SizeLevel, color: Color, x: f32, y: f32, cx: 
     bar.into_any_element()
 }
 
+/// The redact tool's style bar: brush or area | mosaic, blur or gray |
+/// strength slider | brush size. Controls that don't apply are grayed out
+/// rather than hidden, so the bar keeps its layout.
+pub fn redact_bar(redaction: Redaction, size: SizeLevel, x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
+    let mut bar = floating_panel(style_bar_size(Tool::Redact), x, y);
+    for area in RedactArea::ALL {
+        let (label, icon) = match area {
+            RedactArea::Brush => ("Brush: paint over what to hide", "icons/brush.svg"),
+            RedactArea::Rect => ("Area: drag a rectangle to hide", "icons/area.svg"),
+        };
+        bar = bar.child(
+            segment(label, icon, redaction.area == area)
+                .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().set_redaction(|r| r.area = area))),
+        );
+    }
+    bar = bar.child(separator());
+    for effect in RedactEffect::ALL {
+        let (label, icon) = match effect {
+            RedactEffect::Mosaic => ("Mosaic", "icons/mosaic.svg"),
+            RedactEffect::Blur => ("Blur", "icons/blur.svg"),
+            RedactEffect::Gray => ("Gray block", "icons/gray.svg"),
+        };
+        bar = bar.child(
+            segment(label, icon, redaction.effect == effect).on_mouse_down(
+                MouseButton::Left,
+                on_press(cx, move |this, _, _| this.editor_mut().set_redaction(|r| r.effect = effect)),
+            ),
+        );
+    }
+    bar = bar.child(separator()).child(slider(redaction, cx)).child(separator());
+    size_dots(bar, size, redaction.area == RedactArea::Brush, cx).into_any_element()
+}
+
+/// The strength slider. A press anywhere on it jumps the thumb there and
+/// starts a drag, which the view follows window-wide.
+fn slider(redaction: Redaction, cx: &mut Context<EditorView>) -> Stateful<Div> {
+    let enabled = redaction.effect.has_strength();
+    let label = match redaction.effect {
+        RedactEffect::Mosaic => "Mosaic block size",
+        RedactEffect::Blur => "Blur strength",
+        RedactEffect::Gray => "Gray covers fully",
+    };
+    let (fill, thumb): (Hsla, Hsla) =
+        if enabled { (hsla(THEME_BLUE), hsla(THEME_BLUE)) } else { (rgb(0xD0D0D0).into(), rgb(0xC0C0C0).into()) };
+    let track = SLIDER - 2.0 * SLIDER_INSET;
+    let at = SLIDER_INSET + redaction.strength.clamp(0.0, 1.0) * track;
+    let line = |left: f32, width: f32, color: Hsla| {
+        div().absolute().left(px(left)).top(px((STYLE_BUTTON - 4.0) / 2.0)).w(px(width)).h(px(4.0)).rounded(px(2.0)).bg(color)
+    };
+    div()
+        .id(label)
+        .tooltip(tooltip(label))
+        .relative()
+        .flex_none()
+        .w(px(SLIDER))
+        .h(px(STYLE_BUTTON))
+        .child(line(SLIDER_INSET, track, rgb(0xE3E3E3).into()))
+        .child(line(SLIDER_INSET, at - SLIDER_INSET, fill))
+        .child(
+            div()
+                .absolute()
+                .left(px(at - THUMB / 2.0))
+                .top(px((STYLE_BUTTON - THUMB) / 2.0))
+                .size(px(THUMB))
+                .rounded_full()
+                .bg(white())
+                .border_2()
+                .border_color(thumb)
+                .when(enabled, |d| d.shadow_sm()),
+        )
+        .when(enabled, |d| {
+            d.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.press_slider(ev.position.x, window);
+                    cx.notify();
+                }),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,11 +419,36 @@ mod tests {
     #[test]
     fn panel_size_counts_buttons_separators_and_gaps() {
         // 12 buttons, 2 separators, 13 gaps between the 14 children.
-        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (2.0 * PAD + 12.0 * BUTTON + 2.0 * SEP + 13.0 * GAP, 40.0));
+        let frame = 2.0 * (BORDER + PAD);
+        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 12.0 * BUTTON + 2.0 * SEP + 13.0 * GAP, 42.0));
         // One button less without scrolling capture.
         assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0).0 - panel_size(DOCUMENT_TOOLBAR, 0.0).0, BUTTON + GAP);
         // Extra content (the scrolling bar's status) is a group of its own:
         // status | 4 buttons = 6 children.
-        assert_eq!(panel_size(SCROLLING_BAR, 200.0).0, 2.0 * PAD + 4.0 * BUTTON + SEP + 200.0 + 5.0 * GAP);
+        assert_eq!(panel_size(SCROLLING_BAR, 200.0).0, frame + 4.0 * BUTTON + SEP + 200.0 + 5.0 * GAP);
+    }
+
+    #[test]
+    fn style_bar_sizes_follow_the_tool() {
+        let frame = 2.0 * (BORDER + PAD);
+        // 3 sizes | 6 colors: 9 buttons, a separator, 9 gaps.
+        assert_eq!(style_bar_size(Tool::Rect).0, frame + 9.0 * STYLE_BUTTON + SEP + 9.0 * GAP);
+        // 2 areas | 3 effects | slider | 3 sizes: 8 buttons, 3 separators and
+        // the slider, so 11 gaps.
+        let redact = frame + 8.0 * STYLE_BUTTON + 3.0 * SEP + SLIDER + 11.0 * GAP;
+        assert_eq!(style_bar_size(Tool::Redact), (redact, frame + STYLE_BUTTON));
+    }
+
+    #[test]
+    fn slider_maps_its_track_to_strength() {
+        let (lo, hi) = slider_ends(100.0);
+        // The slider sits after the segments and two separators, inside the bar.
+        assert!(lo > 100.0 + 5.0 * STYLE_BUTTON && hi < 100.0 + style_bar_size(Tool::Redact).0);
+        assert_eq!(hi - lo, SLIDER - 2.0 * SLIDER_INSET);
+        assert_eq!(slider_value(100.0, lo), 0.0);
+        assert_eq!(slider_value(100.0, (lo + hi) / 2.0), 0.5);
+        // Past either end (a drag off the track) clamps.
+        assert_eq!(slider_value(100.0, lo - 50.0), 0.0);
+        assert_eq!(slider_value(100.0, hi + 50.0), 1.0);
     }
 }

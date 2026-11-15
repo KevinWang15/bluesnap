@@ -14,7 +14,11 @@ macro_rules! icons {
     };
 }
 
-icons!["rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done"];
+icons![
+    "rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
+    // The redact style bar.
+    "brush", "area", "blur", "gray",
+];
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {

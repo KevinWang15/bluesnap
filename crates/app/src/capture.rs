@@ -50,13 +50,12 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
     let image = ImageTiles::from_bgra(width, height, bgra).context("bad capture buffer")?;
     stages.push(("gpu image", started.elapsed()));
     let scale = capture.display.scale_factor;
-    let mosaic_block = (8.0 * scale).round() as u32;
     let windows = capture
         .windows
         .iter()
         .map(|w| Rect::new(w.x as f32, w.y as f32, w.width as f32, w.height as f32))
         .collect();
-    let doc = Document::from_rgba(width, height, rgba, mosaic_block).context("bad capture buffer")?;
+    let doc = Document::from_rgba(width, height, rgba).context("bad capture buffer")?;
     let fonts = cx.global::<AppState>().fonts.clone();
     let editor = Editor::new(doc, fonts, windows, scale);
     let permission_url = capture.permission_missing.then(|| platform.permission_settings_url()).flatten();

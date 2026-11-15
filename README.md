@@ -7,11 +7,18 @@ Press the hotkey, then:
 - move the mouse: the window under the cursor is highlighted (blue border, size label)
 - click: select that window, or drag: select a region
 - drag the 8 handles to resize the selection, or drag inside it to move it
-- annotate with rectangle, ellipse, arrow, pen, mosaic and text. Click an existing
+- annotate with rectangle, ellipse, arrow, pen, redact and text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
+- the Redact tool's style bar picks how to hide things: paint with a **brush** (a
+  ring under the pointer shows its size) or drag an **area**; then **mosaic**,
+  **blur** or a solid **gray** block. The slider sets the mosaic block size or
+  the blur strength, and dragging it updates the selected redaction live (one
+  undo step per drag). Select an existing redaction to change its effect or
+  strength; area redactions can be resized with their handles. Effects always
+  read the original screenshot, and mosaic blocks line up across strokes.
 - the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
-  copies it to the clipboard as plain text and closes. Mosaicked areas stay unreadable
+  copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.
 - the scrolling-screenshot button (a page with a down arrow) captures more than fits
   on screen: the overlay closes, a blue frame marks the selection and a bar shows
@@ -20,7 +27,7 @@ Press the hotkey, then:
   frames into one tall image. Sticky headers and footers appear once. The bar
   next to the region has Edit, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
   image, Save writes a PNG, ✕ cancels, and Edit opens it in a window with the
-  same tools as the capture toolbar (shapes, pen, mosaic, text, undo, To text,
+  same tools as the capture toolbar (shapes, pen, redact, text, undo, To text,
   Save, ✕, ✓), scrolled with the mouse wheel. Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
   scrolling back a little picks it up again. Content redrawn at fractional pixel
@@ -125,13 +132,19 @@ selection, 20 annotations). On a 20-thread x86 Linux machine:
 | frame while moving the selection | ~0 (no re-render) |
 | frame while typing text | 0.7 ms |
 | export (copy/save) | 7 ms |
-| first mosaic stroke | 3.7 ms |
+| first mosaic stroke | 1.0 ms |
+| frame while dragging the blur slider (1200×800 area) | 14 ms |
+| blur of 1000 rows of a 1600×30000 scrolling screenshot | 9 ms |
 
 Annotations are split into a cached layer of finished shapes and a small layer for
 the shape being edited; both are clipped to the selection on the GPU, so only the
 edited shape is re-rasterized and uploaded per mouse move. With
 `RUST_LOG=bluesnap=debug` the app logs a timeline from hotkey to first presented
 frame (65–115 ms under WSLg, most of it gpui window creation and the first frame).
+
+Redaction effects are computed in 256×256 tiles, only under redactions, in
+parallel, and cached for the four most recent effect settings, so slider drags
+and very tall images stay responsive.
 
 On macOS, opening the capture overlay starts warming Vision in the background so
 its model loading usually finishes before you use To text.
