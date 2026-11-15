@@ -7,9 +7,17 @@ Press the hotkey, then:
 - move the mouse: the window under the cursor is highlighted (blue border, size label)
 - click: select that window, or drag: select a region
 - drag the 8 handles to resize the selection, or drag inside it to move it
-- annotate with rectangle, ellipse, arrow, pen, redact and text. Click an existing
+- annotate with rectangle, ellipse, arrow, pen, highlighter, counter, redact and
+  text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
+- the **highlighter** draws translucent strokes (yellow by default) that don't get
+  darker where they cross; hold Shift for a straight line, handy for a line of
+  text. A ring under the pointer shows its width.
+- the **counter** places numbered markers with a click (drag to position before
+  releasing): 1, 2, 3 … or A, B, C …, I, II, III … or a, b, c …, chosen in its
+  style bar for the whole sequence. Deleting one renumbers the rest; drag a
+  marker to move it. Labels are dark on light colors.
 - the Redact tool's style bar picks how to hide things: paint with a **brush** (a
   ring under the pointer shows its size) or drag an **area**; then **mosaic**,
   **blur** or a solid **gray** block. The slider sets the mosaic block size or
@@ -27,7 +35,8 @@ Press the hotkey, then:
   frames into one tall image. Sticky headers and footers appear once. The bar
   next to the region has Edit, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
   image, Save writes a PNG, ✕ cancels, and Edit opens it in a window with the
-  same tools as the capture toolbar (shapes, pen, redact, text, undo, To text,
+  same tools as the capture toolbar (shapes, pen, highlighter, counter, redact,
+  text, undo, To text,
   Save, ✕, ✓), scrolled with the mouse wheel. Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
   scrolling back a little picks it up again. Content redrawn at fractional pixel

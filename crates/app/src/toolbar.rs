@@ -2,9 +2,9 @@
 //! colors), the editor's toolbar and style bar, and building blocks other
 //! panels (the scrolling-capture bar) reuse.
 
-use bluesnap_core::{Color, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
+use bluesnap_core::{Color, CounterFormat, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, AnyView, App, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba, svg, white,
 };
@@ -49,6 +49,8 @@ impl Action {
             Action::Tool(Tool::Ellipse) => "icons/ellipse.svg",
             Action::Tool(Tool::Arrow) => "icons/arrow.svg",
             Action::Tool(Tool::Pen) => "icons/pen.svg",
+            Action::Tool(Tool::Highlighter) => "icons/highlighter.svg",
+            Action::Tool(Tool::Counter) => "icons/counter.svg",
             Action::Tool(Tool::Redact) => "icons/mosaic.svg",
             Action::Tool(Tool::Text) => "icons/text.svg",
             Action::Undo => "icons/undo.svg",
@@ -67,6 +69,8 @@ impl Action {
             Action::Tool(Tool::Ellipse) => "Ellipse",
             Action::Tool(Tool::Arrow) => "Arrow",
             Action::Tool(Tool::Pen) => "Pen",
+            Action::Tool(Tool::Highlighter) => "Highlighter (Shift: straight line)",
+            Action::Tool(Tool::Counter) => "Counter: click to place 1, 2, 3 …",
             Action::Tool(Tool::Redact) => "Redact",
             Action::Tool(Tool::Text) => "Text",
             Action::Undo => "Undo",
@@ -98,11 +102,13 @@ impl Action {
     }
 }
 
-const TOOLS: [Action; 6] = [
+const TOOLS: [Action; Tool::ALL.len()] = [
     Action::Tool(Tool::Rect),
     Action::Tool(Tool::Ellipse),
     Action::Tool(Tool::Arrow),
     Action::Tool(Tool::Pen),
+    Action::Tool(Tool::Highlighter),
+    Action::Tool(Tool::Counter),
     Action::Tool(Tool::Redact),
     Action::Tool(Tool::Text),
 ];
@@ -133,10 +139,12 @@ pub fn panel_size(groups: &[&[Action]], extra: f32) -> (f32, f32) {
 }
 
 /// Logical size of the style bar: 3 sizes, then (if the tool has a color) | 6
-/// colors. The redact tool's bar is area | effect | strength slider | 3 sizes.
+/// colors, then for counters | 4 numberings. The redact tool's bar is area |
+/// effect | strength slider | 3 sizes.
 pub fn style_bar_size(tool: Tool) -> (f32, f32) {
     let (buttons, seps, extra) = match tool {
         Tool::Redact => (REDACT_SEGMENTS + 3, 3, SLIDER),
+        Tool::Counter => (3 + PALETTE.len() + CounterFormat::ALL.len(), 2, 0.0),
         _ if tool.uses_color() => (3 + PALETTE.len(), 1, 0.0),
         _ => (3, 0, 0.0),
     };
@@ -312,7 +320,17 @@ fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<Edit
     bar
 }
 
-pub fn style_bar(tool: Tool, size: SizeLevel, color: Color, x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
+/// The style bar of a tool with a color. `numbering` is the counters' format,
+/// shown for the counter tool.
+pub fn style_bar(
+    tool: Tool,
+    size: SizeLevel,
+    color: Color,
+    numbering: Option<CounterFormat>,
+    x: f32,
+    y: f32,
+    cx: &mut Context<EditorView>,
+) -> AnyElement {
     let mut bar = size_dots(floating_panel(style_bar_size(tool), x, y), size, true, cx);
     if tool.uses_color() {
         bar = bar.child(separator());
@@ -324,6 +342,33 @@ pub fn style_bar(tool: Tool, size: SizeLevel, color: Color, x: f32, y: f32, cx: 
                     .when(active, |d| d.border_2().border_color(hsla(THEME_BLUE)))
                     .child(div().size(px(16.0)).rounded(px(3.0)).bg(hsla(c)).border_1().border_color(rgba(0x0000_0033)))
                     .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().set_color(c))),
+            );
+        }
+    }
+    if let Some(current) = numbering {
+        bar = bar.child(separator());
+        for format in CounterFormat::ALL {
+            let (glyph, label) = match format {
+                CounterFormat::Decimal => ("1", "Numbers: 1, 2, 3 …"),
+                CounterFormat::UpperAlpha => ("A", "Letters: A, B, C …"),
+                CounterFormat::Roman => ("I", "Roman numerals: I, II, III …"),
+                CounterFormat::LowerAlpha => ("a", "Lowercase letters: a, b, c …"),
+            };
+            let active = format == current;
+            bar = bar.child(
+                style_button(active)
+                    .id(label)
+                    .tooltip(tooltip(label))
+                    .cursor_pointer()
+                    .when(!active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(if active { hsla(THEME_BLUE) } else { rgb(0x444444).into() })
+                    .child(glyph)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        on_press(cx, move |this, _, _| this.editor_mut().set_counter_format(format)),
+                    ),
             );
         }
     }
@@ -418,9 +463,9 @@ mod tests {
 
     #[test]
     fn panel_size_counts_buttons_separators_and_gaps() {
-        // 12 buttons, 2 separators, 13 gaps between the 14 children.
+        // 14 buttons, 2 separators, 15 gaps between the 16 children.
         let frame = 2.0 * (BORDER + PAD);
-        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 12.0 * BUTTON + 2.0 * SEP + 13.0 * GAP, 42.0));
+        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 14.0 * BUTTON + 2.0 * SEP + 15.0 * GAP, 42.0));
         // One button less without scrolling capture.
         assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0).0 - panel_size(DOCUMENT_TOOLBAR, 0.0).0, BUTTON + GAP);
         // Extra content (the scrolling bar's status) is a group of its own:
@@ -433,6 +478,8 @@ mod tests {
         let frame = 2.0 * (BORDER + PAD);
         // 3 sizes | 6 colors: 9 buttons, a separator, 9 gaps.
         assert_eq!(style_bar_size(Tool::Rect).0, frame + 9.0 * STYLE_BUTTON + SEP + 9.0 * GAP);
+        // Counters add | 4 numberings: 13 buttons, 2 separators, 14 gaps.
+        assert_eq!(style_bar_size(Tool::Counter).0, frame + 13.0 * STYLE_BUTTON + 2.0 * SEP + 14.0 * GAP);
         // 2 areas | 3 effects | slider | 3 sizes: 8 buttons, 3 separators and
         // the slider, so 11 gaps.
         let redact = frame + 8.0 * STYLE_BUTTON + 3.0 * SEP + SLIDER + 11.0 * GAP;

@@ -15,7 +15,7 @@ macro_rules! icons {
 }
 
 icons![
-    "rect", "ellipse", "arrow", "pen", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
+    "rect", "ellipse", "arrow", "pen", "highlighter", "counter", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
     // The redact style bar.
     "brush", "area", "blur", "gray",
 ];

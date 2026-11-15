@@ -17,6 +17,12 @@ impl Color {
     pub const fn to_hex(self) -> u32 {
         (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
     }
+
+    /// Whether dark text reads better on this color than white text.
+    pub fn is_light(self) -> bool {
+        // Relative luminance with sRGB weights, on the gamma-encoded values.
+        0.299 * self.r as f32 + 0.587 * self.g as f32 + 0.114 * self.b as f32 > 160.0
+    }
 }
 
 /// Theme color of the whole tool: selection borders, handles, active tool.
@@ -32,18 +38,37 @@ pub const PALETTE: [Color; 6] = [
     Color::rgb(0xFFFFFF), // white
 ];
 
+/// Opacity of highlighter strokes.
+pub const HIGHLIGHT_ALPHA: u8 = 115; // 45%
+
+/// Text color of counters on light colors (white text elsewhere).
+pub const COUNTER_DARK_TEXT: Color = Color::rgb(0x1F1F1F);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tool {
     Rect,
     Ellipse,
     Arrow,
     Pen,
+    /// Translucent freehand strokes, like a marker over paper.
+    Highlighter,
+    /// Numbered markers placed with a click: 1, 2, 3, …
+    Counter,
     Redact,
     Text,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 6] = [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Pen, Tool::Redact, Tool::Text];
+    pub const ALL: [Tool; 8] = [
+        Tool::Rect,
+        Tool::Ellipse,
+        Tool::Arrow,
+        Tool::Pen,
+        Tool::Highlighter,
+        Tool::Counter,
+        Tool::Redact,
+        Tool::Text,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -52,6 +77,14 @@ impl Tool {
     /// Whether the tool's color can be changed (redaction has effects instead).
     pub fn uses_color(self) -> bool {
         self != Tool::Redact
+    }
+
+    /// Style of the tool's first shapes in a session.
+    pub fn default_style(self) -> Style {
+        match self {
+            Tool::Highlighter => Style { color: PALETTE[1], ..Style::default() }, // yellow
+            _ => Style::default(),
+        }
     }
 }
 
@@ -71,6 +104,9 @@ impl SizeLevel {
     pub fn logical_px(self, tool: Tool) -> f32 {
         let table: [f32; 3] = match tool {
             Tool::Rect | Tool::Ellipse | Tool::Arrow | Tool::Pen => [2.0, 4.0, 6.0],
+            Tool::Highlighter => [10.0, 18.0, 30.0],
+            // Marker diameter.
+            Tool::Counter => [20.0, 28.0, 40.0],
             Tool::Redact => [12.0, 24.0, 40.0],
             Tool::Text => [16.0, 24.0, 36.0],
         };
@@ -88,6 +124,76 @@ impl Default for Style {
     fn default() -> Self {
         Self { color: PALETTE[0], size: SizeLevel::Medium }
     }
+}
+
+/// How counters are numbered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CounterFormat {
+    /// 1, 2, 3, 4 …
+    #[default]
+    Decimal,
+    /// A, B, C, D … Z, AA, AB …
+    UpperAlpha,
+    /// I, II, III, IV …
+    Roman,
+    /// a, b, c, d …
+    LowerAlpha,
+}
+
+impl CounterFormat {
+    pub const ALL: [CounterFormat; 4] =
+        [CounterFormat::Decimal, CounterFormat::UpperAlpha, CounterFormat::Roman, CounterFormat::LowerAlpha];
+
+    /// The label of counter `n` (1-based).
+    pub fn label(self, n: u32) -> String {
+        let n = n.max(1);
+        match self {
+            CounterFormat::Decimal => n.to_string(),
+            CounterFormat::UpperAlpha => alpha(n, b'A'),
+            CounterFormat::LowerAlpha => alpha(n, b'a'),
+            // Beyond 3999 Roman numerals need overlines; fall back to digits.
+            CounterFormat::Roman if n >= 4000 => n.to_string(),
+            CounterFormat::Roman => roman(n),
+        }
+    }
+}
+
+/// Spreadsheet-style column letters: 1 → A, 26 → Z, 27 → AA.
+fn alpha(mut n: u32, a: u8) -> String {
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push(a + (n % 26) as u8);
+        n /= 26;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ASCII letters")
+}
+
+fn roman(mut n: u32) -> String {
+    const TABLE: [(u32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    for (value, digits) in TABLE {
+        while n >= value {
+            out.push_str(digits);
+            n -= value;
+        }
+    }
+    out
 }
 
 /// How a redaction hides what's under it.
@@ -163,6 +269,23 @@ impl RedactEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_labels_in_each_format() {
+        let labels = |f: CounterFormat, ns: &[u32]| ns.iter().map(|n| f.label(*n)).collect::<Vec<_>>();
+        assert_eq!(labels(CounterFormat::Decimal, &[1, 2, 10]), ["1", "2", "10"]);
+        assert_eq!(labels(CounterFormat::UpperAlpha, &[1, 26, 27, 52, 703]), ["A", "Z", "AA", "AZ", "AAA"]);
+        assert_eq!(labels(CounterFormat::LowerAlpha, &[3, 28]), ["c", "ab"]);
+        assert_eq!(labels(CounterFormat::Roman, &[1, 4, 9, 14, 40, 1994]), ["I", "IV", "IX", "XIV", "XL", "MCMXCIV"]);
+    }
+
+    #[test]
+    fn light_colors_get_dark_text() {
+        assert!(PALETTE[5].is_light()); // white
+        assert!(PALETTE[1].is_light()); // yellow
+        assert!(!PALETTE[0].is_light()); // red
+        assert!(!PALETTE[3].is_light()); // blue
+    }
 
     #[test]
     fn strength_maps_to_effect_amounts() {

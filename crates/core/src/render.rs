@@ -13,8 +13,9 @@ use tiny_skia::{
 use crate::geom::{Point, Rect};
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
 use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
-use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len};
-use crate::style::{Color, REDACT_GRAY, RedactEffect};
+use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size};
+use crate::style::{COUNTER_DARK_TEXT, Color, HIGHLIGHT_ALPHA, REDACT_GRAY, RedactEffect};
+use crate::text::FontSet;
 
 /// The frozen screenshot an editing session works on.
 pub struct Document {
@@ -211,6 +212,16 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
             }
         }
+        Geometry::Highlight(pts) => {
+            // One path, so where the stroke crosses itself it doesn't get darker.
+            if let Some(path) = smooth_path(pts) {
+                let paint = solid(Color { a: HIGHLIGHT_ALPHA, ..shape.style.color });
+                pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
+            }
+        }
+        Geometry::Counter { center, number, format } => {
+            draw_counter(pixmap, *center, &format.label(*number), w, shape.style.color, m.fonts, ts)
+        }
         Geometry::Redact { area, effect, strength } => {
             let region;
             let paint = match effect {
@@ -290,6 +301,31 @@ fn draw_arrow(pixmap: &mut Pixmap, from: Point, to: Point, w: f32, paint: &Paint
     }
 }
 
+/// A filled circle (or pill, for long labels) with the label centered on it.
+fn draw_counter(pixmap: &mut Pixmap, center: Point, label: &str, diameter: f32, color: Color, fonts: &FontSet, ts: Transform) {
+    let r = counter_box(center, label, diameter, fonts);
+    // A round-capped line as wide as the marker: a circle when it has no length.
+    let radius = diameter / 2.0;
+    let mut pb = PathBuilder::new();
+    pb.move_to(r.x + radius, center.y);
+    pb.line_to((r.right() - radius).max(r.x + radius + 0.01), center.y);
+    let Some(body) = pb.finish() else { return };
+    // A faint dark edge keeps light markers visible on light backgrounds.
+    let edge = Color { a: 64, ..Color::rgb(0x000000) };
+    pixmap.stroke_path(&body, &solid(edge), &stroke(diameter + 2.0, LineJoin::Round), ts, None);
+    pixmap.stroke_path(&body, &solid(color), &stroke(diameter, LineJoin::Round), ts, None);
+
+    let size = counter_font_size(diameter);
+    let Some(glyphs) = fonts.outline_path(&fonts.layout(label, size), Point::new(0.0, 0.0)) else { return };
+    // Center the glyphs' ink, not their line box, so digits sit in the middle.
+    let ink = glyphs.bounds();
+    let ts = ts.pre_translate(center.x - (ink.left() + ink.right()) / 2.0, center.y - (ink.top() + ink.bottom()) / 2.0);
+    let text = solid(if color.is_light() { COUNTER_DARK_TEXT } else { Color::rgb(0xFFFFFF) });
+    pixmap.fill_path(&glyphs, &text, FillRule::Winding, ts, None);
+    // Slightly bolder than the regular face, for legibility at small sizes.
+    pixmap.stroke_path(&glyphs, &text, &Stroke { width: size * 0.06, ..Stroke::default() }, ts, None);
+}
+
 /// Polyline through `pts`, smoothed with quadratic curves through segment midpoints.
 fn smooth_path(pts: &[Point]) -> Option<tiny_skia::Path> {
     let (first, rest) = pts.split_first()?;
@@ -324,7 +360,7 @@ fn draw_underline(pixmap: &mut Pixmap, shape: &Shape, m: Metrics, range: Range<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::style::{PALETTE, RedactEffect, SizeLevel, Style};
+    use crate::style::{CounterFormat, PALETTE, RedactEffect, SizeLevel, Style, Tool};
     use crate::text::FontSet;
 
     fn doc(w: u32, h: u32) -> Document {
@@ -389,6 +425,65 @@ mod tests {
             assert_eq!((px0, py0), (256, 256));
             assert_eq!(part.pixel(50, 50), whole.pixel(306, 306));
         }
+    }
+
+    fn real_fonts() -> Option<FontSet> {
+        let fonts = FontSet::load(&["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]);
+        (!fonts.is_empty()).then_some(fonts)
+    }
+
+    #[test]
+    fn highlights_are_translucent_and_dont_darken_where_they_cross() {
+        let d = doc(100, 100);
+        let fonts = FontSet::empty();
+        let m = Metrics { scale: 1.0, fonts: &fonts };
+        // Through the white half and back over itself.
+        let pts = [(60.0, 20.0), (90.0, 50.0), (60.0, 80.0), (90.0, 20.0)].map(|(x, y)| Point::new(x, y)).to_vec();
+        let shapes = [Shape { geometry: Geometry::Highlight(pts), style: Tool::Highlighter.default_style() }];
+        let out = export(&d, d.bounds(), &shapes, m).unwrap();
+        let px = |x, y| {
+            let p = out.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue())
+        };
+        let yellow = PALETTE[1];
+        let mix = |c: u8| (255.0 + (c as f32 - 255.0) * HIGHLIGHT_ALPHA as f32 / 255.0).round() as u8;
+        let expected = (mix(yellow.r), mix(yellow.g), mix(yellow.b));
+        // On a single pass and where the stroke crosses itself: the same tint.
+        for (x, y) in [(66, 26), (75, 50)] {
+            let (r, g, b) = px(x, y);
+            assert!(r.abs_diff(expected.0) <= 1 && g.abs_diff(expected.1) <= 1 && b.abs_diff(expected.2) <= 1, "{:?} at ({x}, {y})", px(x, y));
+        }
+    }
+
+    #[test]
+    fn counters_are_filled_with_a_centered_label() {
+        let Some(fonts) = real_fonts() else { return };
+        let d = doc(200, 100);
+        let m = Metrics { scale: 1.0, fonts: &fonts };
+        let counter = |x, number, color| Shape {
+            geometry: Geometry::Counter { center: Point::new(x, 50.0), number, format: CounterFormat::Decimal },
+            style: Style { color, size: SizeLevel::Large },
+        };
+        let out = export(&d, d.bounds(), &[counter(150.0, 1, PALETTE[0]), counter(60.0, 8, PALETTE[5])], m).unwrap();
+        let rgb = |x, y| {
+            let p = out.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue())
+        };
+        // Red disc, radius 20, around a white "1" whose ink is centered on it.
+        assert_eq!(rgb(150 - 14, 50), (0xF5, 0x22, 0x2D));
+        assert_eq!(rgb(150 + 25, 50), (255, 255, 255));
+        let ink: Vec<(u32, u32)> = (131..170)
+            .flat_map(|x| (31..70).map(move |y| (x, y)))
+            .filter(|&(x, y)| Point::new(x as f32 + 0.5, y as f32 + 0.5).distance(Point::new(150.0, 50.0)) < 17.0)
+            .filter(|&(x, y)| rgb(x, y) == (255, 255, 255))
+            .collect();
+        assert!(ink.len() > 40, "label too small: {} px", ink.len());
+        let span = |f: fn(&(u32, u32)) -> u32| (ink.iter().map(f).min().unwrap(), ink.iter().map(f).max().unwrap());
+        let ((x0, x1), (y0, y1)) = (span(|p| p.0), span(|p| p.1));
+        assert!(((x0 + x1) as f32 / 2.0 - 149.5).abs() <= 1.0 && ((y0 + y1) as f32 / 2.0 - 49.5).abs() <= 1.0, "ink {x0}..{x1} x {y0}..{y1}");
+        // White disc on the black half: a dark "8", whose waist is at the center.
+        assert_eq!(rgb(60 - 15, 50), (255, 255, 255));
+        assert!(rgb(60, 50).0 < 100, "label not dark at the center: {:?}", rgb(60, 50));
     }
 
     #[test]

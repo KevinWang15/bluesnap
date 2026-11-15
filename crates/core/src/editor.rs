@@ -10,7 +10,7 @@ use tiny_skia::Pixmap;
 use crate::geom::{CursorKind, Handle, Point, Rect};
 use crate::render::{self, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
-use crate::style::{Color, RedactArea, Redaction, SizeLevel, Style, Tool};
+use crate::style::{Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, Tool};
 use crate::text::FontSet;
 
 /// Movement (in logical pixels) before a press turns into a drag.
@@ -91,6 +91,8 @@ pub struct Editor {
     styles: [Style; Tool::ALL.len()],
     /// The redact tool's settings for new redactions.
     redaction: Redaction,
+    /// Numbering for counters while there are none (existing ones set it otherwise).
+    counter_format: CounterFormat,
     /// Inside `begin_continuous_edit` .. `end_continuous_edit`; `true` once an
     /// undo snapshot was taken for it.
     continuous: Option<bool>,
@@ -122,8 +124,9 @@ impl Editor {
             history: Vec::new(),
             selected: None,
             tool: None,
-            styles: [Style::default(); Tool::ALL.len()],
+            styles: Tool::ALL.map(Tool::default_style),
             redaction: Redaction::default(),
+            counter_format: CounterFormat::default(),
             continuous: None,
             text: None,
             revision: 0,
@@ -293,6 +296,52 @@ impl Editor {
         self.touch_shapes();
     }
 
+    /// The counters' numbering for the style bar: when the counter tool is active
+    /// or a counter is selected.
+    pub fn current_counter_format(&self) -> Option<CounterFormat> {
+        let showing = match self.selected.and_then(|i| self.shapes.get(i)) {
+            Some(shape) => shape.tool() == Tool::Counter,
+            None => self.tool == Some(Tool::Counter),
+        };
+        showing.then(|| self.counter_format())
+    }
+
+    /// All counters share one numbering, so they read as one sequence.
+    fn counter_format(&self) -> CounterFormat {
+        self.shapes
+            .iter()
+            .find_map(|s| match s.geometry {
+                Geometry::Counter { format, .. } => Some(format),
+                _ => None,
+            })
+            .unwrap_or(self.counter_format)
+    }
+
+    /// Renumbers every counter with `format`, and new ones (one undo step).
+    pub fn set_counter_format(&mut self, format: CounterFormat) {
+        self.counter_format = format;
+        self.begin_change();
+        for shape in &mut self.shapes {
+            if let Geometry::Counter { format: f, .. } = &mut shape.geometry {
+                *f = format;
+            }
+        }
+        self.end_change();
+        self.touch_shapes();
+    }
+
+    /// Numbers counters 1, 2, 3 … in the order they were placed, so deleting
+    /// one closes the gap.
+    fn renumber_counters(&mut self) {
+        let mut n = 0;
+        for shape in &mut self.shapes {
+            if let Geometry::Counter { number, .. } = &mut shape.geometry {
+                n += 1;
+                *number = n;
+            }
+        }
+    }
+
     /// Starts a run of changes that should undo as one (a slider drag).
     pub fn begin_continuous_edit(&mut self) {
         self.continuous = Some(false);
@@ -304,14 +353,19 @@ impl Editor {
         }
     }
 
-    /// Where to show the redact brush's outline (center and radius), when the
-    /// next press would paint with it.
+    /// Where to show a wide brush's outline (center and radius), when the next
+    /// press would paint with it: the redact brush and the highlighter.
     pub fn brush_ring(&self) -> Option<(Point, f32)> {
         let painting = matches!(self.drag, None | Some(Drag::Create { .. }));
-        let brush = self.tool == Some(Tool::Redact) && self.redaction.area == RedactArea::Brush;
+        let tool = self.tool?;
+        let brush = match tool {
+            Tool::Redact => self.redaction.area == RedactArea::Brush,
+            Tool::Highlighter => true,
+            _ => false,
+        };
         let inside = self.selection.is_some_and(|s| s.contains(self.pointer));
         (painting && brush && inside && self.text.is_none())
-            .then(|| (self.pointer, self.styles[Tool::Redact.index()].size.logical_px(Tool::Redact) * self.scale / 2.0))
+            .then(|| (self.pointer, self.styles[tool.index()].size.logical_px(tool) * self.scale / 2.0))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -457,6 +511,12 @@ impl Editor {
             Tool::Ellipse => Geometry::Ellipse(Rect::from_points(p, p)),
             Tool::Arrow => Geometry::Arrow { from: p, to: p },
             Tool::Pen => Geometry::Pen(vec![p]),
+            Tool::Highlighter => Geometry::Highlight(vec![p]),
+            Tool::Counter => Geometry::Counter {
+                center: p,
+                number: self.shapes.iter().filter(|s| s.tool() == Tool::Counter).count() as u32 + 1,
+                format: self.counter_format(),
+            },
             Tool::Redact => Geometry::Redact {
                 area: match self.redaction.area {
                     RedactArea::Brush => RedactShape::Brush(vec![p]),
@@ -524,7 +584,13 @@ impl Editor {
                         *r = Rect::from_points(start, constrained(start, p, constrain))
                     }
                     Geometry::Arrow { to, .. } => *to = p,
-                    Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+                    // Placed where the press ends, so it can be positioned precisely.
+                    Geometry::Counter { center, .. } => *center = p,
+                    // A straight line while constrained, for highlighting a line of text.
+                    Geometry::Highlight(pts) if constrain => *pts = vec![start, p],
+                    Geometry::Pen(pts)
+                    | Geometry::Highlight(pts)
+                    | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                         if pts.last().is_none_or(|last| last.distance(p) >= MIN_STROKE_STEP * scale) {
                             pts.push(p);
                         }
@@ -663,6 +729,7 @@ impl Editor {
         let Some(idx) = self.selected.take() else { return false };
         self.begin_change();
         self.shapes.remove(idx);
+        self.renumber_counters();
         self.touch_shapes();
         true
     }
@@ -1132,6 +1199,79 @@ mod tests {
         assert_eq!((e.selected, e.tool), (None, Some(Tool::Redact)));
         assert_eq!(e.current_redaction().unwrap().area, RedactArea::Brush);
         assert_eq!(e.shapes, before);
+    }
+
+    fn counters(e: &Editor) -> Vec<(u32, CounterFormat)> {
+        e.shapes
+            .iter()
+            .filter_map(|s| match s.geometry {
+                Geometry::Counter { number, format, .. } => Some((number, format)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn counters_number_in_order_and_close_gaps() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Counter);
+        assert_eq!(e.current_counter_format(), Some(CounterFormat::Decimal));
+        for x in [50.0, 120.0, 190.0] {
+            click(&mut e, x, 100.0);
+        }
+        let numbers = |e: &Editor| counters(e).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(numbers(&e), [1, 2, 3]);
+        // Clicking a counter grabs it instead of adding one.
+        drag(&mut e, (120.0, 100.0), (120.0, 200.0));
+        assert_eq!(numbers(&e), [1, 2, 3]);
+        assert!(matches!(e.shapes[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
+        // Deleting the second renumbers the third; undo brings both back.
+        assert!(e.delete_selected());
+        assert_eq!(numbers(&e), [1, 2]);
+        click(&mut e, 260.0, 100.0);
+        assert_eq!(numbers(&e), [1, 2, 3]);
+        e.undo();
+        e.undo();
+        assert_eq!(numbers(&e), [1, 2, 3]);
+        assert!(matches!(e.shapes[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
+    }
+
+    #[test]
+    fn counter_format_applies_to_the_whole_sequence() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Counter);
+        click(&mut e, 50.0, 100.0);
+        click(&mut e, 120.0, 100.0);
+        e.set_counter_format(CounterFormat::Roman);
+        click(&mut e, 190.0, 100.0);
+        assert!(counters(&e).iter().all(|(_, f)| *f == CounterFormat::Roman));
+        // One undo step for the format change (after undoing the third counter).
+        e.undo();
+        e.undo();
+        assert!(counters(&e).iter().all(|(_, f)| *f == CounterFormat::Decimal));
+        assert_eq!(e.current_counter_format(), Some(CounterFormat::Decimal));
+        // Other tools don't show the numbering.
+        e.toggle_tool(Tool::Pen);
+        assert_eq!(e.current_counter_format(), None);
+    }
+
+    #[test]
+    fn highlighter_draws_yellow_strokes_straight_with_shift() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Highlighter);
+        assert_eq!(e.current_style().unwrap().1.color, crate::style::PALETTE[1]);
+        e.pointer_down(Point::new(50.0, 100.0));
+        for x in [80.0, 120.0, 160.0] {
+            e.pointer_move(Point::new(x, 100.0 + x / 10.0), true);
+        }
+        e.pointer_up(Point::new(160.0, 116.0));
+        assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 116.0)]));
+        // The ring shows the highlighter's width.
+        e.pointer_move(Point::new(300.0, 200.0), false);
+        assert_eq!(e.brush_ring(), Some((Point::new(300.0, 200.0), 9.0)));
     }
 
     #[test]

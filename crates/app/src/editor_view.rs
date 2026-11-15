@@ -596,7 +596,10 @@ impl Render for EditorView {
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
                 root = root.child(match self.editor.current_redaction() {
                     Some(redaction) => toolbar::redact_bar(redaction, style.size, at.x, at.y, cx),
-                    None => toolbar::style_bar(tool, style.size, style.color, at.x, at.y, cx),
+                    None => {
+                        let numbering = self.editor.current_counter_format();
+                        toolbar::style_bar(tool, style.size, style.color, numbering, at.x, at.y, cx)
+                    }
                 });
             }
         }

@@ -1,7 +1,7 @@
 //! Annotation shapes: geometry, hit testing and editing handles.
 
 use crate::geom::{Handle, Point, Rect, distance_to_segment};
-use crate::style::{RedactEffect, Style, Tool};
+use crate::style::{CounterFormat, RedactEffect, Style, Tool};
 use crate::text::FontSet;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10,6 +10,11 @@ pub enum Geometry {
     Ellipse(Rect),
     Arrow { from: Point, to: Point },
     Pen(Vec<Point>),
+    /// A translucent stroke through the points.
+    Highlight(Vec<Point>),
+    /// A numbered marker centered on `center`. `number` is its place among the
+    /// counters (1-based), kept in order by the editor.
+    Counter { center: Point, number: u32, format: CounterFormat },
     /// Hides what's under `area` with `effect`; `strength` is the 0..=1 slider
     /// value (see [`RedactEffect::amount`]).
     Redact { area: RedactShape, effect: RedactEffect, strength: f32 },
@@ -54,6 +59,8 @@ impl Shape {
             Geometry::Ellipse(_) => Tool::Ellipse,
             Geometry::Arrow { .. } => Tool::Arrow,
             Geometry::Pen(_) => Tool::Pen,
+            Geometry::Highlight(_) => Tool::Highlighter,
+            Geometry::Counter { .. } => Tool::Counter,
             Geometry::Redact { .. } => Tool::Redact,
             Geometry::Text { .. } => Tool::Text,
         }
@@ -70,6 +77,10 @@ impl Shape {
             Geometry::Ellipse(r) => Geometry::Ellipse(r.translate(d)),
             Geometry::Arrow { from, to } => Geometry::Arrow { from: *from + d, to: *to + d },
             Geometry::Pen(pts) => Geometry::Pen(pts.iter().map(|p| *p + d).collect()),
+            Geometry::Highlight(pts) => Geometry::Highlight(pts.iter().map(|p| *p + d).collect()),
+            Geometry::Counter { center, number, format } => {
+                Geometry::Counter { center: *center + d, number: *number, format: *format }
+            }
             Geometry::Redact { area, effect, strength } => Geometry::Redact {
                 area: match area {
                     RedactShape::Brush(pts) => RedactShape::Brush(pts.iter().map(|p| *p + d).collect()),
@@ -89,9 +100,10 @@ impl Shape {
         match &self.geometry {
             Geometry::Rect(r) | Geometry::Ellipse(r) => r.inflate(w / 2.0 + 1.0),
             Geometry::Arrow { from, to } => Rect::from_points(*from, *to).inflate(arrow_head_len(w) + 1.0),
-            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+            Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 points_bounds(pts).inflate(w / 2.0 + 1.0)
             }
+            Geometry::Counter { center, number, format } => counter_box(*center, &format.label(*number), w, m.fonts).inflate(1.0),
             Geometry::Redact { area: RedactShape::Rect(r), .. } => *r,
             Geometry::Text { origin, content } => {
                 let layout = m.fonts.layout(content, w);
@@ -120,10 +132,11 @@ impl Shape {
                 (d - 1.0).abs() * a.min(b) <= tol
             }
             Geometry::Arrow { from, to } => distance_to_segment(p, *from, *to) <= tol.max(arrow_head_len(w) / 2.0),
-            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+            Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 pts.windows(2).any(|s| distance_to_segment(p, s[0], s[1]) <= tol)
                     || pts.first().is_some_and(|q| q.distance(p) <= tol)
             }
+            Geometry::Counter { .. } => self.bounds(m).inflate(2.0 * m.scale).contains(p),
             Geometry::Redact { area: RedactShape::Rect(r), .. } => r.inflate(5.0 * m.scale).contains(p),
             Geometry::Text { .. } => self.bounds(m).inflate(4.0 * m.scale).contains(p),
         }
@@ -161,10 +174,25 @@ impl Shape {
                 r.w < 2.0 || r.h < 2.0
             }
             Geometry::Arrow { from, to } => from.distance(*to) < 4.0,
-            Geometry::Pen(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => pts.len() < 2,
+            Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+                pts.len() < 2
+            }
+            Geometry::Counter { .. } => false,
             Geometry::Text { content, .. } => content.is_empty(),
         }
     }
+}
+
+/// A counter's marker: a circle of `diameter` around `center`, widened into a
+/// pill when the label (like "XVIII") doesn't fit.
+pub fn counter_box(center: Point, label: &str, diameter: f32, fonts: &FontSet) -> Rect {
+    let text = fonts.layout(label, counter_font_size(diameter)).width;
+    let w = diameter.max(text + diameter * 0.45);
+    Rect::new(center.x - w / 2.0, center.y - diameter / 2.0, w, diameter)
+}
+
+pub fn counter_font_size(diameter: f32) -> f32 {
+    diameter * 0.62
 }
 
 pub fn arrow_head_len(stroke: f32) -> f32 {
@@ -208,6 +236,22 @@ mod tests {
         };
         let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0));
         assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0) });
+    }
+
+    #[test]
+    fn counters_are_hit_inside_and_move() {
+        let fonts = FontSet::empty();
+        let s = Shape {
+            geometry: Geometry::Counter { center: Point::new(50.0, 50.0), number: 3, format: CounterFormat::Decimal },
+            style: Style::default(),
+        };
+        // Medium: 28 px across.
+        assert_eq!(s.bounds(metrics(&fonts)), Rect::new(36.0, 36.0, 28.0, 28.0).inflate(1.0));
+        assert!(s.hit(Point::new(50.0, 50.0), metrics(&fonts)));
+        assert!(!s.hit(Point::new(80.0, 50.0), metrics(&fonts)));
+        assert!(!s.is_degenerate());
+        let moved = s.translated(Point::new(10.0, 0.0));
+        assert!(matches!(moved.geometry, Geometry::Counter { center, number: 3, .. } if center == Point::new(60.0, 50.0)));
     }
 
     #[test]
