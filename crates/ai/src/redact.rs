@@ -64,6 +64,8 @@ pub struct Report {
     /// Requests that failed even after retries; their lines went unchecked.
     pub failed: usize,
     pub requests: usize,
+    /// Why the first failed request failed, to show the user.
+    pub first_error: Option<String>,
 }
 
 /// Finds sensitive text in `lines` (in reading order, so chunks keep context)
@@ -99,7 +101,7 @@ pub fn find_sensitive(settings: &AiSettings, lines: &[String]) -> anyhow::Result
     for e in errors.iter().take(3) {
         log::warn!("AI request failed: {e}");
     }
-    Ok(Report { findings: merge(findings), failed: errors.len(), requests })
+    Ok(Report { findings: merge(findings), failed: errors.len(), requests, first_error: errors.first().cloned() })
 }
 
 /// Where sensitive text is drawn in `image`, given its OCR `lines` (boxes in

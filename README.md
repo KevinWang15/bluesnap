@@ -25,10 +25,12 @@ Press the hotkey, then:
   undo step per drag). Select an existing redaction to change its effect or
   strength; area redactions can be resized with their handles. Effects always
   read the original screenshot, and mosaic blocks line up across strokes.
-- with an AI model set up (see [AI redaction](#ai-redaction)), the Redact bar has
-  an **Auto** button: it finds passwords, keys, tokens, contact details, IDs and
-  card numbers in the selection and covers each with an area redaction in the
-  current effect, in about a second. One undo removes them all.
+- the Redact bar's **Auto** button finds passwords, keys, tokens, contact details,
+  IDs and card numbers in the selection with AI (see [AI redaction](#ai-redaction))
+  and covers each with an area redaction in the current effect, in about a second.
+  One undo removes them all. A toast shows each step (reading the text, checking
+  it with AI, the result) and any error; without a model set up, it offers to
+  open the settings.
 - the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
   copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.

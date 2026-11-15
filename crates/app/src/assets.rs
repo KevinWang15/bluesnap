@@ -18,6 +18,8 @@ icons![
     "rect", "ellipse", "arrow", "pen", "highlighter", "counter", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
     // The redact style bar.
     "brush", "area", "blur", "gray", "auto",
+    // Toasts.
+    "spinner", "warning", "info",
 ];
 
 impl AssetSource for Assets {

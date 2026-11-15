@@ -13,6 +13,7 @@ mod gpu_image;
 mod output;
 mod scrolling;
 mod text_field;
+mod toast;
 mod toolbar;
 mod viewport;
 
@@ -175,7 +176,7 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                     .ok();
                 }
                 TrayCommand::AiSettings => {
-                    cx.update(ai_settings::open).ok();
+                    cx.update(|cx| ai_settings::open(false, cx)).ok();
                 }
                 TrayCommand::Quit => {
                     cx.update(|cx| cx.quit()).ok();

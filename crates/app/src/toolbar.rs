@@ -378,7 +378,7 @@ pub fn style_bar(
     bar.into_any_element()
 }
 
-/// Whether the redact bar offers AI redaction, and if it's running.
+/// The redact bar's Auto button: ready, or running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Auto {
     Ready,
@@ -386,17 +386,18 @@ pub enum Auto {
 }
 
 /// The redact tool's style bar: brush or area | mosaic, blur or gray |
-/// strength slider | brush size, then | Auto when AI is set up. Controls that
-/// don't apply are grayed out rather than hidden, so the bar keeps its layout.
+/// strength slider | brush size | Auto (AI redaction; it explains how to set it
+/// up when it isn't). Controls that don't apply are grayed out rather than
+/// hidden, so the bar keeps its layout.
 pub fn redact_bar(
     redaction: Redaction,
     size: SizeLevel,
-    auto: Option<Auto>,
+    auto: Auto,
     x: f32,
     y: f32,
     cx: &mut Context<EditorView>,
 ) -> AnyElement {
-    let mut bar = floating_panel(style_bar_size(Tool::Redact, auto.is_some()), x, y);
+    let mut bar = floating_panel(style_bar_size(Tool::Redact, true), x, y);
     for area in RedactArea::ALL {
         let (label, icon) = match area {
             RedactArea::Brush => ("Brush: paint over what to hide", "icons/brush.svg"),
@@ -423,7 +424,7 @@ pub fn redact_bar(
     }
     bar = bar.child(separator()).child(slider(redaction, cx)).child(separator());
     bar = size_dots(bar, size, redaction.area == RedactArea::Brush, cx);
-    if let Some(auto) = auto {
+    {
         let running = auto == Auto::Running;
         let color: Hsla = if running { rgb(0x999999).into() } else { hsla(THEME_BLUE) };
         bar = bar.child(separator()).child(
@@ -500,7 +501,7 @@ fn slider(redaction: Redaction, cx: &mut Context<EditorView>) -> Stateful<Div> {
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.press_slider(ev.position.x, window, cx);
+                    this.press_slider(ev.position.x, window);
                     cx.notify();
                 }),
             )

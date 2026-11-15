@@ -109,6 +109,15 @@ impl Platform for Native {
         Ok(())
     }
 
+    fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
+        // gpui puts the overlay (a pop-up window) at NSPopUpWindowLevel, 101.
+        const ABOVE_OVERLAY: isize = 102;
+        let ns_window = ns_window(window)?;
+        ns_window.setLevel(ABOVE_OVERLAY);
+        ns_window.makeKeyAndOrderFront(None);
+        Ok(())
+    }
+
     fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image> {
         // The rect is in display-local points; the image comes back in pixels.
         let s = display.scale_factor as f64;

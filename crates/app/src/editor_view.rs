@@ -22,12 +22,13 @@ use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollWheelEvent, SharedString, Styled, Task, UTF16Selection, Window, canvas, div,
+    Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection, Window, canvas, div,
     fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
 use crate::gpu_image::{ImageTiles, LayerCache, paint_tiles};
 use crate::output::{self, Finish};
+use crate::toast::{self, Toast};
 use crate::toolbar::{self, Action};
 use crate::viewport::Viewport;
 use crate::AppState;
@@ -71,8 +72,8 @@ pub struct EditorView {
     /// Document surface: height of the toolbar area above the image.
     top_bar: f32,
     finished: bool,
-    /// Message shown over the selection (text recognition progress/result).
-    status: Option<SharedString>,
+    /// Progress and results of text recognition and AI redaction.
+    toast: Option<Toast>,
     /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
     /// Running AI redaction, if any. Dropping it cancels the UI update.
@@ -83,6 +84,35 @@ pub struct EditorView {
 
 fn color(c: bluesnap_core::Color) -> Hsla {
     rgb(c.to_hex()).into()
+}
+
+/// An error's message, short enough for a toast.
+fn short_error(e: &anyhow::Error) -> String {
+    truncate(&format!("{e:#}"), 200)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// "1 line", "5 lines".
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
+}
+
+/// The servers AI requests go to, for telling the user.
+fn hosts(settings: &bluesnap_ai::AiSettings) -> String {
+    let host = |e: &bluesnap_ai::Endpoint| {
+        let url = e.url.trim();
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        rest.split(['/', '?']).next().unwrap_or(rest).to_string()
+    };
+    let mut hosts: Vec<String> = [settings.llm(), settings.decisions()].into_iter().flatten().map(host).collect();
+    hosts.dedup();
+    hosts.join(" and ")
 }
 
 /// Shown when macOS returned a capture without window contents.
@@ -149,7 +179,7 @@ impl EditorView {
             scroll: 0.0,
             top_bar: 0.0,
             finished: false,
-            status: None,
+            toast: None,
             ocr: None,
             auto: None,
             slider: None,
@@ -263,6 +293,37 @@ impl EditorView {
         self.ocr.is_some()
     }
 
+    /// Shows `toast` until its lifetime ends or another replaces it.
+    fn show_toast(&mut self, toast: Toast, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(lifetime) = toast.lifetime() {
+            let shown = toast.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(lifetime).await;
+                this.update(cx, |this, cx| {
+                    if this.toast.as_ref() == Some(&shown) {
+                        this.toast = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        self.toast = Some(toast);
+        cx.notify();
+    }
+
+    fn toast_action(&mut self, action: toast::Action, cx: &mut Context<Self>) {
+        match action {
+            toast::Action::OpenAiSettings => {
+                self.toast = None;
+                let above_overlay = matches!(self.surface, Surface::Capture { .. });
+                cx.defer(move |cx| crate::ai_settings::open(above_overlay, cx));
+            }
+        }
+        cx.notify();
+    }
+
     /// Recognizes the text in the selection (as displayed, so redacted text stays
     /// hidden), copies it to the clipboard and closes the view.
     fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -271,7 +332,7 @@ impl EditorView {
         }
         let Some(pixmap) = self.editor.export() else { return };
         let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
-        self.status = Some("Recognizing text…".into());
+        self.show_toast(Toast::new(toast::Kind::Busy, "Recognizing text…"), window, cx);
         let started = std::time::Instant::now();
         let recognized = cx
             .background_executor()
@@ -301,7 +362,7 @@ impl EditorView {
                     .collect(),
             )
         });
-        match text {
+        let toast = match text {
             Ok(text) if !text.trim().is_empty() => {
                 log::info!("copied {} characters of recognized text", text.chars().count());
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -309,19 +370,19 @@ impl EditorView {
                 window.remove_window();
                 return;
             }
-            Ok(_) => self.status = Some("No text found".into()),
+            Ok(_) => Toast::new(toast::Kind::Info, "No text found").detail("Select an area with text, then try again."),
             Err(e) => {
                 log::error!("text recognition failed: {e:#}");
-                self.status = Some("Text recognition failed".into());
+                Toast::new(toast::Kind::Error, "Text recognition failed").detail(short_error(&e))
             }
-        }
-        cx.notify();
+        };
+        self.show_toast(toast, window, cx);
     }
 
     /// A press on the redact strength slider: jumps to the pointer and follows
     /// it until release, as one undo step.
-    pub fn press_slider(&mut self, x: Pixels, window: &Window, cx: &App) {
-        let Some(bar) = self.panel_positions(window, cx).1 else { return };
+    pub fn press_slider(&mut self, x: Pixels, window: &Window) {
+        let Some(bar) = self.panel_positions(window).1 else { return };
         self.editor.begin_continuous_edit();
         self.slider = Some(bar.x);
         self.drag_slider(x);
@@ -334,94 +395,110 @@ impl EditorView {
         }
     }
 
-    /// The redact bar's Auto button: offered when an AI model is set up.
-    fn auto_state(&self, cx: &App) -> Option<toolbar::Auto> {
-        let configured = cx.global::<AppState>().ai.is_configured();
-        configured.then_some(if self.auto.is_some() { toolbar::Auto::Running } else { toolbar::Auto::Ready })
+    /// The redact bar's Auto button, and whether it's running.
+    fn auto_state(&self) -> toolbar::Auto {
+        if self.auto.is_some() { toolbar::Auto::Running } else { toolbar::Auto::Ready }
     }
 
     /// Finds sensitive text in the selection (as displayed, so what's already
     /// redacted isn't found again) and covers it with area redactions in the
     /// current effect, as one undo step. Text is recognized locally; only the
-    /// text goes to the configured AI endpoints.
+    /// text goes to the configured AI endpoints. Each stage shows in a toast.
     pub fn auto_redact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.auto.is_some() {
             return;
         }
-        let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
-        let origin = (sel.round().x, sel.round().y);
-        let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
         let settings = cx.global::<AppState>().ai.clone();
-        let image = pixmap;
+        if !settings.is_configured() {
+            let toast = Toast::new(toast::Kind::Info, "Set up AI redaction first")
+                .detail("Add an LLM or a decision model to find sensitive text automatically. Only recognized text is sent, never the image.")
+                .action("Set up…", toast::Action::OpenAiSettings);
+            return self.show_toast(toast, window, cx);
+        }
+        let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
+        let origin = bluesnap_core::Point::new(sel.round().x, sel.round().y);
+        let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
         let fonts = cx.global::<AppState>().fonts.clone();
-        self.status = Some("Finding sensitive text…".into());
+        self.show_toast(Toast::new(toast::Kind::Busy, "Reading the text…"), window, cx);
         let started = std::time::Instant::now();
-        let found = cx.background_executor().spawn(async move {
-            let lines: Vec<(PxRect, String)> = bluesnap_platform::native()
-                .recognize_text(width, height, &rgba)?
-                .into_iter()
-                .map(|l| (PxRect::new(l.bounds.x as f32, l.bounds.y as f32, l.bounds.width as f32, l.bounds.height as f32), l.text))
-                .collect();
-            let ocr_time = started.elapsed();
-            let (rects, report) = bluesnap_ai::locate_sensitive(&settings, &image, &lines, &fonts)?;
-            log::info!(
-                "auto redact: {} lines, {} findings, {}/{} requests failed; OCR {ocr_time:?}, total {:?}",
-                lines.len(),
-                report.findings.len(),
-                report.failed,
-                report.requests,
-                started.elapsed()
-            );
-            // Found in the selection's pixels; placed on the screenshot.
-            let at = bluesnap_core::Point::new(origin.0, origin.1);
-            anyhow::Ok((rects.into_iter().map(|r| r.translate(at)).collect::<Vec<_>>(), report.failed))
-        });
         self.auto = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = found.await;
-            this.update_in(cx, |this, window, cx| this.auto_redacted(result, window, cx)).ok();
+            let recognized = cx
+                .background_executor()
+                .spawn(async move { bluesnap_platform::native().recognize_text(width, height, &rgba) })
+                .await;
+            let lines: Vec<(PxRect, String)> = match recognized {
+                Ok(lines) => lines
+                    .into_iter()
+                    .map(|l| {
+                        let b = l.bounds;
+                        (PxRect::new(b.x as f32, b.y as f32, b.width as f32, b.height as f32), l.text)
+                    })
+                    .collect(),
+                Err(e) => {
+                    log::error!("auto redact: text recognition failed: {e:#}");
+                    let toast = Toast::new(toast::Kind::Error, "Couldn't read the text").detail(short_error(&e));
+                    this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
+                    return;
+                }
+            };
+            if lines.is_empty() {
+                let toast = Toast::new(toast::Kind::Info, "No text found").detail("There's nothing to redact in the selection.");
+                this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
+                return;
+            }
+            let ocr_time = started.elapsed();
+            let checking = Toast::new(toast::Kind::Busy, format!("Checking {} with AI…", plural(lines.len(), "line")))
+                .detail(format!("Sending the text, not the image, to {}", hosts(&settings)));
+            this.update_in(cx, |this, window, cx| this.show_toast(checking, window, cx)).ok();
+
+            let count = lines.len();
+            let found = cx
+                .background_executor()
+                .spawn(async move { bluesnap_ai::locate_sensitive(&settings, &pixmap, &lines, &fonts) })
+                .await;
+            log::info!("auto redact: {count} lines, OCR {ocr_time:?}, total {:?}", started.elapsed());
+            this.update_in(cx, |this, window, cx| {
+                let toast = match found {
+                    Ok((rects, report)) => {
+                        // Found in the selection's pixels; placed on the screenshot.
+                        let rects: Vec<PxRect> = rects.into_iter().map(|r| r.translate(origin)).collect();
+                        let added = this.editor.add_redactions(&rects);
+                        let toast = match added {
+                            0 => Toast::new(toast::Kind::Done, "Nothing sensitive found")
+                                .detail(format!("Checked {}.", plural(count, "line"))),
+                            n => Toast::new(toast::Kind::Done, format!("Redacted {}", plural(n, "item")))
+                                .detail("Undo removes them all; click one to change or delete it."),
+                        };
+                        // Some lines went unchecked: say so rather than imply all is covered.
+                        match (report.failed, report.first_error) {
+                            (0, _) | (_, None) => toast,
+                            (failed, Some(e)) => Toast::new(toast::Kind::Error, format!("{} · {} failed", toast.title, plural(failed, "request")))
+                                .detail(format!("Some text wasn't checked: {}", truncate(&e, 160)))
+                                .action("Settings…", toast::Action::OpenAiSettings),
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("auto redact failed: {e:#}");
+                        Toast::new(toast::Kind::Error, "AI redaction failed")
+                            .detail(short_error(&e))
+                            .action("Settings…", toast::Action::OpenAiSettings)
+                    }
+                };
+                this.auto_finished(toast, window, cx);
+            })
+            .ok();
         }));
         cx.notify();
     }
 
-    fn auto_redacted(&mut self, result: anyhow::Result<(Vec<PxRect>, usize)>, window: &mut Window, cx: &mut Context<Self>) {
+    fn auto_finished(&mut self, toast: Toast, window: &mut Window, cx: &mut Context<Self>) {
         self.auto = None;
-        let message = match result {
-            Ok((rects, failed)) => {
-                let added = self.editor.add_redactions(&rects);
-                let found = match added {
-                    0 => "Nothing sensitive found".to_string(),
-                    1 => "Redacted 1 item".to_string(),
-                    n => format!("Redacted {n} items"),
-                };
-                // Some lines went unchecked: say so rather than imply all is covered.
-                if failed > 0 { format!("{found} · some text could not be checked") } else { found }
-            }
-            Err(e) => {
-                log::error!("auto redact failed: {e:#}");
-                let e = format!("{e:#}");
-                format!("Auto redact failed: {}", e.chars().take(120).collect::<String>())
-            }
-        };
-        let shown: SharedString = message.into();
-        self.status = Some(shown.clone());
-        // The result stays readable briefly, then gets out of the way.
-        cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
-            this.update(cx, |this, cx| {
-                if this.status.as_ref() == Some(&shown) {
-                    this.status = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
+        self.show_toast(toast, window, cx);
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ocr.is_none() && self.auto.is_none() {
-            self.status = None;
+        if self.toast.as_ref().is_some_and(Toast::dismissable) {
+            self.toast = None;
         }
         if let Surface::Document = self.surface
             && f32::from(ev.position.y) < self.top_bar
@@ -568,9 +645,8 @@ impl EditorView {
     }
 
     /// Where the toolbar and style bar go, in window coordinates.
-    fn panel_positions(&self, window: &Window, cx: &App) -> (Point<f32>, Option<Point<f32>>) {
-        let auto = self.auto_state(cx).is_some();
-        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool, auto));
+    fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
+        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool, true));
         match self.surface {
             Surface::Capture { .. } => {
                 let sel = self.editor.selection().unwrap_or_default();
@@ -648,31 +724,32 @@ impl Render for EditorView {
             }
         }
 
-        if let (Some(status), Some(sel)) = (&self.status, self.editor.selection()) {
-            // Centered on the visible part of the selection.
-            let full = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-            let b = self.viewport.to_window(sel).intersect(&full);
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(b.origin.x)
-                    .top(b.origin.y)
-                    .w(b.size.width)
-                    .h(b.size.height)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px(px(12.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(rgba(0x0000_00CC))
-                            .text_color(white())
-                            .text_size(px(14.0))
-                            .child(status.clone()),
-                    ),
-            );
+        if let Some(toast) = &self.toast {
+            // At the top of the visible selection (the document window: under its toolbar).
+            let win = window.viewport_size();
+            let full = Bounds::new(point(px(0.), px(0.)), win);
+            let (center_x, top) = match (&self.surface, self.editor.selection()) {
+                (Surface::Capture { .. }, Some(sel)) => {
+                    let b = self.viewport.to_window(sel).intersect(&full);
+                    (f32::from(b.center().x), f32::from(b.origin.y) + 12.0)
+                }
+                _ => (f32::from(win.width) / 2.0, self.top_bar + 8.0),
+            };
+            let entity = cx.entity();
+            let close = cx.entity();
+            root = root.child(toast::render(
+                toast,
+                center_x,
+                top,
+                f32::from(win.width),
+                move |action, _, cx| entity.update(cx, |this, cx| this.toast_action(action, cx)),
+                move |_, cx| {
+                    close.update(cx, |this, cx| {
+                        this.toast = None;
+                        cx.notify();
+                    })
+                },
+            ));
         }
 
         if self.editor.toolbar_visible() {
@@ -680,8 +757,8 @@ impl Render for EditorView {
                 Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
                 Surface::Document => toolbar::DOCUMENT_TOOLBAR,
             };
-            let (at, style_at) = self.panel_positions(window, cx);
-            let auto = self.auto_state(cx);
+            let (at, style_at) = self.panel_positions(window);
+            let auto = self.auto_state();
             root = root.child(toolbar::toolbar(self, groups, at.x, at.y, cx));
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
                 root = root.child(match self.editor.current_redaction() {

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use bluesnap_ai::{AiSettings, Endpoint};
+use bluesnap_platform::Platform;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyBinding, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
@@ -44,10 +45,20 @@ pub fn load() -> AiSettings {
     })
 }
 
-/// Opens the window, or brings the open one forward.
-pub fn open(cx: &mut App) {
+/// Opens the window, or brings the open one forward. `above_overlay` when
+/// asked from the capture overlay, which otherwise covers it.
+pub fn open(above_overlay: bool, cx: &mut App) {
+    let raise = move |window: &mut Window| {
+        if above_overlay && let Err(e) = bluesnap_platform::native().raise_above_overlay(window) {
+            log::warn!("could not raise the AI settings window: {e:#}");
+        }
+    };
     if let Some(handle) = cx.global::<AppState>().ai_window
-        && handle.update(cx, |_, window, _| window.activate_window()).is_ok()
+        && handle.update(cx, |_, window, _| {
+            window.activate_window();
+            raise(window);
+        })
+        .is_ok()
     {
         cx.activate(true);
         return;
@@ -66,6 +77,7 @@ pub fn open(cx: &mut App) {
     match opened {
         Ok(handle) => {
             cx.global_mut::<AppState>().ai_window = Some(handle.into());
+            handle.update(cx, |_, window, _| raise(window)).ok();
             cx.activate(true);
         }
         Err(e) => log::error!("could not open the AI settings: {e:#}"),
@@ -149,6 +161,8 @@ impl SettingsView {
             Ok(()) => {
                 log::info!("AI settings saved (LLM: {}, decisions: {})", settings.llm().is_some(), settings.decisions().is_some());
                 cx.global_mut::<AppState>().ai = Arc::new(settings);
+                // Open editors show what's now available.
+                cx.refresh_windows();
                 window.remove_window();
             }
             Err(e) => {

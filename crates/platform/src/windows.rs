@@ -64,6 +64,20 @@ impl Platform for Native {
         Ok(())
     }
 
+    fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
+        let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw() else {
+            bail!("not a Win32 window");
+        };
+        let hwnd = handle.hwnd.get() as HWND;
+        // Topmost too, and set later, so it sits above the overlay.
+        let ok = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) };
+        if ok == FALSE {
+            bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+        }
+        unsafe { SetForegroundWindow(hwnd) };
+        Ok(())
+    }
+
     fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image> {
         let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);

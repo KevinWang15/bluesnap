@@ -96,6 +96,13 @@ pub trait Platform {
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
+    /// Puts a normal window (like settings opened from the capture overlay)
+    /// above the overlay, and focuses it.
+    fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
+        let _ = window;
+        Ok(())
+    }
+
     /// Captures `rect` (in `display`'s image pixels) from the live screen, for
     /// scrolling screenshots. Called repeatedly, so it avoids anything that
     /// flickers the cursor.

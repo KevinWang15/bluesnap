@@ -31,11 +31,16 @@ pub struct ApiError {
     pub message: String,
 }
 
+/// Says what's likely wrong first, then the server's own message.
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let m = &self.message;
         match self.status {
-            0 => write!(f, "{}", self.message),
-            s => write!(f, "HTTP {s}: {}", self.message),
+            0 => write!(f, "Couldn't reach the server: {m}"),
+            401 | 403 => write!(f, "The token was rejected (HTTP {}): {m}", self.status),
+            404 => write!(f, "Not found; check the URL and model (HTTP 404): {m}"),
+            429 | 502 | 503 => write!(f, "The server is busy; try again shortly (HTTP {}): {m}", self.status),
+            s => write!(f, "HTTP {s}: {m}"),
         }
     }
 }
@@ -56,7 +61,7 @@ fn post(endpoint: &Endpoint, path: &str, body: &Value) -> Result<Value, ApiError
         request = request.header("Authorization", format!("Bearer {}", endpoint.token.trim()));
     }
     let mut response =
-        request.send(body.to_string()).map_err(|e| ApiError { status: 0, message: format!("{url}: {e}") })?;
+        request.send(body.to_string()).map_err(|e| ApiError { status: 0, message: format!("{e} ({url})") })?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
