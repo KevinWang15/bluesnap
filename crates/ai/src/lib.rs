@@ -1,9 +1,13 @@
-//! Optional AI features, off unless the user configures an endpoint: finding
-//! sensitive text in a screenshot so the editor can redact it automatically.
+//! Optional AI services, off unless the user configures them:
 //!
-//! Only recognized text is sent, never the image.
+//! - [`settings`]: the endpoints (an LLM and a decision model), saved by the
+//!   app's AI Settings window;
+//! - [`client`]: calls to them, for any feature;
+//! - features built on them: [`redact`] finds sensitive text to cover.
+//!
+//! Features send recognized text, never the screenshot itself.
 
-mod client;
+pub mod client;
 pub mod redact;
 pub mod settings;
 

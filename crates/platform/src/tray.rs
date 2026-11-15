@@ -32,7 +32,7 @@ fn decode_png(data: &[u8]) -> anyhow::Result<Icon> {
 pub(crate) fn create(style: Style, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
     let capture = MenuItem::with_id("capture", format!("Take Screenshot ({hotkey})"), true, None);
     let settings = MenuItem::with_id("settings", "Edit Settings…", true, None);
-    let ai = MenuItem::with_id("ai", "AI Redaction…", true, None);
+    let ai = MenuItem::with_id("ai", "AI Settings…", true, None);
     let quit = MenuItem::with_id("quit", "Quit bluesnap", true, None);
     let menu = Menu::new();
     menu.append_items(&[

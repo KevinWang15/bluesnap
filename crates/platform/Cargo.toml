@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bluesnap-core.workspace = true
 anyhow.workspace = true
 log.workspace = true
 raw-window-handle.workspace = true

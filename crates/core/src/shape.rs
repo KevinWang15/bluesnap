@@ -1,8 +1,8 @@
 //! Annotation shapes: geometry, hit testing and editing handles.
 
 use crate::geom::{Handle, Point, Rect, distance_to_segment};
-use crate::style::{CounterFormat, RedactEffect, Style, Tool};
-use crate::text::FontSet;
+use crate::style::{CounterFormat, RedactEffect, Style, TextBackdrop, TextStyle, Tool};
+use crate::text::{FontSet, Fonts, TextLayout};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Geometry {
@@ -19,7 +19,7 @@ pub enum Geometry {
     /// value (see [`RedactEffect::amount`]).
     Redact { area: RedactShape, effect: RedactEffect, strength: f32 },
     /// `origin` is the top-left corner of the first line.
-    Text { origin: Point, content: String },
+    Text { origin: Point, content: String, style: TextStyle },
 }
 
 /// The area a redaction covers.
@@ -41,7 +41,7 @@ pub struct Shape {
 pub struct Metrics<'a> {
     /// Screenshot pixels per logical pixel.
     pub scale: f32,
-    pub fonts: &'a FontSet,
+    pub fonts: &'a Fonts,
 }
 
 /// A draggable point that reshapes an annotation.
@@ -89,7 +89,9 @@ impl Shape {
                 effect: *effect,
                 strength: *strength,
             },
-            Geometry::Text { origin, content } => Geometry::Text { origin: *origin + d, content: content.clone() },
+            Geometry::Text { origin, content, style } => {
+                Geometry::Text { origin: *origin + d, content: content.clone(), style: *style }
+            }
         };
         Shape { geometry, style: self.style }
     }
@@ -103,11 +105,13 @@ impl Shape {
             Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 points_bounds(pts).inflate(w / 2.0 + 1.0)
             }
-            Geometry::Counter { center, number, format } => counter_box(*center, &format.label(*number), w, m.fonts).inflate(1.0),
+            Geometry::Counter { center, number, format } => {
+                counter_box(*center, &format.label(*number), w, m.fonts.sans()).inflate(1.0)
+            }
             Geometry::Redact { area: RedactShape::Rect(r), .. } => *r,
-            Geometry::Text { origin, content } => {
-                let layout = m.fonts.layout(content, w);
-                Rect::new(origin.x, origin.y, layout.width.max(w / 2.0), layout.height())
+            Geometry::Text { origin, content, style } => {
+                let layout = m.fonts.get(style.family()).layout(content, w);
+                text_box(*origin, &layout, w, *style).inflate(1.0)
             }
         }
     }
@@ -183,6 +187,25 @@ impl Shape {
     }
 }
 
+/// The area a text annotation covers: its glyphs' box at `origin` (at least
+/// a little wide while empty, so there's something to click) plus room for
+/// the style's outline or backdrop. `size` is the font size.
+pub fn text_box(origin: Point, layout: &TextLayout, size: f32, style: TextStyle) -> Rect {
+    let glyphs = Rect::new(origin.x, origin.y, layout.width.max(size / 2.0), layout.height());
+    let (px, py) = text_padding(style, size);
+    Rect::new(glyphs.x - px, glyphs.y - py, glyphs.w + 2.0 * px, glyphs.h + 2.0 * py)
+}
+
+/// Horizontal and vertical room a style needs around the glyphs' box.
+pub fn text_padding(style: TextStyle, size: f32) -> (f32, f32) {
+    match style.backdrop() {
+        TextBackdrop::None => (0.0, 0.0),
+        TextBackdrop::Outline => (size * 0.09, size * 0.09),
+        TextBackdrop::Box | TextBackdrop::Card => (size * 0.32, size * 0.1),
+        TextBackdrop::Pill => (size * 0.5, size * 0.1),
+    }
+}
+
 /// A counter's marker: a circle of `diameter` around `center`, widened into a
 /// pill when the label (like "XVIII") doesn't fit.
 pub fn counter_box(center: Point, label: &str, diameter: f32, fonts: &FontSet) -> Rect {
@@ -208,13 +231,13 @@ fn points_bounds(pts: &[Point]) -> Rect {
 mod tests {
     use super::*;
 
-    fn metrics(fonts: &FontSet) -> Metrics<'_> {
+    fn metrics(fonts: &Fonts) -> Metrics<'_> {
         Metrics { scale: 1.0, fonts }
     }
 
     #[test]
     fn rect_is_hit_on_outline_only() {
-        let fonts = FontSet::empty();
+        let fonts = Fonts::empty();
         let s = Shape { geometry: Geometry::Rect(Rect::new(0.0, 0.0, 200.0, 100.0)), style: Style::default() };
         assert!(s.hit(Point::new(1.0, 50.0), metrics(&fonts)));
         assert!(!s.hit(Point::new(100.0, 50.0), metrics(&fonts)));
@@ -222,7 +245,7 @@ mod tests {
 
     #[test]
     fn ellipse_is_hit_near_perimeter() {
-        let fonts = FontSet::empty();
+        let fonts = Fonts::empty();
         let s = Shape { geometry: Geometry::Ellipse(Rect::new(0.0, 0.0, 200.0, 100.0)), style: Style::default() };
         assert!(s.hit(Point::new(100.0, 1.0), metrics(&fonts)));
         assert!(!s.hit(Point::new(100.0, 50.0), metrics(&fonts)));
@@ -240,7 +263,7 @@ mod tests {
 
     #[test]
     fn counters_are_hit_inside_and_move() {
-        let fonts = FontSet::empty();
+        let fonts = Fonts::empty();
         let s = Shape {
             geometry: Geometry::Counter { center: Point::new(50.0, 50.0), number: 3, format: CounterFormat::Decimal },
             style: Style::default(),
@@ -256,7 +279,7 @@ mod tests {
 
     #[test]
     fn redaction_areas_are_hit_inside_and_resize_like_rectangles() {
-        let fonts = FontSet::empty();
+        let fonts = Fonts::empty();
         let s = Shape {
             geometry: Geometry::Redact {
                 area: RedactShape::Rect(Rect::new(0.0, 0.0, 200.0, 100.0)),

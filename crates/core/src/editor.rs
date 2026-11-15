@@ -10,8 +10,8 @@ use tiny_skia::Pixmap;
 use crate::geom::{CursorKind, Handle, Point, Rect};
 use crate::render::{self, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
-use crate::style::{Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, Tool};
-use crate::text::FontSet;
+use crate::style::{Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, TextStyle, Tool};
+use crate::text::{Fonts, TextLayout};
 
 /// Movement (in logical pixels) before a press turns into a drag.
 const DRAG_THRESHOLD: f32 = 3.0;
@@ -41,6 +41,16 @@ pub enum SelectionMode {
     Fixed,
 }
 
+/// A brush's outline under the pointer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrushRing {
+    pub center: Point,
+    /// Half the brush width.
+    pub radius: f32,
+    /// A rounded square (the highlighter's tip) rather than a circle.
+    pub square: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightClick {
     /// Nothing selected yet: the frontend should end the capture.
@@ -68,7 +78,7 @@ struct TextEdit {
 
 pub struct Editor {
     doc: Document,
-    fonts: Arc<FontSet>,
+    fonts: Arc<Fonts>,
     /// Content scale: screenshot pixels per logical pixel, for stroke widths and
     /// font sizes.
     scale: f32,
@@ -93,6 +103,8 @@ pub struct Editor {
     redaction: Redaction,
     /// Numbering for counters while there are none (existing ones set it otherwise).
     counter_format: CounterFormat,
+    /// The text tool's style for new text.
+    text_style: TextStyle,
     /// Inside `begin_continuous_edit` .. `end_continuous_edit`; `true` once an
     /// undo snapshot was taken for it.
     continuous: Option<bool>,
@@ -106,7 +118,7 @@ pub struct Editor {
 
 impl Editor {
     /// `scale` is screenshot pixels per logical pixel (the display's scale factor).
-    pub fn new(doc: Document, fonts: Arc<FontSet>, windows: Vec<Rect>, scale: f32) -> Self {
+    pub fn new(doc: Document, fonts: Arc<Fonts>, windows: Vec<Rect>, scale: f32) -> Self {
         let bounds = doc.bounds();
         let windows = windows.iter().filter_map(|w| w.intersect(&bounds)).collect();
         let mut editor = Self {
@@ -127,6 +139,7 @@ impl Editor {
             styles: Tool::ALL.map(Tool::default_style),
             redaction: Redaction::default(),
             counter_format: CounterFormat::default(),
+            text_style: TextStyle::default(),
             continuous: None,
             text: None,
             revision: 0,
@@ -139,7 +152,7 @@ impl Editor {
 
     /// An editor for a whole image (e.g. a stitched scrolling screenshot): the
     /// selection is the image and can't be changed, only annotated.
-    pub fn for_document(doc: Document, fonts: Arc<FontSet>, scale: f32) -> Self {
+    pub fn for_document(doc: Document, fonts: Arc<Fonts>, scale: f32) -> Self {
         let mut editor = Self::new(doc, fonts, Vec::new(), scale);
         editor.mode = SelectionMode::Fixed;
         editor.selection = Some(editor.screen());
@@ -317,6 +330,38 @@ impl Editor {
             .unwrap_or(self.counter_format)
     }
 
+    /// The text style the style bar should show: the selected text's, else
+    /// the text tool's when it is active.
+    pub fn current_text_style(&self) -> Option<TextStyle> {
+        match self.selected.and_then(|i| self.shapes.get(i)) {
+            Some(shape) => match &shape.geometry {
+                Geometry::Text { style, .. } => Some(*style),
+                _ => None,
+            },
+            None => (self.tool == Some(Tool::Text)).then_some(self.text_style),
+        }
+    }
+
+    /// Applies to the selected text if there is one (one undo step, or part
+    /// of the edit while typing), and to new text.
+    pub fn set_text_style(&mut self, new: TextStyle) {
+        self.text_style = new;
+        let Some(idx) = self.selected else { return self.touch() };
+        if !matches!(self.shapes[idx].geometry, Geometry::Text { .. }) {
+            return self.touch();
+        }
+        if self.text.is_none() {
+            self.begin_change();
+        }
+        if let Geometry::Text { style, .. } = &mut self.shapes[idx].geometry {
+            *style = new;
+        }
+        if self.text.is_none() {
+            self.end_change();
+        }
+        self.touch_shapes();
+    }
+
     /// Renumbers every counter with `format`, and new ones (one undo step).
     pub fn set_counter_format(&mut self, format: CounterFormat) {
         self.counter_format = format;
@@ -379,9 +424,9 @@ impl Editor {
         }
     }
 
-    /// Where to show a wide brush's outline (center and radius), when the next
-    /// press would paint with it: the redact brush and the highlighter.
-    pub fn brush_ring(&self) -> Option<(Point, f32)> {
+    /// Where to show a wide brush's outline, when the next press would paint
+    /// with it: the redact brush (round) and the highlighter (a chisel tip).
+    pub fn brush_ring(&self) -> Option<BrushRing> {
         let painting = matches!(self.drag, None | Some(Drag::Create { .. }));
         let tool = self.tool?;
         let brush = match tool {
@@ -390,8 +435,11 @@ impl Editor {
             _ => false,
         };
         let inside = self.selection.is_some_and(|s| s.contains(self.pointer));
-        (painting && brush && inside && self.text.is_none())
-            .then(|| (self.pointer, self.styles[tool.index()].size.logical_px(tool) * self.scale / 2.0))
+        (painting && brush && inside && self.text.is_none()).then(|| BrushRing {
+            center: self.pointer,
+            radius: self.styles[tool.index()].size.logical_px(tool) * self.scale / 2.0,
+            square: tool == Tool::Highlighter,
+        })
     }
 
     pub fn can_undo(&self) -> bool {
@@ -554,8 +602,8 @@ impl Editor {
             Tool::Text => {
                 // Center the first line vertically on the click.
                 let size = style.size.logical_px(Tool::Text) * self.scale;
-                let half_line = self.fonts.layout("", size).line_height / 2.0;
-                Geometry::Text { origin: Point::new(p.x, p.y - half_line), content: String::new() }
+                let half_line = self.fonts.get(self.text_style.family()).layout("", size).line_height / 2.0;
+                Geometry::Text { origin: Point::new(p.x, p.y - half_line), content: String::new(), style: self.text_style }
             }
         };
         self.begin_change();
@@ -787,8 +835,8 @@ impl Editor {
     fn set_caret_from_point(&mut self, p: Point) {
         let Some(edit) = &self.text else { return };
         let shape = &self.shapes[edit.idx];
-        let Geometry::Text { origin, content } = &shape.geometry else { return };
-        let caret = self.fonts.layout(content, shape.size_px(self.scale)).index_at(p - *origin);
+        let Some((origin, layout)) = self.text_layout(shape) else { return };
+        let caret = layout.index_at(p - origin);
         if let Some(edit) = &mut self.text {
             edit.caret = caret;
             edit.marked = None;
@@ -877,13 +925,25 @@ impl Editor {
         }
     }
 
+    /// A text shape's origin and layout, in its style's font family.
+    fn text_layout(&self, shape: &Shape) -> Option<(Point, TextLayout)> {
+        let Geometry::Text { origin, content, style } = &shape.geometry else { return None };
+        Some((*origin, self.fonts.get(style.family()).layout(content, shape.size_px(self.scale))))
+    }
+
+    /// The color of the edited text's glyphs (for its caret).
+    pub fn text_ink(&self) -> Option<Color> {
+        let shape = &self.shapes[self.text.as_ref()?.idx];
+        let Geometry::Text { style, .. } = &shape.geometry else { return None };
+        Some(style.ink(shape.style.color))
+    }
+
     /// Screen-space caret rectangle at byte offset `index` of the edited text.
     pub fn text_caret_rect_at(&self, index: usize) -> Option<Rect> {
         let edit = self.text.as_ref()?;
         let shape = &self.shapes[edit.idx];
-        let Geometry::Text { origin, content } = &shape.geometry else { return None };
-        let caret = self.fonts.layout(content, shape.size_px(self.scale)).caret_rect(index);
-        Some(caret.translate(*origin))
+        let (origin, layout) = self.text_layout(shape)?;
+        Some(layout.caret_rect(index).translate(origin))
     }
 
     pub fn text_caret_rect(&self) -> Option<Rect> {
@@ -894,8 +954,8 @@ impl Editor {
     pub fn text_index_at(&self, p: Point) -> Option<usize> {
         let edit = self.text.as_ref()?;
         let shape = &self.shapes[edit.idx];
-        let Geometry::Text { origin, content } = &shape.geometry else { return None };
-        Some(self.fonts.layout(content, shape.size_px(self.scale)).index_at(p - *origin))
+        let (origin, layout) = self.text_layout(shape)?;
+        Some(layout.index_at(p - origin))
     }
 
     /// Box drawn around the text being edited.
@@ -971,7 +1031,7 @@ mod tests {
     fn editor() -> Editor {
         let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4]).unwrap();
         let windows = vec![Rect::new(50.0, 50.0, 100.0, 100.0), Rect::new(0.0, 0.0, 300.0, 200.0)];
-        Editor::new(doc, Arc::new(FontSet::empty()), windows, 1.0)
+        Editor::new(doc, Arc::new(Fonts::empty()), windows, 1.0)
     }
 
     fn click(e: &mut Editor, x: f32, y: f32) {
@@ -1132,7 +1192,7 @@ mod tests {
 
     fn document_editor() -> Editor {
         let doc = Document::from_rgba(400, 3000, vec![255; 400 * 3000 * 4]).unwrap();
-        Editor::for_document(doc, Arc::new(FontSet::empty()), 1.0)
+        Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0)
     }
 
     #[test]
@@ -1297,7 +1357,7 @@ mod tests {
         assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 116.0)]));
         // The ring shows the highlighter's width.
         e.pointer_move(Point::new(300.0, 200.0), false);
-        assert_eq!(e.brush_ring(), Some((Point::new(300.0, 200.0), 9.0)));
+        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(300.0, 200.0), radius: 9.0, square: true }));
     }
 
     #[test]
@@ -1315,13 +1375,37 @@ mod tests {
     }
 
     #[test]
+    fn text_style_applies_to_new_and_selected_text() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Text);
+        assert_eq!(e.current_text_style(), Some(TextStyle::Standard));
+        e.set_text_style(TextStyle::Boxed);
+        click(&mut e, 100.0, 100.0);
+        e.text_replace(None, "hi", false, None);
+        e.finish_text();
+        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
+        // Select it (a press and release on it), restyle: one undo step.
+        click(&mut e, 101.0, 105.0);
+        e.finish_text();
+        e.selected = Some(0);
+        e.set_text_style(TextStyle::Outlined);
+        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Outlined, .. }));
+        assert!(e.undo());
+        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
+        // Other tools don't show text styles.
+        e.toggle_tool(Tool::Rect);
+        assert_eq!(e.current_text_style(), None);
+    }
+
+    #[test]
     fn brush_ring_shows_only_for_the_redact_brush() {
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.pointer_move(Point::new(100.0, 100.0), false);
         assert_eq!(e.brush_ring(), None);
         e.toggle_tool(Tool::Redact);
-        assert_eq!(e.brush_ring(), Some((Point::new(100.0, 100.0), 12.0)));
+        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(100.0, 100.0), radius: 12.0, square: false }));
         e.set_redaction(|r| r.area = RedactArea::Rect);
         assert_eq!(e.brush_ring(), None);
     }

@@ -90,6 +90,19 @@ impl TextField {
     }
 
     // ----- offsets: content bytes, displayed bytes, UTF-16 ------------------
+    //
+    // Offsets also arrive from the OS (IME queries) and from the last layout,
+    // which can be a frame behind the content (just after a paste). Every one
+    // is clamped to the content and to a character boundary before use, so
+    // none can slice a string out of bounds or inside a character.
+
+    fn clamp(&self, offset: usize) -> usize {
+        clamp_offset(&self.content, offset)
+    }
+
+    fn clamp_range(&self, r: &Range<usize>) -> Range<usize> {
+        clamp_range(&self.content, r)
+    }
 
     /// The text as drawn: bullets in place of a hidden secret's characters.
     fn display_text(&self) -> String {
@@ -97,12 +110,13 @@ impl TextField {
     }
 
     fn display_offset(&self, offset: usize) -> usize {
+        let offset = self.clamp(offset);
         if self.masked() { self.content[..offset].chars().count() * BULLET.len_utf8() } else { offset }
     }
 
     fn content_offset(&self, offset: usize) -> usize {
         if !self.masked() {
-            return offset;
+            return self.clamp(offset);
         }
         let chars = offset / BULLET.len_utf8();
         self.content.char_indices().nth(chars).map_or(self.content.len(), |(i, _)| i)
@@ -120,11 +134,11 @@ impl TextField {
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        self.content[..offset.min(self.content.len())].chars().map(char::len_utf16).sum()
+        self.content[..self.clamp(offset)].chars().map(char::len_utf16).sum()
     }
 
     fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(r.start)..self.offset_from_utf16(r.end)
+        self.clamp_range(&(self.offset_from_utf16(r.start)..self.offset_from_utf16(r.end)))
     }
 
     fn range_to_utf16(&self, r: &Range<usize>) -> Range<usize> {
@@ -132,10 +146,12 @@ impl TextField {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
+        let offset = self.clamp(offset);
         self.content[..offset].char_indices().next_back().map_or(0, |(i, _)| i)
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
+        let offset = self.clamp(offset);
         self.content[offset..].chars().next().map_or(offset, |c| offset + c.len_utf8())
     }
 
@@ -144,12 +160,15 @@ impl TextField {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
         self.selected = offset..offset;
         self.reversed = false;
         cx.notify();
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self.clamp(offset);
+        self.selected = self.clamp_range(&self.selected);
         if self.reversed {
             self.selected.start = offset;
         } else {
@@ -222,14 +241,17 @@ impl TextField {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            // Pasted tokens often come with a trailing newline.
-            self.replace_text_in_range(None, text.trim().replace(['\n', '\r'], " ").as_str(), window, cx);
+            // One line: pasted tokens often come with a trailing newline, and
+            // control characters have no place in a field.
+            let line: String = text.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+            self.replace_text_in_range(None, &line, window, cx);
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected.is_empty() && !self.masked() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected.clone()].to_string()));
+            let selected = self.clamp_range(&self.selected);
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[selected].to_string()));
         }
     }
 
@@ -295,6 +317,7 @@ impl EntityInputHandler for TextField {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked.clone())
             .unwrap_or(self.selected.clone());
+        let range = self.clamp_range(&range);
         self.content.replace_range(range.clone(), text);
         let end = range.start + text.len();
         self.selected = end..end;
@@ -316,6 +339,7 @@ impl EntityInputHandler for TextField {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked.clone())
             .unwrap_or(self.selected.clone());
+        let range = self.clamp_range(&range);
         self.content.replace_range(range.clone(), text);
         self.marked = (!text.is_empty()).then(|| range.start..range.start + text.len());
         self.selected = new_selected
@@ -347,6 +371,21 @@ impl EntityInputHandler for TextField {
         let index = line.index_for_x(p.x - bounds.left() + self.scroll)?;
         Some(self.offset_to_utf16(self.content_offset(index)))
     }
+}
+
+/// `offset` within `text`, moved back to a character boundary.
+fn clamp_offset(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// `r` with both ends clamped (see [`clamp_offset`]) and in order.
+fn clamp_range(text: &str, r: &Range<usize>) -> Range<usize> {
+    let (a, b) = (clamp_offset(text, r.start), clamp_offset(text, r.end));
+    a.min(b)..a.max(b)
 }
 
 /// The text itself: shapes and paints the line, caret and selection.
@@ -543,5 +582,25 @@ impl Render for TextField {
 impl Focusable for TextField {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offsets_from_stale_layouts_stay_inside_characters() {
+        let text = "a密b";
+        // Past the end, and inside the 3-byte 密.
+        assert_eq!(clamp_offset(text, 99), 5);
+        assert_eq!(clamp_offset(text, 2), 1);
+        assert_eq!(clamp_offset(text, 3), 1);
+        assert_eq!(clamp_offset(text, 4), 4);
+        // Reversed and out-of-range ranges come back usable.
+        let (from, to) = (9, 2);
+        assert_eq!(clamp_range(text, &(from..to)), 1..5);
+        let r = clamp_range(text, &(3..99));
+        assert_eq!(&text[r], "密b");
     }
 }

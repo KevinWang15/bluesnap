@@ -11,9 +11,17 @@ Press the hotkey, then:
   text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
-- the **highlighter** draws translucent strokes (yellow by default) that don't get
+- the **highlighter** draws translucent strokes (yellow by default) with a chisel
+  tip, like a real highlighter: square ends with rounded corners. Strokes don't get
   darker where they cross; hold Shift for a straight line, handy for a line of
-  text. A ring under the pointer shows its width.
+  text. An outline of the tip under the pointer shows its width.
+- **text** comes in the seven styles CleanShot X offers, picked in the text style
+  bar (each shown as a preview in the current color): Standard, Rounded,
+  Monospaced, Outlined (a contrasting outline, readable on any background), Boxed
+  (on a box of the text color), Rounded Boxed (on a pill) and Monospaced Boxed (on
+  a bordered card, like a code chip). Text is bold-ish, in SF Pro / SF Pro Rounded /
+  SF Mono on macOS and Segoe UI Semibold / Nunito / Consolas on Windows. Changing
+  the style of selected text is one undo step.
 - the **counter** places numbered markers with a click (drag to position before
   releasing): 1, 2, 3 … or A, B, C …, I, II, III … or a, b, c …, chosen in its
   style bar for the whole sequence. Deleting one renumbers the rest; drag a
@@ -26,11 +34,11 @@ Press the hotkey, then:
   strength; area redactions can be resized with their handles. Effects always
   read the original screenshot, and mosaic blocks line up across strokes.
 - the Redact bar's **Auto** button finds passwords, keys, tokens, contact details,
-  IDs and card numbers in the selection with AI (see [AI redaction](#ai-redaction))
+  IDs and card numbers in the selection with AI (see [AI features](#ai-features))
   and covers each with an area redaction in the current effect, in about a second.
   One undo removes them all. A toast shows each step (reading the text, checking
   it with AI, the result) and any error; without a model set up, it offers to
-  open the settings.
+  open AI Settings.
 - the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
   copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.
@@ -55,23 +63,29 @@ Press the hotkey, then:
   picking, or exits when nothing is selected.
 
 bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
-Take Screenshot, Edit Settings…, AI Redaction… and Quit; on Windows, left-clicking the tray icon
+Take Screenshot, Edit Settings…, AI Settings… and Quit; on Windows, left-clicking the tray icon
 also takes a screenshot.
 
 Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. It is set in
 `config.toml`, created on first run in the OS config directory
 (`%APPDATA%\bluesnap\` on Windows, `~/Library/Application Support/bluesnap/` on macOS).
+If bluesnap ever crashes, the details are appended to `crash.log` in the same
+folder.
 
-## AI redaction
+## AI features
 
-Optional, and off until set up in **AI Redaction…** in the tray / menu bar menu.
-Two endpoints can be configured, each with a URL, token and model; either or both:
+Optional, and off until set up in **AI Settings…** in the tray / menu bar menu.
+Two services can be configured, each with a URL (like `https://api.example.com`),
+token and model; either or both:
 
 - an **LLM** behind an OpenAI-compatible Responses API (`/v1/responses`);
 - a **decision model** behind a Decisions API (`/v1/decisions`).
 
 Each section has a Test button. The settings are saved to `ai.json` beside
-`config.toml`, readable only by the user (it holds the tokens).
+`config.toml`, readable only by the user (it holds the tokens). Features send
+recognized text, never the screenshot.
+
+### Auto redaction
 
 Text is recognized on the computer with the same OCR as To text; only the
 recognized text is sent to the endpoints, never the image. The lines are sent in
@@ -121,8 +135,10 @@ crates/
               toolbar.rs      one table of toolbar actions; toolbars are lists of them
               viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU images
               output.rs       copy / save / cancel
-              ai_settings.rs  the AI Redaction window; text_field.rs  its text inputs
+              ai_settings.rs  the AI Settings window; text_field.rs  its text inputs
 packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
+crates/platform/assets/fonts  Nunito (SIL Open Font License, Nunito-OFL.txt), the
+                    rounded text face on Windows and Linux
 third_party/xattr   patched copy of a gpui dependency (see below)
 ```
 

@@ -21,7 +21,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
+use crate::{Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
@@ -183,18 +183,26 @@ impl Platform for Native {
         recognize_with_vision(width, height, rgba)
     }
 
-    fn font_paths(&self) -> Vec<PathBuf> {
-        [
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/Library/Fonts/Arial Unicode.ttf",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect()
+    fn fonts(&self, family: FontFamily) -> Vec<FontSource> {
+        let file = |path: &str| FontSource::file(path);
+        // SF Pro, SF Pro Rounded and SF Mono are variable fonts: semibold.
+        let primary = match family {
+            FontFamily::Sans => vec![file("/System/Library/Fonts/SFNS.ttf").weight(600.0)],
+            FontFamily::Rounded => vec![file("/System/Library/Fonts/SFNSRounded.ttf").weight(600.0)],
+            FontFamily::Mono => vec![
+                file("/System/Library/Fonts/SFNSMono.ttf").weight(600.0),
+                file("/System/Library/Fonts/Menlo.ttc").face(1), // Menlo Bold
+            ],
+        };
+        let fallbacks = [
+            file("/System/Library/Fonts/Helvetica.ttc").face(1), // Helvetica Bold
+            file("/System/Library/Fonts/PingFang.ttc"),
+            file("/System/Library/Fonts/Hiragino Sans GB.ttc"),
+            file("/System/Library/Fonts/STHeiti Medium.ttc"),
+            file("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            file("/Library/Fonts/Arial Unicode.ttf"),
+        ];
+        primary.into_iter().chain(fallbacks).collect()
     }
 }
 

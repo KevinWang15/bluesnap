@@ -16,9 +16,9 @@ pub mod stitch;
 pub mod style;
 pub mod text;
 
-pub use editor::{Editor, RightClick, SelectionMode, TextKey};
+pub use editor::{BrushRing, Editor, RightClick, SelectionMode, TextKey};
 pub use geom::{CursorKind, Point, Rect};
 pub use render::Document;
-pub use style::{Color, CounterFormat, PALETTE, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, Tool};
-pub use text::FontSet;
+pub use style::{Color, CounterFormat, PALETTE, TextStyle, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, Tool};
+pub use text::{FontFamily, FontSet, FontSource, Fonts};
 pub use tiny_skia::Pixmap;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::render::{swap_red_blue, to_bgra_straight};
-use bluesnap_core::{Document, Editor, FontSet, Point, RedactArea, RedactEffect, Rect, Tool};
+use bluesnap_core::{Fonts, Document, Editor, FontSet, Point, RedactArea, RedactEffect, Rect, Tool};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const W4K: u32 = 3840;
@@ -30,12 +30,12 @@ fn screenshot(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-fn fonts() -> Arc<FontSet> {
-    Arc::new(FontSet::load(&[
+fn fonts() -> Arc<Fonts> {
+    Arc::new(Fonts::sans_only(FontSet::load(&[
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         r"C:\Windows\Fonts\segoeui.ttf",
-    ]))
+    ])))
 }
 
 fn editor(w: u32, h: u32) -> Editor {
@@ -116,7 +116,7 @@ fn startup(c: &mut Criterion) {
             || rgba.clone(),
             |rgba| {
                 let doc = Document::from_rgba(W4K, H4K, rgba).unwrap();
-                black_box(Editor::new(doc, Arc::new(FontSet::empty()), Vec::new(), 2.0))
+                black_box(Editor::new(doc, Arc::new(Fonts::empty()), Vec::new(), 2.0))
             },
             BatchSize::LargeInput,
         )

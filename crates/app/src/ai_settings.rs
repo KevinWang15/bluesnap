@@ -1,5 +1,5 @@
-//! The "AI Redaction" settings window, opened from the tray menu: the two
-//! optional endpoints behind the Redact tool's Auto button.
+//! The "AI Settings" window, opened from the tray menu: the optional AI
+//! endpoints that features like the Redact tool's Auto button use.
 
 use std::sync::Arc;
 
@@ -65,7 +65,7 @@ pub fn open(above_overlay: bool, cx: &mut App) {
     }
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(600.), px(690.)), cx))),
-        titlebar: Some(TitlebarOptions { title: Some("bluesnap: AI Redaction".into()), ..Default::default() }),
+        titlebar: Some(TitlebarOptions { title: Some("bluesnap: AI Settings".into()), ..Default::default() }),
         focus: true,
         show: true,
         kind: WindowKind::Normal,
@@ -110,7 +110,7 @@ impl Section {
         Self {
             title,
             api,
-            url: cx.new(|cx| TextField::new(&e.url, "https://api.example.com/v1", false, cx)),
+            url: cx.new(|cx| TextField::new(&e.url, "https://api.example.com", false, cx)),
             token: cx.new(|cx| TextField::new(&e.token, "Token (sent as a Bearer header)", true, cx)),
             model: cx.new(|cx| TextField::new(&e.model, model_hint, false, cx)),
             check: Check::Idle,
@@ -163,17 +163,18 @@ impl SettingsView {
                 cx.global_mut::<AppState>().ai = Arc::new(settings);
                 // Open editors show what's now available.
                 cx.refresh_windows();
-                window.remove_window();
+                close_soon(window, cx);
             }
             Err(e) => {
-                self.error = Some(format!("Could not save: {e:#}").into());
+                log::error!("could not save the AI settings: {e:#}");
+                self.error = Some(format!("Could not save: {}", shorten(&format!("{e:#}"))).into());
                 cx.notify();
             }
         }
     }
 
-    fn close(&mut self, _: &Close, window: &mut Window, _: &mut Context<Self>) {
-        window.remove_window();
+    fn close(&mut self, _: &Close, window: &mut Window, cx: &mut Context<Self>) {
+        close_soon(window, cx);
     }
 
     fn test(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -193,7 +194,10 @@ impl SettingsView {
             this.update(cx, |this, cx| {
                 this.sections[i].check = match result {
                     Ok(()) => Check::Passed,
-                    Err(e) => Check::Failed(format!("{e:#}").into()),
+                    Err(e) => {
+                        log::warn!("AI endpoint test failed: {e:#}");
+                        Check::Failed(shorten(&format!("{e:#}")).into())
+                    }
                 };
                 this.sections[i].test = None;
                 cx.notify();
@@ -253,12 +257,36 @@ impl SettingsView {
                     .items_center()
                     .gap(px(10.))
                     .pl(px(64.))
+                    .min_w(px(0.))
                     .child(
                         small_button(("test", i), if running { "Testing…" } else { "Test" }, running)
                             .when(!running, |b| b.on_click(cx.listener(move |this, _, window, cx| this.test(i, window, cx)))),
                     )
-                    .child(div().flex_1().text_size(px(12.)).text_color(rgb(check_color)).child(check_text)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(rgb(check_color))
+                            .child(check_text),
+                    ),
             )
+    }
+}
+
+/// Closes the window once the current event is handled: removing it while the
+/// OS is still delivering a key or IME event to it is a crash risk.
+fn close_soon(window: &mut Window, cx: &mut Context<SettingsView>) {
+    cx.defer_in(window, |_, window, _| window.remove_window());
+}
+
+/// An error message short enough for the form (the full one is logged).
+fn shorten(message: &str) -> String {
+    const MAX: usize = 220;
+    match message.char_indices().nth(MAX) {
+        Some((i, _)) => format!("{}…", &message[..i]),
+        None => message.to_string(),
     }
 }
 
@@ -307,20 +335,19 @@ impl Render for SettingsView {
             .p(px(20.))
             .bg(rgb(0xF5F6F8))
             .text_color(rgb(0x1F1F1F))
-            .child(div().text_size(px(18.)).font_weight(gpui::FontWeight::BOLD).child("AI redaction"))
+            .child(div().text_size(px(18.)).font_weight(gpui::FontWeight::BOLD).child("AI Settings"))
             .child(
                 div().text_size(px(13.)).text_color(rgb(0x555555)).line_height(px(19.)).child(
-                    "With a model set up, the Redact tool gets an Auto button that finds passwords, keys, \
-                     contact details, IDs and card numbers in the selection and covers them. Text is \
-                     recognized on this computer; only the recognized text is sent to these services, \
-                     never the image.",
+                    "Optional AI services for bluesnap's AI features. Nothing is sent anywhere until a \
+                     service is set up here. Text is recognized on this computer; only text is sent, \
+                     never the screenshot. Used by: Auto in the Redact tool.",
                 ),
             )
             .child(self.section(0, cx))
             .child(self.section(1, cx))
             .child(div().text_size(px(12.)).text_color(rgb(0x777777)).child(
-                "Set up either or both; leave a section empty to turn it off. With both, the decision model \
-                 double-checks what the LLM leaves out.",
+                "Set up either or both; leave a section empty to turn it off. Features use whichever \
+                 is available, and both together when they can.",
             ))
             .child(div().flex_1())
             .child(
@@ -328,7 +355,15 @@ impl Render for SettingsView {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(div().flex_1().text_size(px(12.)).text_color(rgb(0xCF1322)).children(self.error.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .text_color(rgb(0xCF1322))
+                            .children(self.error.clone()),
+                    )
                     .child(small_button("cancel", "Cancel", false).on_click(cx.listener(|this, _, window, cx| this.close(&Close, window, cx))))
                     .child(
                         div()

@@ -3,12 +3,75 @@
 //! Text is rasterized by the same CPU renderer for the live preview and for the
 //! exported image, so what the user sees is exactly what gets copied or saved.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use ab_glyph::{Font, FontVec, GlyphId, OutlineCurve, ScaleFont};
+use ab_glyph::{Font, FontVec, GlyphId, OutlineCurve, ScaleFont, VariableFont};
 use tiny_skia::{Path as SkPath, PathBuilder};
 
 use crate::geom::{Point, Rect};
+
+/// The typeface families text is set in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    Sans,
+    Rounded,
+    Mono,
+}
+
+impl FontFamily {
+    pub const ALL: [FontFamily; 3] = [FontFamily::Sans, FontFamily::Rounded, FontFamily::Mono];
+}
+
+/// Where a font's bytes come from.
+#[derive(Clone, Debug)]
+pub enum FontData {
+    File(PathBuf),
+    /// Bundled in the binary.
+    Static(&'static [u8]),
+}
+
+/// A font to load: its data, the face within a collection, and for variable
+/// fonts the weight (CSS scale, 100–900) to use.
+#[derive(Clone, Debug)]
+pub struct FontSource {
+    pub data: FontData,
+    pub index: u32,
+    pub weight: Option<f32>,
+}
+
+impl FontSource {
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self { data: FontData::File(path.into()), index: 0, weight: None }
+    }
+
+    pub fn bundled(data: &'static [u8]) -> Self {
+        Self { data: FontData::Static(data), index: 0, weight: None }
+    }
+
+    /// The `index`th face of a collection (`.ttc`).
+    pub fn face(mut self, index: u32) -> Self {
+        self.index = index;
+        self
+    }
+
+    /// The weight to set on a variable font (ignored by static fonts).
+    pub fn weight(mut self, weight: f32) -> Self {
+        self.weight = Some(weight);
+        self
+    }
+
+    fn load(&self) -> Option<FontVec> {
+        let data = match &self.data {
+            FontData::File(path) => std::fs::read(path).ok()?,
+            FontData::Static(bytes) => bytes.to_vec(),
+        };
+        let mut font = FontVec::try_from_vec_and_index(data, self.index).ok()?;
+        if let Some(weight) = self.weight {
+            font.set_variation(b"wght", weight);
+        }
+        Some(font)
+    }
+}
 
 /// A primary font plus fallbacks, consulted per character in order.
 pub struct FontSet {
@@ -18,12 +81,13 @@ pub struct FontSet {
 impl FontSet {
     /// Loads every readable font in `paths`; unreadable or invalid files are skipped.
     pub fn load<P: AsRef<Path>>(paths: &[P]) -> Self {
-        let fonts = paths
-            .iter()
-            .filter_map(|p| std::fs::read(p.as_ref()).ok())
-            .filter_map(|data| FontVec::try_from_vec_and_index(data, 0).ok())
-            .collect();
-        Self { fonts }
+        let sources: Vec<FontSource> = paths.iter().map(|p| FontSource::file(p.as_ref())).collect();
+        Self::from_sources(&sources)
+    }
+
+    /// Loads every usable font in `sources`, in order; the rest are skipped.
+    pub fn from_sources(sources: &[FontSource]) -> Self {
+        Self { fonts: sources.iter().filter_map(FontSource::load).collect() }
     }
 
     pub fn empty() -> Self {
@@ -154,6 +218,39 @@ impl FontSet {
     }
 }
 
+/// A font set per family. Families without fonts fall back to sans-serif.
+pub struct Fonts {
+    sets: [FontSet; 3],
+}
+
+impl Fonts {
+    pub fn new(sans: FontSet, rounded: FontSet, mono: FontSet) -> Self {
+        Self { sets: [sans, rounded, mono] }
+    }
+
+    /// Only sans-serif fonts: every family uses them.
+    pub fn sans_only(sans: FontSet) -> Self {
+        Self::new(sans, FontSet::empty(), FontSet::empty())
+    }
+
+    pub fn empty() -> Self {
+        Self::sans_only(FontSet::empty())
+    }
+
+    pub fn get(&self, family: FontFamily) -> &FontSet {
+        let set = &self.sets[family as usize];
+        if set.is_empty() { &self.sets[0] } else { set }
+    }
+
+    pub fn sans(&self) -> &FontSet {
+        &self.sets[0]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets[0].is_empty()
+    }
+}
+
 struct PlacedGlyph {
     font: usize,
     id: GlyphId,
@@ -209,6 +306,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn variable_fonts_load_at_the_requested_weight() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../platform/assets/fonts/Nunito.ttf");
+        let ink = |weight: f32| {
+            let set = FontSet::from_sources(&[FontSource::file(path).weight(weight)]);
+            let glyphs = set.outline_path(&set.layout("H", 100.0), Point::new(0.0, 0.0)).unwrap();
+            let mut p = tiny_skia::Pixmap::new(120, 140).unwrap();
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(0, 0, 0, 255);
+            p.fill_path(&glyphs, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+            p.pixels().iter().filter(|c| c.alpha() > 128).count()
+        };
+        // Nunito's default instance is ExtraLight (200); bold has far more ink.
+        assert!(ink(800.0) > 2 * ink(200.0));
+    }
+
+    #[test]
     fn spans_take_their_share_of_the_line() {
         let fonts = FontSet::load(&["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]);
         if fonts.is_empty() {
@@ -224,3 +337,4 @@ mod tests {
         assert_eq!(FontSet::empty().span_rect(line, "key=secret", 4..10), line);
     }
 }
+

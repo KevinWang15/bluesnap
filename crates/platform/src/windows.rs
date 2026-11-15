@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
 };
 
-use crate::{Capture, DisplayInfo, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
+use crate::{Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
@@ -165,10 +165,18 @@ impl Platform for Native {
         crate::recognize_with_model(width, height, rgba)
     }
 
-    fn font_paths(&self) -> Vec<PathBuf> {
+    fn fonts(&self, family: FontFamily) -> Vec<FontSource> {
         let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-        let fonts = windir.join("Fonts");
-        ["segoeui.ttf", "msyh.ttc", "simsun.ttc", "arial.ttf"].iter().map(|f| fonts.join(f)).collect()
+        let dir = windir.join("Fonts");
+        let file = |name: &str| FontSource::file(dir.join(name));
+        // Segoe UI Semibold, Microsoft YaHei Bold, then regular faces.
+        let cjk = ["msyhbd.ttc", "msyh.ttc", "simsun.ttc", "arial.ttf"].map(file);
+        let primary = match family {
+            FontFamily::Sans => vec![file("seguisb.ttf"), file("segoeuib.ttf"), file("segoeui.ttf")],
+            FontFamily::Rounded => vec![crate::bundled_rounded()],
+            FontFamily::Mono => vec![file("consolab.ttf"), file("consola.ttf")],
+        };
+        primary.into_iter().chain(cjk).collect()
     }
 }
 

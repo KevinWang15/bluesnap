@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bluesnap_core::FontSet;
+use bluesnap_core::{FontFamily, FontSet, Fonts};
 use bluesnap_platform::{Native, Platform, Tray, TrayCommand};
 use futures::StreamExt;
 use global_hotkey::hotkey::HotKey;
@@ -39,7 +39,7 @@ pub struct AppState {
     pub ai: Arc<bluesnap_ai::AiSettings>,
     /// The open AI settings window, if any.
     pub ai_window: Option<AnyWindowHandle>,
-    pub(crate) fonts: Arc<FontSet>,
+    pub(crate) fonts: Arc<Fonts>,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
     /// The running scrolling capture, if any.
@@ -54,6 +54,7 @@ impl Global for AppState {}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    record_panics();
     let config = Config::load();
 
     Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
@@ -84,7 +85,8 @@ fn main() {
         };
 
         // Loading fonts reads a few MB from disk; do it once, up front.
-        let fonts = Arc::new(FontSet::load(&platform.font_paths()));
+        let [sans, rounded, mono] = FontFamily::ALL.map(|f| FontSet::from_sources(&platform.fonts(f)));
+        let fonts = Arc::new(Fonts::new(sans, rounded, mono));
         if fonts.is_empty() {
             log::warn!("no usable font found; text annotations will be invisible");
         }
@@ -102,6 +104,24 @@ fn main() {
             _tray: tray,
         });
     });
+}
+
+/// Appends panics (with a backtrace) to `crash.log` beside the config file, as
+/// well as the log: release builds on Windows have no console to show them.
+fn record_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let report = format!("{} {info}\n{backtrace}\n", chrono::Local::now().to_rfc3339());
+        log::error!("{report}");
+        if let Some(path) = Config::path().map(|p| p.with_file_name("crash.log")) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                file.write_all(report.as_bytes()).ok();
+            }
+        }
+        default(info);
+    }));
 }
 
 /// gpui quits on Windows when its last window closes. An invisible window keeps

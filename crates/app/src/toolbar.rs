@@ -2,7 +2,9 @@
 //! colors), the editor's toolbar and style bar, and building blocks other
 //! panels (the scrolling-capture bar) reuse.
 
-use bluesnap_core::{Color, CounterFormat, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
+use std::sync::Arc;
+
+use bluesnap_core::{Color, CounterFormat, PALETTE, TextStyle, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
 use gpui::{
     AnyElement, AnyView, App, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
@@ -26,6 +28,8 @@ const BORDER: f32 = 1.0;
 const SLIDER: f32 = 120.0;
 const SLIDER_INSET: f32 = 9.0;
 const THUMB: f32 = 14.0;
+/// Width of the text style bar's style picker button.
+const TEXT_STYLE: f32 = 132.0;
 /// Width of the redact bar's Auto button (AI redaction).
 const AUTO: f32 = 64.0;
 /// Redact style bar buttons before the slider: area and effect segments.
@@ -148,6 +152,7 @@ pub fn style_bar_size(tool: Tool, auto: bool) -> (f32, f32) {
         Tool::Redact if auto => (REDACT_SEGMENTS + 3, 4, SLIDER + AUTO),
         Tool::Redact => (REDACT_SEGMENTS + 3, 3, SLIDER),
         Tool::Counter => (3 + PALETTE.len() + CounterFormat::ALL.len(), 2, 0.0),
+        Tool::Text => (3 + PALETTE.len(), 2, TEXT_STYLE),
         _ if tool.uses_color() => (3 + PALETTE.len(), 1, 0.0),
         _ => (3, 0, 0.0),
     };
@@ -155,6 +160,13 @@ pub fn style_bar_size(tool: Tool, auto: bool) -> (f32, f32) {
     let width =
         2.0 * (BORDER + PAD) + buttons as f32 * STYLE_BUTTON + seps as f32 * SEP + extra + (children - 1) as f32 * GAP;
     (width, 2.0 * (BORDER + PAD) + STYLE_BUTTON)
+}
+
+/// Where the text style button is, as (x, width), on a text style bar at `bar_x`:
+/// after 3 sizes, a separator, 6 colors and a separator (11 children, 11 gaps).
+pub fn text_style_button(bar_x: f32) -> (f32, f32) {
+    let before = (3 + PALETTE.len()) as f32 * STYLE_BUTTON + 2.0 * SEP + (5 + PALETTE.len()) as f32 * GAP;
+    (bar_x + BORDER + PAD + before, TEXT_STYLE)
 }
 
 /// Window x of the strength slider's 0 and 1 for a redact style bar at `bar_x`.
@@ -323,13 +335,21 @@ fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<Edit
     bar
 }
 
-/// The style bar of a tool with a color. `numbering` is the counters' format,
-/// shown for the counter tool.
+/// What a style bar shows beyond sizes and colors.
+pub enum Extra {
+    None,
+    /// The counters' numbering.
+    Numbering(CounterFormat),
+    /// The text style, and whether its menu is open.
+    TextStyle(TextStyle, bool),
+}
+
+/// The style bar of a tool with a color.
 pub fn style_bar(
     tool: Tool,
     size: SizeLevel,
     color: Color,
-    numbering: Option<CounterFormat>,
+    extra: Extra,
     x: f32,
     y: f32,
     cx: &mut Context<EditorView>,
@@ -348,7 +368,31 @@ pub fn style_bar(
             );
         }
     }
-    if let Some(current) = numbering {
+    if let Extra::TextStyle(style, open) = extra {
+        bar = bar.child(separator()).child(
+            div()
+                .id("text-style")
+                .tooltip(tooltip("Text style"))
+                .flex_none()
+                .w(px(TEXT_STYLE))
+                .h(px(STYLE_BUTTON))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0x333333))
+                .cursor_pointer()
+                .when(open, |d| d.bg(rgba(0x1677_FF1F)).text_color(hsla(THEME_BLUE)))
+                .when(!open, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
+                .child(style.label())
+                .child(div().text_size(px(9.)).child(if open { "▲" } else { "▼" }))
+                .on_mouse_down(MouseButton::Left, on_press(cx, |this, _, _| this.toggle_text_styles())),
+        );
+    }
+    if let Extra::Numbering(current) = extra {
         bar = bar.child(separator());
         for format in CounterFormat::ALL {
             let (glyph, label) = match format {
@@ -376,6 +420,67 @@ pub fn style_bar(
         }
     }
     bar.into_any_element()
+}
+
+/// One text style preview: the style, its sample drawn by the annotation
+/// renderer, and the sample's logical size.
+pub type TextPreview = (TextStyle, Arc<gpui::RenderImage>, (f32, f32));
+
+/// Row height of the text style menu.
+const MENU_ROW: f32 = 36.0;
+
+/// Logical size of the text style menu for `count` styles.
+pub fn text_style_menu_size(count: usize) -> (f32, f32) {
+    (190.0, 2.0 * (BORDER + PAD) + count as f32 * MENU_ROW)
+}
+
+/// The text style picker: each style's sample, the current one checked. On a
+/// dark panel when the text color is light, so light samples show.
+pub fn text_style_menu(
+    previews: &[TextPreview],
+    current: TextStyle,
+    dark: bool,
+    x: f32,
+    y: f32,
+    cx: &mut Context<EditorView>,
+) -> AnyElement {
+    let (w, h) = text_style_menu_size(previews.len());
+    let mut menu = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .p(px(PAD))
+        .flex()
+        .flex_col()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(rgba(0x0000_0022))
+        .shadow_lg()
+        .occlude()
+        .bg(if dark { rgb(0x2A2A2E) } else { rgb(0xFFFFFF) });
+    for (style, image, (iw, ih)) in previews.iter().cloned() {
+        let active = style == current;
+        menu = menu.child(
+            div()
+                .id(style.label())
+                .h(px(MENU_ROW))
+                .flex_none()
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(active, |d| d.bg(rgba(0x1677_FF26)))
+                .when(!active, |d| d.hover(|s| s.bg(if dark { rgba(0xFFFF_FF14) } else { rgba(0x0000_000D) })))
+                .child(gpui::img(image).w(px(iw)).h(px(ih)))
+                .when(active, |d| d.child(svg().path("icons/done.svg").size(px(14.)).text_color(hsla(THEME_BLUE))))
+                .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.choose_text_style(style))),
+        );
+    }
+    menu.into_any_element()
 }
 
 /// The redact bar's Auto button: ready, or running.

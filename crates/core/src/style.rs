@@ -1,5 +1,7 @@
 //! Tools, colors and stroke sizes shared by the editor, the rasterizer and the UI.
 
+use crate::text::FontFamily;
+
 /// Straight (non-premultiplied) sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -22,6 +24,11 @@ impl Color {
     pub fn is_light(self) -> bool {
         // Relative luminance with sRGB weights, on the gamma-encoded values.
         0.299 * self.r as f32 + 0.587 * self.g as f32 + 0.114 * self.b as f32 > 160.0
+    }
+
+    /// Text on this color: dark on light colors, white otherwise.
+    pub fn contrast(self) -> Color {
+        if self.is_light() { COUNTER_DARK_TEXT } else { Color::rgb(0xFFFFFF) }
     }
 }
 
@@ -123,6 +130,85 @@ pub struct Style {
 impl Default for Style {
     fn default() -> Self {
         Self { color: PALETTE[0], size: SizeLevel::Medium }
+    }
+}
+
+/// How a text annotation looks: a typeface family and what's behind the
+/// glyphs. The seven styles CleanShot X offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum TextStyle {
+    #[default]
+    Standard,
+    Rounded,
+    Monospaced,
+    /// Outlined in a contrasting color, readable on any background.
+    Outlined,
+    /// On a box of the text color, in a contrasting color.
+    Boxed,
+    /// On a pill of the text color, in the rounded face.
+    RoundedBoxed,
+    /// Monospaced on a light card with a border, like a code chip.
+    MonospacedBoxed,
+}
+
+/// What a [`TextStyle`] draws behind its glyphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextBackdrop {
+    None,
+    Outline,
+    Box,
+    Pill,
+    Card,
+}
+
+impl TextStyle {
+    pub const ALL: [TextStyle; 7] = [
+        TextStyle::Standard,
+        TextStyle::Rounded,
+        TextStyle::Monospaced,
+        TextStyle::Outlined,
+        TextStyle::Boxed,
+        TextStyle::RoundedBoxed,
+        TextStyle::MonospacedBoxed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextStyle::Standard => "Standard",
+            TextStyle::Rounded => "Rounded",
+            TextStyle::Monospaced => "Monospaced",
+            TextStyle::Outlined => "Outlined",
+            TextStyle::Boxed => "Boxed",
+            TextStyle::RoundedBoxed => "Rounded Boxed",
+            TextStyle::MonospacedBoxed => "Monospaced Boxed",
+        }
+    }
+
+    pub fn family(self) -> FontFamily {
+        match self {
+            TextStyle::Rounded | TextStyle::RoundedBoxed => FontFamily::Rounded,
+            TextStyle::Monospaced | TextStyle::MonospacedBoxed => FontFamily::Mono,
+            _ => FontFamily::Sans,
+        }
+    }
+
+    pub fn backdrop(self) -> TextBackdrop {
+        match self {
+            TextStyle::Outlined => TextBackdrop::Outline,
+            TextStyle::Boxed => TextBackdrop::Box,
+            TextStyle::RoundedBoxed => TextBackdrop::Pill,
+            TextStyle::MonospacedBoxed => TextBackdrop::Card,
+            _ => TextBackdrop::None,
+        }
+    }
+
+    /// The glyphs' color for text in `color`: on a box or pill of that
+    /// color, the contrasting one.
+    pub fn ink(self, color: Color) -> Color {
+        match self.backdrop() {
+            TextBackdrop::Box | TextBackdrop::Pill => color.contrast(),
+            _ => color,
+        }
     }
 }
 

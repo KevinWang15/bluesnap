@@ -5,12 +5,11 @@
 //! `GetImage` (or the XDG screenshot portal on Wayland) and list windows from
 //! `_NET_CLIENT_LIST_STACKING`.
 
-use std::path::PathBuf;
 
 use anyhow::bail;
 use raw_window_handle::HasWindowHandle;
 
-use crate::{Capture, DisplayInfo, Platform, TextLine, Tray, TrayCommand};
+use crate::{Capture, DisplayInfo, FontFamily, FontSource, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
@@ -56,15 +55,21 @@ impl Platform for Native {
         crate::recognize_with_model(width, height, rgba)
     }
 
-    fn font_paths(&self) -> Vec<PathBuf> {
-        [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    fn fonts(&self, family: FontFamily) -> Vec<FontSource> {
+        let file = |path: &str| FontSource::file(path);
+        let primary = match family {
+            FontFamily::Sans => vec![file("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")],
+            FontFamily::Rounded => vec![crate::bundled_rounded()],
+            FontFamily::Mono => vec![file("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf")],
+        };
+        let cjk = [
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         ]
-        .iter()
-        .map(PathBuf::from)
-        .collect()
+        .map(file);
+        primary.into_iter().chain(cjk).collect()
     }
 }

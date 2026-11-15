@@ -858,6 +858,7 @@ name = "bluesnap-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bluesnap-core",
  "bluesnap-ocr",
  "log",
  "objc2",

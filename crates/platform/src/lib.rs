@@ -5,8 +5,8 @@
 //! Adding an OS means adding a module that implements [`Platform`] and wiring it
 //! into the `cfg` list at the bottom of this file.
 
-use std::path::PathBuf;
 
+pub use bluesnap_core::{FontFamily, FontSource};
 use raw_window_handle::HasWindowHandle;
 
 /// Rectangle in captured-image pixels (origin at the image's top-left).
@@ -135,9 +135,10 @@ pub trait Platform {
     /// UI thread. Lines come back in no particular order.
     fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>>;
 
-    /// Font files for text annotations, best first. CJK-capable fonts are listed
-    /// early so mixed-script text renders without tofu.
-    fn font_paths(&self) -> Vec<PathBuf>;
+    /// Fonts for text in `family`, best first, bold-ish like annotation text
+    /// in other tools. Each list ends with CJK-capable fallbacks so mixed-script
+    /// text renders without tofu.
+    fn fonts(&self, family: FontFamily) -> Vec<FontSource>;
 }
 
 /// The embedded PP-OCRv6 engine, for OSes without a good built-in OCR API.
@@ -172,6 +173,12 @@ mod linux;
 pub use linux::Native;
 
 /// The implementation for the OS being compiled for.
+/// A rounded face for platforms without one (OFL, see assets/fonts).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn bundled_rounded() -> FontSource {
+    FontSource::bundled(include_bytes!("../assets/fonts/Nunito.ttf")).weight(800.0)
+}
+
 pub fn native() -> Native {
     Native
 }

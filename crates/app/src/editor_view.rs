@@ -78,6 +78,10 @@ pub struct EditorView {
     ocr: Option<Task<()>>,
     /// Running AI redaction, if any. Dropping it cancels the UI update.
     auto: Option<Task<()>>,
+    /// The text style menu is open.
+    text_menu: bool,
+    /// Its previews, for the text color and display scale they were drawn in.
+    text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
     /// While the redact strength slider is dragged: its style bar's window x.
     slider: Option<f32>,
 }
@@ -182,6 +186,8 @@ impl EditorView {
             toast: None,
             ocr: None,
             auto: None,
+            text_menu: false,
+            text_previews: None,
             slider: None,
         }
     }
@@ -379,6 +385,50 @@ impl EditorView {
         self.show_toast(toast, window, cx);
     }
 
+    pub fn toggle_text_styles(&mut self) {
+        self.text_menu = !self.text_menu;
+    }
+
+    pub fn choose_text_style(&mut self, style: bluesnap_core::TextStyle) {
+        self.editor.set_text_style(style);
+        self.text_menu = false;
+    }
+
+    /// The text style menu under the style bar's style button (above the bar
+    /// when there's no room below).
+    fn text_menu(
+        &mut self,
+        current: bluesnap_core::TextStyle,
+        color: bluesnap_core::Color,
+        bar: Point<f32>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let scale = window.scale_factor();
+        if !self.text_previews.as_ref().is_some_and(|(c, s, _)| *c == color && *s == scale) {
+            let fonts = cx.global::<AppState>().fonts.clone();
+            let previews = bluesnap_core::TextStyle::ALL
+                .into_iter()
+                .filter_map(|style| {
+                    // Drawn at device resolution, shown at 15 logical px.
+                    let sample = bluesnap_core::render::text_sample(&fonts, style.label(), style, color, 15.0 * scale)?;
+                    let size = (sample.width() as f32 / scale, sample.height() as f32 / scale);
+                    Some((style, crate::gpu_image::pixmap_image(&sample)?, size))
+                })
+                .collect();
+            self.text_previews = Some((color, scale, previews));
+        }
+        let previews = self.text_previews.as_ref().expect("just made").2.clone();
+        let (w, h) = toolbar::text_style_menu_size(previews.len());
+        let (button_x, _) = toolbar::text_style_button(bar.x);
+        let bar_h = toolbar::style_bar_size(bluesnap_core::Tool::Text, false).1;
+        let win = window.viewport_size();
+        let x = button_x.min(f32::from(win.width) - w - 8.0).max(8.0);
+        let below = bar.y + bar_h + 4.0;
+        let y = if below + h <= f32::from(win.height) - 8.0 { below } else { (bar.y - h - 4.0).max(8.0) };
+        toolbar::text_style_menu(&previews, current, color.is_light(), x, y, cx)
+    }
+
     /// A press on the redact strength slider: jumps to the pointer and follows
     /// it until release, as one undo step.
     pub fn press_slider(&mut self, x: Pixels, window: &Window) {
@@ -410,9 +460,9 @@ impl EditorView {
         }
         let settings = cx.global::<AppState>().ai.clone();
         if !settings.is_configured() {
-            let toast = Toast::new(toast::Kind::Info, "Set up AI redaction first")
-                .detail("Add an LLM or a decision model to find sensitive text automatically. Only recognized text is sent, never the image.")
-                .action("Set up…", toast::Action::OpenAiSettings);
+            let toast = Toast::new(toast::Kind::Info, "Set up AI first")
+                .detail("Auto finds sensitive text with an LLM or a decision model. Add one in AI Settings; only recognized text is sent, never the image.")
+                .action("AI Settings…", toast::Action::OpenAiSettings);
             return self.show_toast(toast, window, cx);
         }
         let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
@@ -454,7 +504,7 @@ impl EditorView {
             let count = lines.len();
             let found = cx
                 .background_executor()
-                .spawn(async move { bluesnap_ai::locate_sensitive(&settings, &pixmap, &lines, &fonts) })
+                .spawn(async move { bluesnap_ai::locate_sensitive(&settings, &pixmap, &lines, fonts.sans()) })
                 .await;
             log::info!("auto redact: {count} lines, OCR {ocr_time:?}, total {:?}", started.elapsed());
             this.update_in(cx, |this, window, cx| {
@@ -474,14 +524,14 @@ impl EditorView {
                             (0, _) | (_, None) => toast,
                             (failed, Some(e)) => Toast::new(toast::Kind::Error, format!("{} · {} failed", toast.title, plural(failed, "request")))
                                 .detail(format!("Some text wasn't checked: {}", truncate(&e, 160)))
-                                .action("Settings…", toast::Action::OpenAiSettings),
+                                .action("AI Settings…", toast::Action::OpenAiSettings),
                         }
                     }
                     Err(e) => {
                         log::error!("auto redact failed: {e:#}");
                         Toast::new(toast::Kind::Error, "AI redaction failed")
                             .detail(short_error(&e))
-                            .action("Settings…", toast::Action::OpenAiSettings)
+                            .action("AI Settings…", toast::Action::OpenAiSettings)
                     }
                 };
                 this.auto_finished(toast, window, cx);
@@ -497,6 +547,9 @@ impl EditorView {
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.text_menu) {
+            return cx.notify(); // a click outside the menu just closes it
+        }
         if self.toast.as_ref().is_some_and(Toast::dismissable) {
             self.toast = None;
         }
@@ -560,6 +613,7 @@ impl EditorView {
             return; // the IME owns the keyboard while composing
         }
         match ks.key.as_str() {
+            "escape" if self.text_menu => self.text_menu = false,
             "escape" if editing => self.editor.finish_text(),
             "escape" => return self.finish(Finish::Cancel, window, cx),
             "enter" if editing => self.editor.text_key(TextKey::Newline),
@@ -625,9 +679,13 @@ impl EditorView {
                 .selected_frame()
                 .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
             text_frame: e.text_frame().map(|r| v.to_window(r)),
-            brush_ring: e.brush_ring().map(|(c, r)| (v.point_to_window(c), px(r * v.zoom))),
+            brush_ring: e.brush_ring().map(|b| {
+                let r = px(b.radius * v.zoom);
+                // The highlighter's tip: corners rounded by a quarter of its width.
+                (v.point_to_window(b.center), r, if b.square { r / 2. } else { r })
+            }),
             caret: e.text_caret_rect().map(|r| {
-                let color = e.current_style().map_or(THEME_BLUE, |(_, s)| s.color);
+                let color = e.text_ink().unwrap_or(THEME_BLUE);
                 (v.to_window(r), self::color(color))
             }),
             cursor: match e.cursor() {
@@ -764,10 +822,22 @@ impl Render for EditorView {
                 root = root.child(match self.editor.current_redaction() {
                     Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, at.x, at.y, cx),
                     None => {
-                        let numbering = self.editor.current_counter_format();
-                        toolbar::style_bar(tool, style.size, style.color, numbering, at.x, at.y, cx)
+                        let extra = match (self.editor.current_counter_format(), self.editor.current_text_style()) {
+                            (Some(numbering), _) => toolbar::Extra::Numbering(numbering),
+                            (_, Some(text)) => toolbar::Extra::TextStyle(text, self.text_menu),
+                            _ => toolbar::Extra::None,
+                        };
+                        toolbar::style_bar(tool, style.size, style.color, extra, at.x, at.y, cx)
                     }
                 });
+                if let Some(current) = self.editor.current_text_style().filter(|_| self.text_menu) {
+                    let menu = self.text_menu(current, style.color, at, window, cx);
+                    root = root.child(menu);
+                } else {
+                    self.text_menu = false;
+                }
+            } else {
+                self.text_menu = false;
             }
         }
         root
@@ -794,8 +864,8 @@ struct Scene {
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
-    /// The redact brush's outline at the pointer: center and radius.
-    brush_ring: Option<(Point<Pixels>, Pixels)>,
+    /// A brush's outline at the pointer: center, half width, corner radius.
+    brush_ring: Option<(Point<Pixels>, Pixels, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
     cursor: CursorStyle,
     editing_text: bool,
@@ -836,11 +906,11 @@ impl Scene {
         }
 
         // Over the canvas only, not over the panels.
-        if let Some((center, r)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
+        if let Some((center, r, corner)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
             let ring = Bounds::centered_at(center, size(r * 2., r * 2.));
             // A white ring between two dark ones shows on any background.
-            window.paint_quad(quad(ring.dilate(px(1.)), r + px(1.), transparent_black(), px(3.5), rgba(0x0000_0059), BorderStyle::Solid));
-            window.paint_quad(quad(ring, r, transparent_black(), px(1.5), white(), BorderStyle::Solid));
+            window.paint_quad(quad(ring.dilate(px(1.)), corner + px(1.), transparent_black(), px(3.5), rgba(0x0000_0059), BorderStyle::Solid));
+            window.paint_quad(quad(ring, corner, transparent_black(), px(1.5), white(), BorderStyle::Solid));
         }
 
         if let Some((region, handles)) = &self.selection_frame {

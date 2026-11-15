@@ -13,9 +13,9 @@ use tiny_skia::{
 use crate::geom::{Point, Rect};
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
 use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
-use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size};
-use crate::style::{COUNTER_DARK_TEXT, Color, HIGHLIGHT_ALPHA, REDACT_GRAY, RedactEffect};
-use crate::text::FontSet;
+use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size, text_box};
+use crate::style::{COUNTER_DARK_TEXT, Color, HIGHLIGHT_ALPHA, REDACT_GRAY, RedactEffect, TextBackdrop, TextStyle};
+use crate::text::{FontSet, Fonts};
 
 /// The frozen screenshot an editing session works on.
 pub struct Document {
@@ -212,15 +212,9 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
             }
         }
-        Geometry::Highlight(pts) => {
-            // One path, so where the stroke crosses itself it doesn't get darker.
-            if let Some(path) = smooth_path(pts) {
-                let paint = solid(Color { a: HIGHLIGHT_ALPHA, ..shape.style.color });
-                pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
-            }
-        }
+        Geometry::Highlight(pts) => draw_highlight(pixmap, pts, w, shape.style.color, ts),
         Geometry::Counter { center, number, format } => {
-            draw_counter(pixmap, *center, &format.label(*number), w, shape.style.color, m.fonts, ts)
+            draw_counter(pixmap, *center, &format.label(*number), w, shape.style.color, m.fonts.sans(), ts)
         }
         Geometry::Redact { area, effect, strength } => {
             let region;
@@ -260,11 +254,8 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 }
             }
         }
-        Geometry::Text { origin, content } => {
-            let layout = m.fonts.layout(content, w);
-            if let Some(path) = m.fonts.outline_path(&layout, *origin) {
-                pixmap.fill_path(&path, &paint, FillRule::Winding, ts, None);
-            }
+        Geometry::Text { origin, content, style } => {
+            draw_text(pixmap, m.fonts.get(style.family()), content, *origin, w, *style, shape.style.color, ts)
         }
     }
 }
@@ -299,6 +290,155 @@ fn draw_arrow(pixmap: &mut Pixmap, from: Point, to: Point, w: f32, paint: &Paint
     if let Some(path) = pb.finish() {
         pixmap.fill_path(&path, paint, FillRule::Winding, ts, None);
     }
+}
+
+/// `text` in `style` and `color` at `size` px, cropped to what it covers: the
+/// previews in a style picker, drawn exactly as annotations are.
+pub fn text_sample(fonts: &Fonts, text: &str, style: TextStyle, color: Color, size: f32) -> Option<Pixmap> {
+    let set = fonts.get(style.family());
+    let layout = set.layout(text, size);
+    let b = text_box(Point::new(0.0, 0.0), &layout, size, style).inflate(1.0).round_out();
+    let mut pixmap = Pixmap::new(b.w as u32, b.h as u32)?;
+    draw_text(&mut pixmap, set, text, Point::new(0.0, 0.0), size, style, color, Transform::from_translate(-b.x, -b.y));
+    Some(pixmap)
+}
+
+/// Text in `style`: its outline or backdrop, then the glyphs. `size` is the
+/// font size.
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    pixmap: &mut Pixmap,
+    fonts: &FontSet,
+    content: &str,
+    origin: Point,
+    size: f32,
+    style: TextStyle,
+    color: Color,
+    ts: Transform,
+) {
+    let layout = fonts.layout(content, size);
+    let glyphs = fonts.outline_path(&layout, origin);
+    let backdrop = text_box(origin, &layout, size, style);
+    match style.backdrop() {
+        TextBackdrop::None => {}
+        TextBackdrop::Outline => {
+            if let Some(glyphs) = &glyphs {
+                let outline = Stroke { width: size * 0.16, line_join: LineJoin::Round, ..Stroke::default() };
+                pixmap.stroke_path(glyphs, &solid(color.contrast()), &outline, ts, None);
+            }
+        }
+        TextBackdrop::Box => fill_rounded(pixmap, backdrop, size * 0.16, color, ts),
+        TextBackdrop::Pill => fill_rounded(pixmap, backdrop, backdrop.h.min(size * 1.2) / 2.0, color, ts),
+        TextBackdrop::Card => {
+            // A light card with a hairline border; dark for light colors, which
+            // wouldn't show on it.
+            let (card, border) = if color.is_light() {
+                (Color::rgb(0x1F1F1F), Color { a: 60, ..Color::rgb(0xFFFFFF) })
+            } else {
+                (Color::rgb(0xFFFFFF), Color { a: 50, ..Color::rgb(0x000000) })
+            };
+            let radius = size * 0.16;
+            fill_rounded(pixmap, backdrop, radius, card, ts);
+            if let Some(path) = rounded_rect(backdrop.inflate(-size / 48.0), radius) {
+                let line = Stroke { width: (size / 24.0).max(1.0), ..Stroke::default() };
+                pixmap.stroke_path(&path, &solid(border), &line, ts, None);
+            }
+        }
+    }
+    if let Some(glyphs) = glyphs {
+        pixmap.fill_path(&glyphs, &solid(style.ink(color)), FillRule::Winding, ts, None);
+    }
+}
+
+fn fill_rounded(pixmap: &mut Pixmap, r: Rect, radius: f32, color: Color, ts: Transform) {
+    if let Some(path) = rounded_rect(r, radius) {
+        pixmap.fill_path(&path, &solid(color), FillRule::Winding, ts, None);
+    }
+}
+
+/// `r` with corners rounded by `radius` (clamped to half its sides).
+fn rounded_rect(r: Rect, radius: f32) -> Option<tiny_skia::Path> {
+    let k = radius.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
+    // Cubic Bézier control distance approximating a quarter circle.
+    let c = k * 0.552_284_8;
+    let (x0, y0, x1, y1) = (r.x, r.y, r.right(), r.bottom());
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0 + k, y0);
+    pb.line_to(x1 - k, y0);
+    pb.cubic_to(x1 - k + c, y0, x1, y0 + k - c, x1, y0 + k);
+    pb.line_to(x1, y1 - k);
+    pb.cubic_to(x1, y1 - k + c, x1 - k + c, y1, x1 - k, y1);
+    pb.line_to(x0 + k, y1);
+    pb.cubic_to(x0 + k - c, y1, x0, y1 - k + c, x0, y1 - k);
+    pb.line_to(x0, y0 + k);
+    pb.cubic_to(x0, y0 + k - c, x0 + k - c, y0, x0 + k, y0);
+    pb.close();
+    pb.finish()
+}
+
+/// A highlighter stroke: a chisel tip, so the ends are rounded rectangles
+/// rather than round caps. The stroke and its ends are combined in a mask and
+/// painted once, so overlaps (and crossings) don't get darker.
+fn draw_highlight(pixmap: &mut Pixmap, pts: &[Point], w: f32, color: Color, ts: Transform) {
+    let Some(path) = smooth_path(pts) else { return };
+    let outline = Stroke { width: w, line_cap: LineCap::Butt, line_join: LineJoin::Round, ..Stroke::default() };
+    let Some(body) = path.stroke(&outline, 1.0) else { return };
+    let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else { return };
+    mask.fill_path(&body, FillRule::Winding, true, ts);
+    for cap in highlight_caps(pts, w) {
+        mask.fill_path(&cap, FillRule::Winding, true, ts);
+    }
+    let paint = solid(Color { a: HIGHLIGHT_ALPHA, ..color });
+    let all = tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap.width() as f32, pixmap.height() as f32).expect("non-empty");
+    pixmap.fill_rect(all, &paint, Transform::identity(), Some(&mask));
+}
+
+/// Rounded-rectangle ends for a highlighter stroke `w` wide through `pts`:
+/// squares around each end, turned along the stroke, extending w/2 past it.
+fn highlight_caps(pts: &[Point], w: f32) -> Vec<tiny_skia::Path> {
+    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else { return Vec::new() };
+    // The stroke's direction at an end, from a point far enough in to be stable.
+    let along = |end: Point, inward: &mut dyn Iterator<Item = Point>| {
+        let mut other = None;
+        for p in inward {
+            other = Some(p);
+            if p.distance(end) >= w * 0.5 {
+                break;
+            }
+        }
+        let v = other.map_or(Point::new(1.0, 0.0), |o| o - end);
+        let len = v.length();
+        if len > 0.0 { Point::new(v.x / len, v.y / len) } else { Point::new(1.0, 0.0) }
+    };
+    let start = along(first, &mut pts.iter().skip(1).copied());
+    let end = along(last, &mut pts.iter().rev().skip(1).copied());
+    [(first, start), (last, end)].into_iter().filter_map(|(c, d)| rounded_square(c, d, w)).collect()
+}
+
+/// A square `w` wide centered on `center`, turned to the unit direction `d`,
+/// with corners rounded by a quarter of its width.
+fn rounded_square(center: Point, d: Point, w: f32) -> Option<tiny_skia::Path> {
+    let (h, r) = (w / 2.0, w * 0.25);
+    // Corners in the square's own frame (u along `d`, v across), in order.
+    let corners = [Point::new(h, -h), Point::new(h, h), Point::new(-h, h), Point::new(-h, -h)];
+    let world = |p: Point| (center.x + d.x * p.x - d.y * p.y, center.y + d.y * p.x + d.x * p.y);
+    let toward = |a: Point, b: Point| {
+        let v = b - a;
+        let len = v.length();
+        Point::new(a.x + v.x / len * r, a.y + v.y / len * r)
+    };
+    let mut pb = PathBuilder::new();
+    let (x, y) = world(toward(corners[0], corners[3]));
+    pb.move_to(x, y);
+    for i in 0..4 {
+        let (c, next) = (corners[i], corners[(i + 1) % 4]);
+        let ((cx, cy), (ax, ay)) = (world(c), world(toward(c, next)));
+        pb.quad_to(cx, cy, ax, ay);
+        let (bx, by) = world(toward(next, c));
+        pb.line_to(bx, by);
+    }
+    pb.close();
+    pb.finish()
 }
 
 /// A filled circle (or pill, for long labels) with the label centered on it.
@@ -347,13 +487,13 @@ fn smooth_path(pts: &[Point]) -> Option<tiny_skia::Path> {
 }
 
 fn draw_underline(pixmap: &mut Pixmap, shape: &Shape, m: Metrics, range: Range<usize>, ts: Transform) {
-    let Geometry::Text { origin, content } = &shape.geometry else { return };
-    let layout = m.fonts.layout(content, shape.size_px(m.scale));
+    let Geometry::Text { origin, content, style } = &shape.geometry else { return };
+    let layout = m.fonts.get(style.family()).layout(content, shape.size_px(m.scale));
     let (a, b) = (layout.caret_rect(range.start), layout.caret_rect(range.end));
     let thickness = (m.scale * 1.5).max(1.0);
     let y = a.bottom() - thickness;
     if let Some(r) = tiny_skia::Rect::from_xywh(origin.x + a.x, origin.y + y, (b.x - a.x).max(thickness), thickness) {
-        pixmap.fill_rect(r, &solid(shape.style.color), ts, None);
+        pixmap.fill_rect(r, &solid(style.ink(shape.style.color)), ts, None);
     }
 }
 
@@ -378,7 +518,7 @@ mod tests {
     #[test]
     fn export_crops_and_draws() {
         let d = doc(100, 100);
-        let fonts = FontSet::empty();
+        let fonts = crate::text::Fonts::empty();
         let m = Metrics { scale: 1.0, fonts: &fonts };
         let shapes = vec![Shape {
             geometry: Geometry::Rect(Rect::new(60.0, 60.0, 20.0, 20.0)),
@@ -427,15 +567,15 @@ mod tests {
         }
     }
 
-    fn real_fonts() -> Option<FontSet> {
+    fn real_fonts() -> Option<crate::text::Fonts> {
         let fonts = FontSet::load(&["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]);
-        (!fonts.is_empty()).then_some(fonts)
+        (!fonts.is_empty()).then(|| crate::text::Fonts::sans_only(fonts))
     }
 
     #[test]
     fn highlights_are_translucent_and_dont_darken_where_they_cross() {
         let d = doc(100, 100);
-        let fonts = FontSet::empty();
+        let fonts = crate::text::Fonts::empty();
         let m = Metrics { scale: 1.0, fonts: &fonts };
         // Through the white half and back over itself.
         let pts = [(60.0, 20.0), (90.0, 50.0), (60.0, 80.0), (90.0, 20.0)].map(|(x, y)| Point::new(x, y)).to_vec();
@@ -453,6 +593,55 @@ mod tests {
             let (r, g, b) = px(x, y);
             assert!(r.abs_diff(expected.0) <= 1 && g.abs_diff(expected.1) <= 1 && b.abs_diff(expected.2) <= 1, "{:?} at ({x}, {y})", px(x, y));
         }
+    }
+
+    #[test]
+    fn highlighter_ends_are_rounded_rectangles() {
+        let d = doc(200, 100);
+        let fonts = crate::text::Fonts::empty();
+        let m = Metrics { scale: 1.0, fonts: &fonts };
+        // Large: 30 px wide, horizontal from x 140 to 180 at y 50 (on the white half).
+        let pts = vec![Point::new(140.0, 50.0), Point::new(180.0, 50.0)];
+        let shapes = [Shape { geometry: Geometry::Highlight(pts), style: Style { size: SizeLevel::Large, ..Tool::Highlighter.default_style() } }];
+        let out = export(&d, d.bounds(), &shapes, m).unwrap();
+        let tinted = |x, y| out.pixel(x, y).unwrap().blue() < 200;
+        // Past the end by up to 15 px, the full height is covered near the axis
+        // and near the edges (a round cap would leave (191, 37) bare)…
+        assert!(tinted(192, 50) && tinted(191, 37) && tinted(191, 63));
+        // …but the very corner is rounded off, and nothing reaches past w/2.
+        assert!(!tinted(194, 35) && !tinted(196, 50));
+    }
+
+    #[test]
+    fn text_styles_draw_their_backdrops() {
+        let Some(fonts) = real_fonts() else { return };
+        let red = PALETTE[0];
+        let px = |p: &Pixmap, x, y| {
+            let c = p.pixel(x, y).unwrap();
+            (c.red(), c.green(), c.blue(), c.alpha())
+        };
+        // Boxed and pill: the text color behind the glyphs, white glyphs.
+        for style in [TextStyle::Boxed, TextStyle::RoundedBoxed] {
+            let sample = text_sample(&fonts, "Hi", style, red, 40.0).unwrap();
+            let (w, h) = (sample.width(), sample.height());
+            // Inside the padding, left of the glyphs, mid-height: the box.
+            assert_eq!(px(&sample, 8, h / 2), (0xF5, 0x22, 0x2D, 255), "{style:?}");
+            let white = (0..w).flat_map(|x| (0..h).map(move |y| (x, y))).filter(|&(x, y)| px(&sample, x, y) == (255, 255, 255, 255)).count();
+            assert!(white > 30, "{style:?}: glyphs not in the contrasting color");
+            // A pill has round ends: its corner is empty.
+            if style == TextStyle::RoundedBoxed {
+                assert_eq!(px(&sample, 1, 1).3, 0);
+            }
+        }
+        // Card: a white card, a darker border, red glyphs.
+        let card = text_sample(&fonts, "Hi", TextStyle::MonospacedBoxed, red, 40.0).unwrap();
+        assert_eq!(px(&card, 10, card.height() / 2), (255, 255, 255, 255));
+        // Outlined: white around red glyphs, nothing behind.
+        let outlined = text_sample(&fonts, "Hi", TextStyle::Outlined, red, 40.0).unwrap();
+        let (w, h) = (outlined.width(), outlined.height());
+        let all: Vec<_> = (0..w).flat_map(|x| (0..h).map(move |y| (x, y))).map(|(x, y)| px(&outlined, x, y)).collect();
+        assert!(all.contains(&(255, 255, 255, 255)) && all.contains(&(0xF5, 0x22, 0x2D, 255)));
+        assert_eq!(px(&outlined, 0, 0).3, 0);
     }
 
     #[test]
@@ -490,7 +679,7 @@ mod tests {
     fn redactions_hide_only_their_area() {
         use crate::shape::RedactShape;
         let d = noise_doc(120, 120);
-        let fonts = FontSet::empty();
+        let fonts = crate::text::Fonts::empty();
         let m = Metrics { scale: 1.0, fonts: &fonts };
         let area = |effect| Shape {
             geometry: Geometry::Redact { area: RedactShape::Rect(Rect::new(20.0, 20.0, 40.0, 40.0)), effect, strength: 0.5 },

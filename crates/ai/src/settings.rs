@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// Where one model is served and how to call it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
-    /// Base URL such as `https://api.example.com/v1`, or the full endpoint URL.
+    /// The server, such as `https://api.example.com`; a `/v1` base or the full
+    /// endpoint URL works too.
     pub url: String,
     /// Sent as a bearer token.
     pub token: String,
