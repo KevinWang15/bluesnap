@@ -11,10 +11,11 @@ Press the hotkey, then:
   text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
-- the **highlighter** draws translucent strokes (yellow by default) with a chisel
-  tip, like a real highlighter: square ends with rounded corners. Strokes don't get
-  darker where they cross; hold Shift for a straight line, handy for a line of
-  text. An outline of the tip under the pointer shows its width.
+- the **highlighter** draws translucent strokes (yellow by default) with an upright
+  chisel nib, like a real highlighter: narrower than tall, so horizontal strokes
+  are full height and vertical ones thin, with squarish rounded ends. Strokes don't
+  get darker where they cross; hold Shift for a straight line, handy for a line of
+  text. The nib's outline under the pointer shows its size.
 - **text** comes in the seven styles CleanShot X offers, picked in the text style
   bar (each shown as a preview in the current color): Standard, Rounded,
   Monospaced, Outlined (a contrasting outline, readable on any background), Boxed
@@ -57,7 +58,9 @@ Press the hotkey, then:
   offsets (display scaling, trackpads) is matched with sub-pixel accuracy. Only
   the part that scrolls ends up in
   the image: fixed side panels and scrollbars (including macOS overlay scrollbars)
-  are left out. Annotations aren't carried over, and the image stops at 30,000 px.
+  are left out. Annotations made before starting come along: the image starts with
+  the selection, so they stay on the content they were drawn on (and remain
+  editable after Edit). The image stops at 30,000 px.
 - ✓ (or Enter, Ctrl/Cmd+C, double-click) copies to the clipboard, the download icon
   (or Ctrl/Cmd+S) saves a PNG, ✕ (or Esc) cancels. Right-click goes back to window
   picking, or exits when nothing is selected.
@@ -88,7 +91,10 @@ recognized text, never the screenshot.
 ### Auto redaction
 
 Text is recognized on the computer with the same OCR as To text; only the
-recognized text is sent to the endpoints, never the image. The lines are sent in
+recognized text is sent to the endpoints, never the image. Tall images (scrolling
+screenshots) are read in bands of 1200 rows, with progress in the toast, and each
+band's text is checked by the AI while the next band is read; recognition, about
+1 s per 1000 rows of dense text at 900 px wide, is most of the time there. The lines are sent in
 reading order, 8 per LLM request and one per decision request, all in parallel (up
 to 16 at a time per model; busy responses are retried). Each finding is then
 placed on the screen: the line's words are matched to the clusters of ink in the
@@ -203,6 +209,8 @@ selection, 20 annotations). On a 20-thread x86 Linux machine:
 | frame while typing text | 0.7 ms |
 | export (copy/save) | 7 ms |
 | first mosaic stroke | 1.0 ms |
+| frame while drawing a 600-point highlighter stroke | 2.6 ms |
+| re-rendering 55 annotations of every kind (after committing one) | 10 ms |
 | frame while dragging the blur slider (1200×800 area) | 14 ms |
 | blur of 1000 rows of a 1600×30000 scrolling screenshot | 9 ms |
 
@@ -211,6 +219,10 @@ the shape being edited; both are clipped to the selection on the GPU, so only th
 edited shape is re-rasterized and uploaded per mouse move. With
 `RUST_LOG=bluesnap=debug` the app logs a timeline from hotkey to first presented
 frame (65–115 ms under WSLg, most of it gpui window creation and the first frame).
+
+Fonts are memory-mapped and each face is loaded once, shared by the three
+families: large CJK fallbacks (tens of MB each) cost no private memory, where a
+copy per family took about 50 MB more on Linux and far more on macOS and Windows.
 
 Redaction effects are computed in 256×256 tiles, only under redactions, in
 parallel, and cached for the four most recent effect settings, so slider drags

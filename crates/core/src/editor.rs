@@ -41,14 +41,14 @@ pub enum SelectionMode {
     Fixed,
 }
 
-/// A brush's outline under the pointer.
+/// A brush's outline under the pointer: a rounded rectangle (a circle for
+/// the round redact brush, the nib for the highlighter).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushRing {
     pub center: Point,
-    /// Half the brush width.
-    pub radius: f32,
-    /// A rounded square (the highlighter's tip) rather than a circle.
-    pub square: bool,
+    pub half_width: f32,
+    pub half_height: f32,
+    pub corner: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +158,25 @@ impl Editor {
         editor.selection = Some(editor.screen());
         editor.hover = None;
         editor
+    }
+
+    /// Starts with `shapes` in place, carried over from another editor (see
+    /// [`Self::shapes_in_selection`]). They're part of the document, not an
+    /// undoable change.
+    pub fn with_shapes(mut self, shapes: Vec<Shape>) -> Self {
+        self.shapes = shapes;
+        self.touch_shapes();
+        self
+    }
+
+    /// The annotations relative to the selection's top-left corner, with any
+    /// text being typed committed: for carrying them onto an image of the
+    /// selection, like a scrolling screenshot (which starts with it).
+    pub fn shapes_in_selection(&mut self) -> Vec<Shape> {
+        self.finish_text();
+        let Some(sel) = self.selection else { return Vec::new() };
+        let to_origin = Point::new(-sel.x, -sel.y);
+        self.shapes.iter().map(|s| s.translated(to_origin)).collect()
     }
 
     pub fn selection_mode(&self) -> SelectionMode {
@@ -435,11 +454,13 @@ impl Editor {
             _ => false,
         };
         let inside = self.selection.is_some_and(|s| s.contains(self.pointer));
-        (painting && brush && inside && self.text.is_none()).then(|| BrushRing {
-            center: self.pointer,
-            radius: self.styles[tool.index()].size.logical_px(tool) * self.scale / 2.0,
-            square: tool == Tool::Highlighter,
-        })
+        let w = self.styles[tool.index()].size.logical_px(tool) * self.scale;
+        let (half_width, half_height, corner) = match tool {
+            Tool::Highlighter => render::highlighter_nib(w),
+            _ => (w / 2.0, w / 2.0, w / 2.0),
+        };
+        (painting && brush && inside && self.text.is_none())
+            .then_some(BrushRing { center: self.pointer, half_width, half_height, corner })
     }
 
     pub fn can_undo(&self) -> bool {
@@ -531,6 +552,11 @@ impl Editor {
     // ----- pointer input --------------------------------------------------
 
     pub fn pointer_down(&mut self, p: Point) {
+        // A press while a drag is still open means its release was lost (let
+        // go outside the window): finish that drag first, where it was.
+        if self.drag.is_some() {
+            self.pointer_up(self.pointer);
+        }
         self.pointer = p;
         self.touch();
 
@@ -796,8 +822,11 @@ impl Editor {
         true
     }
 
+    /// Deletes the selected shape. Not while typing into it, nor while the
+    /// mouse is still drawing or dragging a shape (the drag refers to it).
     pub fn delete_selected(&mut self) -> bool {
-        if self.text.is_some() {
+        let shape_drag = matches!(self.drag, Some(Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. }));
+        if self.text.is_some() || shape_drag {
             return false;
         }
         let Some(idx) = self.selected.take() else { return false };
@@ -1357,7 +1386,10 @@ mod tests {
         assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 116.0)]));
         // The ring shows the highlighter's width.
         e.pointer_move(Point::new(300.0, 200.0), false);
-        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(300.0, 200.0), radius: 9.0, square: true }));
+        // Medium: 18 px tall, 8.1 px wide.
+        let ring = e.brush_ring().unwrap();
+        assert_eq!((ring.center, ring.half_height), (Point::new(300.0, 200.0), 9.0));
+        assert!(ring.half_width < ring.half_height);
     }
 
     #[test]
@@ -1399,13 +1431,131 @@ mod tests {
     }
 
     #[test]
+    fn annotations_carry_over_to_an_image_of_the_selection() {
+        let mut e = editor();
+        drag(&mut e, (100.0, 50.0), (300.0, 250.0));
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (120.0, 70.0), (160.0, 90.0));
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 200.0, 200.0);
+        e.text_replace(None, "typing", false, None);
+        // Still typing: the text is committed, and everything is moved to the selection's origin.
+        let shapes = e.shapes_in_selection();
+        assert!(!e.is_editing_text());
+        assert_eq!(shapes.len(), 2);
+        assert_eq!(shapes[0].geometry, Geometry::Rect(Rect::new(20.0, 20.0, 40.0, 20.0)));
+        // A document editor for the new image starts with them, nothing to undo.
+        let doc = Document::from_rgba(200, 600, vec![255; 200 * 600 * 4]).unwrap();
+        let d = Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0).with_shapes(shapes);
+        assert!(d.has_shapes() && !d.can_undo());
+        assert!(d.render_static_layer(d.screen()).is_some());
+    }
+
+    #[test]
+    fn delete_during_a_drag_is_ignored() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Rect);
+        e.pointer_down(Point::new(50.0, 50.0));
+        e.pointer_move(Point::new(90.0, 80.0), false);
+        assert!(!e.delete_selected());
+        e.pointer_move(Point::new(100.0, 90.0), false);
+        e.pointer_up(Point::new(100.0, 90.0));
+        assert_eq!(e.shapes.len(), 1);
+        assert!(e.delete_selected());
+    }
+
+    #[test]
+    fn a_press_after_a_lost_release_finishes_the_drag_first() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Rect);
+        // A press whose release never arrives (let go outside the window)…
+        e.pointer_down(Point::new(260.0, 16.0));
+        // …then text is started elsewhere and the release finally comes.
+        e.toggle_tool(Tool::Text);
+        e.pointer_down(Point::new(300.0, 24.0));
+        e.pointer_up(Point::new(290.0, 120.0));
+        e.text_replace(None, "x", false, None);
+        assert!(e.render_active_layer(e.screen()).is_some());
+        assert_eq!(e.text_content(), Some("x"));
+    }
+
+    /// Random sequences of everything a frontend can do, in any order (a key
+    /// press in the middle of a drag, undo while typing, …): nothing may panic,
+    /// and the layers and export must keep rendering.
+    #[test]
+    fn random_input_never_panics() {
+        use crate::style::{CounterFormat, RedactArea, RedactEffect, TextStyle};
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n.max(1)
+        };
+        for _ in 0..400 {
+            let mut e = editor();
+            for _ in 0..80 {
+                let p = Point::new(next(420) as f32 - 10.0, next(320) as f32 - 10.0);
+                match next(24) {
+                    0..=3 => e.pointer_down(p),
+                    4..=8 => e.pointer_move(p, next(4) == 0),
+                    9..=11 => e.pointer_up(p),
+                    12 => e.toggle_tool(Tool::ALL[next(Tool::ALL.len() as u32) as usize]),
+                    13 => {
+                        e.undo();
+                    }
+                    14 => {
+                        e.delete_selected();
+                    }
+                    15 => e.text_replace(None, ["a", "密", "😀", "", "\n"][next(5) as usize], next(3) == 0, None),
+                    16 => e.text_key([TextKey::Backspace, TextKey::Delete, TextKey::Left, TextKey::Right, TextKey::Home, TextKey::End, TextKey::Newline][next(7) as usize]),
+                    17 => e.finish_text(),
+                    18 => {
+                        e.right_click();
+                        e.double_click(p);
+                    }
+                    19 => e.set_size(SizeLevel::ALL[next(3) as usize]),
+                    20 => {
+                        let (effect, area) = (RedactEffect::ALL[next(3) as usize], RedactArea::ALL[next(2) as usize]);
+                        e.set_redaction(|r| (r.effect, r.area) = (effect, area));
+                    }
+                    21 => {
+                        e.set_text_style(TextStyle::ALL[next(7) as usize]);
+                        e.set_counter_format(CounterFormat::ALL[next(4) as usize]);
+                    }
+                    22 => {
+                        e.add_redactions(&[Rect::new(p.x, p.y, 30.0, 12.0)]);
+                    }
+                    _ => {
+                        let strength = next(100) as f32 / 100.0;
+                        e.begin_continuous_edit();
+                        e.set_redaction(|r| r.strength = strength);
+                        e.end_continuous_edit();
+                    }
+                }
+                let screen = e.screen();
+                e.render_static_layer(screen);
+                e.render_active_layer(screen);
+                e.cursor();
+                e.selected_frame();
+                e.text_caret_rect();
+                e.brush_ring();
+            }
+            e.export();
+            e.shapes_in_selection();
+        }
+    }
+
+    #[test]
     fn brush_ring_shows_only_for_the_redact_brush() {
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.pointer_move(Point::new(100.0, 100.0), false);
         assert_eq!(e.brush_ring(), None);
         e.toggle_tool(Tool::Redact);
-        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(100.0, 100.0), radius: 12.0, square: false }));
+        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(100.0, 100.0), half_width: 12.0, half_height: 12.0, corner: 12.0 }));
         e.set_redaction(|r| r.area = RedactArea::Rect);
         assert_eq!(e.brush_ring(), None);
     }

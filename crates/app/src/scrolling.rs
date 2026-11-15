@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bluesnap_core::pixels::split_bgrx;
+use bluesnap_core::shape::Shape;
 use bluesnap_core::stitch::{Progress, Stitcher};
 use bluesnap_core::{Color, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
@@ -76,6 +77,10 @@ pub struct ScrollingCapture {
     height: u32,
     frame: AnyWindowHandle,
     bar: Option<AnyWindowHandle>,
+    /// Annotations made before the capture started, relative to the region's
+    /// top-left: the stitched image starts with the region, so they keep
+    /// their place on its content however far it's scrolled.
+    shapes: Vec<Shape>,
     _task: Option<Task<()>>,
 }
 
@@ -106,8 +111,9 @@ fn helper_window_options(bounds: Bounds<gpui::Pixels>, display: gpui::DisplayId,
 }
 
 /// Starts a scrolling capture of `rect` (image pixels of `display`, whose full
-/// size in image pixels is `screen`).
-pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, cx: &mut App) -> anyhow::Result<()> {
+/// size in image pixels is `screen`), keeping `shapes` (annotations relative
+/// to `rect`) on the result.
+pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: Vec<Shape>, cx: &mut App) -> anyhow::Result<()> {
     let platform = bluesnap_platform::native();
     let gpui_display = cx
         .displays()
@@ -158,7 +164,7 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, cx: &mut
     let frame_handle: AnyWindowHandle = frame.into();
     let bar = cx.open_window(
         helper_window_options(logical_bounds(origin, bar_rect, scale), gpui_display.id(), false),
-        |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), rect, frame_handle, cx)),
+        |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), rect, frame_handle, shapes, cx)),
     )?;
     bar.update(cx, |this, window, _| {
         if let Err(e) = platform.place_floating_window(window, &this.display, bar_rect, None) {
@@ -173,7 +179,7 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, cx: &mut
 }
 
 impl ScrollingCapture {
-    fn new(display: DisplayInfo, rect: PixelRect, frame: AnyWindowHandle, cx: &mut Context<Self>) -> Self {
+    fn new(display: DisplayInfo, rect: PixelRect, frame: AnyWindowHandle, shapes: Vec<Shape>, cx: &mut Context<Self>) -> Self {
         let stitcher = Arc::new(Mutex::new(None));
         let task = cx.spawn({
             let (display, stitcher) = (display.clone(), stitcher.clone());
@@ -202,6 +208,7 @@ impl ScrollingCapture {
             height: 0,
             frame,
             bar: None,
+            shapes,
             _task: Some(task),
         }
     }
@@ -246,10 +253,26 @@ impl ScrollingCapture {
         image
     }
 
-    /// Ends the session; `Copy` and `Save` deliver the stitched image.
+    /// Ends the session; `Copy` and `Save` deliver the stitched image, with
+    /// the annotations drawn on it.
     pub fn finish(&mut self, how: Finish, cx: &mut Context<Self>) {
         let image = self.stop(cx);
-        output::deliver(how, if how == Finish::Cancel { None } else { image }, cx);
+        let image = match how {
+            Finish::Cancel => None,
+            _ => image.map(|image| self.annotate(image, cx)),
+        };
+        output::deliver(how, image, cx);
+    }
+
+    /// `image` with the carried-over annotations drawn on it.
+    fn annotate(&self, image: bluesnap_core::Pixmap, cx: &App) -> bluesnap_core::Pixmap {
+        if self.shapes.is_empty() {
+            return image;
+        }
+        let fonts = cx.global::<AppState>().fonts.clone();
+        let doc = bluesnap_core::Document::from_pixmap(image);
+        let m = bluesnap_core::shape::Metrics { scale: self.display.scale_factor, fonts: &fonts };
+        bluesnap_core::render::export(&doc, doc.bounds(), &self.shapes, m).unwrap_or_else(|| doc.image().clone())
     }
 
     /// Ends the session and opens the stitched image in an editor window.
@@ -257,8 +280,10 @@ impl ScrollingCapture {
         let Some(image) = self.stop(cx) else { return log::warn!("scrolling capture produced no image") };
         let (scale, id) = (self.display.scale_factor, self.display.id);
         let display = cx.displays().into_iter().find(|d| u32::from(d.id()) == id).map(|d| d.id());
+        // Still editable there.
+        let shapes = std::mem::take(&mut self.shapes);
         cx.defer(move |cx| {
-            if let Err(e) = document::open(image, scale, display, cx) {
+            if let Err(e) = document::open(image, scale, display, shapes, cx) {
                 log::error!("could not open the editor: {e:#}");
             }
         });

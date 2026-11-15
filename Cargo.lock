@@ -841,6 +841,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "criterion",
+ "memmap2",
  "tiny-skia 0.12.0",
 ]
 

@@ -278,8 +278,9 @@ impl EditorView {
         output::deliver(how, image, cx);
     }
 
-    /// Closes the overlay and starts capturing the selection while the user scrolls.
-    /// Annotations aren't carried over: the result is assembled from live frames.
+    /// Closes the overlay and starts capturing the selection while the user
+    /// scrolls. Annotations come along: the result starts with the selection,
+    /// so they stay on the content they were made on.
     fn start_scrolling_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Surface::Capture { display, .. } = &self.surface else { return };
         let Some(sel) = self.editor.selection() else { return };
@@ -287,9 +288,10 @@ impl EditorView {
         let rect = bluesnap_platform::PixelRect { x: sel.x as i32, y: sel.y as i32, width: sel.w as i32, height: sel.h as i32 };
         let screen = self.editor.screen();
         let (display, screen) = (display.clone(), (screen.w as i32, screen.h as i32));
+        let shapes = self.editor.shapes_in_selection();
         self.finish(Finish::Cancel, window, cx);
         cx.defer(move |cx| {
-            if let Err(e) = crate::scrolling::start(display, screen, rect, cx) {
+            if let Err(e) = crate::scrolling::start(display, screen, rect, shapes, cx) {
                 log::error!("could not start scrolling capture: {e:#}");
             }
         });
@@ -467,45 +469,92 @@ impl EditorView {
         }
         let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
         let origin = bluesnap_core::Point::new(sel.round().x, sel.round().y);
-        let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
         let fonts = cx.global::<AppState>().fonts.clone();
         self.show_toast(Toast::new(toast::Kind::Busy, "Reading the text…"), window, cx);
         let started = std::time::Instant::now();
         self.auto = Some(cx.spawn_in(window, async move |this, cx| {
-            let recognized = cx
-                .background_executor()
-                .spawn(async move { bluesnap_platform::native().recognize_text(width, height, &rgba) })
-                .await;
-            let lines: Vec<(PxRect, String)> = match recognized {
-                Ok(lines) => lines
-                    .into_iter()
-                    .map(|l| {
-                        let b = l.bounds;
-                        (PxRect::new(b.x as f32, b.y as f32, b.width as f32, b.height as f32), l.text)
-                    })
-                    .collect(),
-                Err(e) => {
-                    log::error!("auto redact: text recognition failed: {e:#}");
-                    let toast = Toast::new(toast::Kind::Error, "Couldn't read the text").detail(short_error(&e));
-                    this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
-                    return;
+            // Tall images (scrolling screenshots) are read in bands: memory
+            // stays bounded, the toast shows progress, and each band's text is
+            // checked by the AI while the next band is being read.
+            let image = Arc::new(pixmap);
+            let bands = bluesnap_core::reading_order::bands(image.height(), 1200, 64);
+            let mut checks = Vec::new();
+            let mut count = 0;
+            for (i, (read, own)) in bands.iter().cloned().enumerate() {
+                if bands.len() > 1 {
+                    let progress = Toast::new(toast::Kind::Busy, format!("Reading the text… {} of {}", i + 1, bands.len()));
+                    this.update_in(cx, |this, window, cx| this.show_toast(progress, window, cx)).ok();
                 }
-            };
-            if lines.is_empty() {
+                let band = image.clone();
+                let recognized = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let part = bluesnap_core::pixels::crop(&band, 0, read.start, band.width(), read.end - read.start)
+                            .ok_or_else(|| anyhow::anyhow!("empty band"))?;
+                        bluesnap_platform::native().recognize_text(part.width(), part.height(), &to_rgba_straight(&part))
+                    })
+                    .await;
+                let lines: Vec<(PxRect, String)> = match recognized {
+                    Ok(lines) => lines
+                        .into_iter()
+                        .map(|l| {
+                            let b = l.bounds;
+                            (PxRect::new(b.x as f32, b.y as f32 + read.start as f32, b.width as f32, b.height as f32), l.text)
+                        })
+                        // A line read twice in an overlap belongs to one band.
+                        .filter(|(r, _)| own.contains(&(r.center().y.max(0.0) as u32)))
+                        .collect(),
+                    Err(e) => {
+                        log::error!("auto redact: text recognition failed: {e:#}");
+                        let toast = Toast::new(toast::Kind::Error, "Couldn't read the text").detail(short_error(&e));
+                        this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
+                        return;
+                    }
+                };
+                if lines.is_empty() {
+                    continue;
+                }
+                count += lines.len();
+                let (settings, image, fonts) = (settings.clone(), image.clone(), fonts.clone());
+                checks.push(cx.background_executor().spawn(async move {
+                    bluesnap_ai::locate_sensitive(&settings, &image, &lines, fonts.sans())
+                }));
+            }
+            if count == 0 {
                 let toast = Toast::new(toast::Kind::Info, "No text found").detail("There's nothing to redact in the selection.");
                 this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
                 return;
             }
             let ocr_time = started.elapsed();
-            let checking = Toast::new(toast::Kind::Busy, format!("Checking {} with AI…", plural(lines.len(), "line")))
+            let checking = Toast::new(toast::Kind::Busy, format!("Checking {} with AI…", plural(count, "line")))
                 .detail(format!("Sending the text, not the image, to {}", hosts(&settings)));
             this.update_in(cx, |this, window, cx| this.show_toast(checking, window, cx)).ok();
 
-            let count = lines.len();
-            let found = cx
-                .background_executor()
-                .spawn(async move { bluesnap_ai::locate_sensitive(&settings, &pixmap, &lines, fonts.sans()) })
-                .await;
+            // All bands' results, or the first error if every band failed.
+            let mut found: anyhow::Result<(Vec<PxRect>, bluesnap_ai::Report)> = Ok((Vec::new(), bluesnap_ai::Report::default()));
+            let mut errors = Vec::new();
+            for check in checks {
+                match (check.await, &mut found) {
+                    (Ok((rects, report)), Ok((all, total))) => {
+                        all.extend(rects);
+                        total.failed += report.failed;
+                        total.requests += report.requests;
+                        total.first_error = total.first_error.take().or(report.first_error);
+                    }
+                    (Err(e), _) => errors.push(e),
+                    _ => {}
+                }
+            }
+            if let Some(e) = errors.into_iter().next() {
+                match &mut found {
+                    // Some bands failed entirely: count them as failed requests.
+                    Ok((all, total)) if !all.is_empty() || total.requests > 0 => {
+                        total.failed += 1;
+                        total.first_error = total.first_error.take().or(Some(format!("{e:#}")));
+                    }
+                    _ => found = Err(e),
+                }
+            }
             log::info!("auto redact: {count} lines, OCR {ocr_time:?}, total {:?}", started.elapsed());
             this.update_in(cx, |this, window, cx| {
                 let toast = match found {
@@ -680,9 +729,8 @@ impl EditorView {
                 .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
             text_frame: e.text_frame().map(|r| v.to_window(r)),
             brush_ring: e.brush_ring().map(|b| {
-                let r = px(b.radius * v.zoom);
-                // The highlighter's tip: corners rounded by a quarter of its width.
-                (v.point_to_window(b.center), r, if b.square { r / 2. } else { r })
+                let z = |d: f32| px(d * v.zoom);
+                (v.point_to_window(b.center), size(z(b.half_width), z(b.half_height)), z(b.corner))
             }),
             caret: e.text_caret_rect().map(|r| {
                 let color = e.text_ink().unwrap_or(THEME_BLUE);
@@ -791,7 +839,16 @@ impl Render for EditorView {
                     let b = self.viewport.to_window(sel).intersect(&full);
                     (f32::from(b.center().x), f32::from(b.origin.y) + 12.0)
                 }
-                _ => (f32::from(win.width) / 2.0, self.top_bar + 8.0),
+                _ => {
+                    // Under the toolbar and the style bar, which wraps below
+                    // it in a narrow window.
+                    let (_, style_at) = self.panel_positions(window);
+                    let style_bottom = match (style_at, self.editor.current_style()) {
+                        (Some(at), Some((tool, _))) => at.y + toolbar::style_bar_size(tool, true).1,
+                        _ => 0.0,
+                    };
+                    (f32::from(win.width) / 2.0, self.top_bar.max(style_bottom) + 8.0)
+                }
             };
             let entity = cx.entity();
             let close = cx.entity();
@@ -864,8 +921,8 @@ struct Scene {
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
-    /// A brush's outline at the pointer: center, half width, corner radius.
-    brush_ring: Option<(Point<Pixels>, Pixels, Pixels)>,
+    /// A brush's outline at the pointer: center, half size, corner radius.
+    brush_ring: Option<(Point<Pixels>, gpui::Size<Pixels>, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
     cursor: CursorStyle,
     editing_text: bool,
@@ -906,8 +963,8 @@ impl Scene {
         }
 
         // Over the canvas only, not over the panels.
-        if let Some((center, r, corner)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
-            let ring = Bounds::centered_at(center, size(r * 2., r * 2.));
+        if let Some((center, half, corner)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
+            let ring = Bounds::centered_at(center, size(half.width * 2., half.height * 2.));
             // A white ring between two dark ones shows on any background.
             window.paint_quad(quad(ring.dilate(px(1.)), corner + px(1.), transparent_black(), px(3.5), rgba(0x0000_0059), BorderStyle::Solid));
             window.paint_quad(quad(ring, corner, transparent_black(), px(1.5), white(), BorderStyle::Solid));

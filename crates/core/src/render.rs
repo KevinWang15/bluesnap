@@ -26,8 +26,12 @@ pub struct Document {
 impl Document {
     /// Wraps opaque RGBA8 pixels. Returns `None` if `rgba` does not match the size.
     pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
-        let image = pixmap_from_rgba(width, height, rgba)?;
-        Some(Self { image, effects: EffectCache::default() })
+        Some(Self::from_pixmap(pixmap_from_rgba(width, height, rgba)?))
+    }
+
+    /// Wraps an opaque image.
+    pub fn from_pixmap(image: Pixmap) -> Self {
+        Self { image, effects: EffectCache::default() }
     }
 
     pub fn width(&self) -> u32 {
@@ -376,70 +380,107 @@ fn rounded_rect(r: Rect, radius: f32) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// A highlighter stroke: a chisel tip, so the ends are rounded rectangles
-/// rather than round caps. The stroke and its ends are combined in a mask and
-/// painted once, so overlaps (and crossings) don't get darker.
+/// A highlighter stroke: an upright chisel nib (see [`highlighter_nib`])
+/// swept along the points, so horizontal strokes are full height and vertical
+/// ones narrow, like a real highlighter. Each segment's sweep is the convex
+/// hull of the nib at its ends; all hulls go in one path filled with the
+/// nonzero rule, so the union is painted once and overlaps don't darken.
 fn draw_highlight(pixmap: &mut Pixmap, pts: &[Point], w: f32, color: Color, ts: Transform) {
-    let Some(path) = smooth_path(pts) else { return };
-    let outline = Stroke { width: w, line_cap: LineCap::Butt, line_join: LineJoin::Round, ..Stroke::default() };
-    let Some(body) = path.stroke(&outline, 1.0) else { return };
-    let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else { return };
-    mask.fill_path(&body, FillRule::Winding, true, ts);
-    for cap in highlight_caps(pts, w) {
-        mask.fill_path(&cap, FillRule::Winding, true, ts);
-    }
-    let paint = solid(Color { a: HIGHLIGHT_ALPHA, ..color });
-    let all = tiny_skia::Rect::from_xywh(0.0, 0.0, pixmap.width() as f32, pixmap.height() as f32).expect("non-empty");
-    pixmap.fill_rect(all, &paint, Transform::identity(), Some(&mask));
-}
-
-/// Rounded-rectangle ends for a highlighter stroke `w` wide through `pts`:
-/// squares around each end, turned along the stroke, extending w/2 past it.
-fn highlight_caps(pts: &[Point], w: f32) -> Vec<tiny_skia::Path> {
-    let (Some(&first), Some(&last)) = (pts.first(), pts.last()) else { return Vec::new() };
-    // The stroke's direction at an end, from a point far enough in to be stable.
-    let along = |end: Point, inward: &mut dyn Iterator<Item = Point>| {
-        let mut other = None;
-        for p in inward {
-            other = Some(p);
-            if p.distance(end) >= w * 0.5 {
-                break;
-            }
-        }
-        let v = other.map_or(Point::new(1.0, 0.0), |o| o - end);
-        let len = v.length();
-        if len > 0.0 { Point::new(v.x / len, v.y / len) } else { Point::new(1.0, 0.0) }
-    };
-    let start = along(first, &mut pts.iter().skip(1).copied());
-    let end = along(last, &mut pts.iter().rev().skip(1).copied());
-    [(first, start), (last, end)].into_iter().filter_map(|(c, d)| rounded_square(c, d, w)).collect()
-}
-
-/// A square `w` wide centered on `center`, turned to the unit direction `d`,
-/// with corners rounded by a quarter of its width.
-fn rounded_square(center: Point, d: Point, w: f32) -> Option<tiny_skia::Path> {
-    let (h, r) = (w / 2.0, w * 0.25);
-    // Corners in the square's own frame (u along `d`, v across), in order.
-    let corners = [Point::new(h, -h), Point::new(h, h), Point::new(-h, h), Point::new(-h, -h)];
-    let world = |p: Point| (center.x + d.x * p.x - d.y * p.y, center.y + d.y * p.x + d.x * p.y);
-    let toward = |a: Point, b: Point| {
-        let v = b - a;
-        let len = v.length();
-        Point::new(a.x + v.x / len * r, a.y + v.y / len * r)
-    };
+    let Some(&first) = pts.first() else { return };
+    let nib = nib_outline(w);
+    let at = |c: Point| nib.iter().map(move |o| Point::new(c.x + o.x, c.y + o.y));
     let mut pb = PathBuilder::new();
-    let (x, y) = world(toward(corners[0], corners[3]));
-    pb.move_to(x, y);
-    for i in 0..4 {
-        let (c, next) = (corners[i], corners[(i + 1) % 4]);
-        let ((cx, cy), (ax, ay)) = (world(c), world(toward(c, next)));
-        pb.quad_to(cx, cy, ax, ay);
-        let (bx, by) = world(toward(next, c));
-        pb.line_to(bx, by);
+    let mut add = |points: Vec<Point>| {
+        let hull = convex_hull(points);
+        if let Some((p0, rest)) = hull.split_first() {
+            pb.move_to(p0.x, p0.y);
+            for p in rest {
+                pb.line_to(p.x, p.y);
+            }
+            pb.close();
+        }
+    };
+    add(at(first).collect());
+    // Pointer samples are mostly collinear runs: sweeping fewer segments looks
+    // the same (to a third of a pixel) and keeps long strokes fast.
+    for pair in simplify(pts, 0.3).windows(2) {
+        add(at(pair[0]).chain(at(pair[1])).collect());
     }
-    pb.close();
-    pb.finish()
+    if let Some(path) = pb.finish() {
+        pixmap.fill_path(&path, &solid(Color { a: HIGHLIGHT_ALPHA, ..color }), FillRule::Winding, ts, None);
+    }
 }
+
+/// The highlighter's nib for a stroke `w` high: half width, half height and
+/// corner radius. Narrower than tall, like a chisel tip.
+pub fn highlighter_nib(w: f32) -> (f32, f32, f32) {
+    let width = w * 0.45;
+    (width / 2.0, w / 2.0, width * 0.35)
+}
+
+/// The nib's rounded-rectangle outline around (0, 0), as a polygon.
+fn nib_outline(w: f32) -> Vec<Point> {
+    let (hw, hh, r) = highlighter_nib(w);
+    let mut out = Vec::new();
+    // Each corner's arc (a few pixels) in 3 steps, clockwise from top-right.
+    for (cx, cy, start) in [(hw - r, -hh + r, -90.0f32), (hw - r, hh - r, 0.0), (-hw + r, hh - r, 90.0), (-hw + r, -hh + r, 180.0)] {
+        for step in 0..=3 {
+            let a = (start + step as f32 * 30.0).to_radians();
+            out.push(Point::new(cx + r * a.cos(), cy + r * a.sin()));
+        }
+    }
+    out
+}
+
+/// `pts` with points dropped where the line through their neighbors stays
+/// within `tolerance` of them (Ramer–Douglas–Peucker). Keeps both ends.
+fn simplify(pts: &[Point], tolerance: f32) -> Vec<Point> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    let (first, last) = (0, pts.len() - 1);
+    keep[first] = true;
+    keep[last] = true;
+    let mut spans = vec![(first, last)];
+    while let Some((a, b)) = spans.pop() {
+        let far = (a + 1..b)
+            .map(|i| (i, crate::geom::distance_to_segment(pts[i], pts[a], pts[b])))
+            .max_by(|x, y| x.1.total_cmp(&y.1));
+        if let Some((i, d)) = far
+            && d > tolerance
+        {
+            keep[i] = true;
+            spans.push((a, i));
+            spans.push((i, b));
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
+}
+
+/// The convex hull of `points` (Andrew's monotone chain), counter-clockwise.
+fn convex_hull(mut points: Vec<Point>) -> Vec<Point> {
+    points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    points.dedup();
+    if points.len() < 3 {
+        return points;
+    }
+    let cross = |o: Point, a: Point, b: Point| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let mut hull: Vec<Point> = Vec::with_capacity(points.len() * 2);
+    for pass in [false, true] {
+        let start = hull.len();
+        let ordered: Box<dyn Iterator<Item = &Point>> = if pass { Box::new(points.iter().rev()) } else { Box::new(points.iter()) };
+        for &p in ordered {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
+}
+
 
 /// A filled circle (or pill, for long labels) with the label centered on it.
 fn draw_counter(pixmap: &mut Pixmap, center: Point, label: &str, diameter: f32, color: Color, fonts: &FontSet, ts: Transform) {
@@ -596,20 +637,31 @@ mod tests {
     }
 
     #[test]
-    fn highlighter_ends_are_rounded_rectangles() {
-        let d = doc(200, 100);
+    fn simplify_drops_collinear_points_only() {
+        let line: Vec<Point> = (0..100).map(|i| Point::new(i as f32, 0.0)).collect();
+        assert_eq!(simplify(&line, 0.3), vec![Point::new(0.0, 0.0), Point::new(99.0, 0.0)]);
+        let corner = [(0.0, 0.0), (5.0, 0.1), (10.0, 0.0), (10.0, 10.0)].map(|(x, y)| Point::new(x, y)).to_vec();
+        assert_eq!(simplify(&corner, 0.3), vec![corner[0], corner[2], corner[3]]);
+    }
+
+    #[test]
+    fn highlighter_nib_is_narrower_than_tall() {
+        let d = doc(200, 200);
         let fonts = crate::text::Fonts::empty();
         let m = Metrics { scale: 1.0, fonts: &fonts };
-        // Large: 30 px wide, horizontal from x 140 to 180 at y 50 (on the white half).
-        let pts = vec![Point::new(140.0, 50.0), Point::new(180.0, 50.0)];
-        let shapes = [Shape { geometry: Geometry::Highlight(pts), style: Style { size: SizeLevel::Large, ..Tool::Highlighter.default_style() } }];
-        let out = export(&d, d.bounds(), &shapes, m).unwrap();
-        let tinted = |x, y| out.pixel(x, y).unwrap().blue() < 200;
-        // Past the end by up to 15 px, the full height is covered near the axis
-        // and near the edges (a round cap would leave (191, 37) bare)…
-        assert!(tinted(192, 50) && tinted(191, 37) && tinted(191, 63));
-        // …but the very corner is rounded off, and nothing reaches past w/2.
-        assert!(!tinted(194, 35) && !tinted(196, 50));
+        let stroke = |pts: Vec<Point>| {
+            let shapes = [Shape { geometry: Geometry::Highlight(pts), style: Style { size: SizeLevel::Large, ..Tool::Highlighter.default_style() } }];
+            export(&d, d.bounds(), &shapes, m).unwrap()
+        };
+        let tinted = |p: &Pixmap, x, y| p.pixel(x, y).unwrap().blue() < 200;
+        // Large: a nib 30 px tall and 13.5 px wide.
+        let across = stroke(vec![Point::new(120.0, 100.0), Point::new(170.0, 100.0)]);
+        assert!(tinted(&across, 145, 86) && tinted(&across, 145, 114), "a horizontal stroke is full height");
+        assert!(tinted(&across, 175, 100) && !tinted(&across, 179, 100), "and ends half a nib width past its end");
+        let down = stroke(vec![Point::new(150.0, 60.0), Point::new(150.0, 140.0)]);
+        assert!(tinted(&down, 144, 100) && !tinted(&down, 159, 100), "a vertical stroke is a nib width wide");
+        // Rounded corners: the nib's very corner is left out.
+        assert!(!tinted(&across, 176, 86));
     }
 
     #[test]

@@ -36,9 +36,44 @@ pub fn join_lines(lines: Vec<(Rect, String)>) -> String {
         .join("\n")
 }
 
+/// Horizontal bands to recognize a tall image in, `size` rows each,
+/// overlapping by `overlap` rows so no text line is cut in every band that
+/// holds it. Each band is (rows to read, rows it owns): a line belongs to the
+/// band owning its center, so lines in an overlap are kept once.
+pub fn bands(height: u32, size: u32, overlap: u32) -> Vec<(std::ops::Range<u32>, std::ops::Range<u32>)> {
+    let step = size.saturating_sub(overlap).max(1);
+    if height <= size {
+        return vec![(0..height, 0..height)];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < height {
+        let read = start..(start + size).min(height);
+        let own_start = if start == 0 { 0 } else { start + overlap / 2 };
+        let own_end = if read.end == height { height } else { read.end - overlap / 2 };
+        out.push((read.clone(), own_start..own_end));
+        if read.end == height {
+            break;
+        }
+        start += step;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bands_cover_tall_images_with_owned_rows_once() {
+        assert_eq!(bands(900, 1200, 64), vec![(0..900, 0..900)]);
+        let b = bands(3000, 1200, 64);
+        // Reads overlap; owned rows tile the image exactly.
+        assert_eq!(b[0], (0..1200, 0..1168));
+        assert_eq!(b[1].0, 1136..2336);
+        assert!(b.windows(2).all(|w| w[0].1.end == w[1].1.start));
+        assert_eq!((b[0].1.start, b.last().unwrap().1.end, b.last().unwrap().0.end), (0, 3000, 3000));
+    }
 
     fn line(x: f32, y: f32, text: &str) -> (Rect, String) {
         (Rect::new(x, y, 100.0, 20.0), text.to_string())

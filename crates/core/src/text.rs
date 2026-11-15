@@ -3,9 +3,11 @@
 //! Text is rasterized by the same CPU renderer for the live preview and for the
 //! exported image, so what the user sees is exactly what gets copied or saved.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
-use ab_glyph::{Font, FontVec, GlyphId, OutlineCurve, ScaleFont, VariableFont};
+use ab_glyph::{Font, FontArc, FontRef, GlyphId, OutlineCurve, ScaleFont, VariableFont};
 use tiny_skia::{Path as SkPath, PathBuilder};
 
 use crate::geom::{Point, Rect};
@@ -60,22 +62,55 @@ impl FontSource {
         self
     }
 
-    fn load(&self) -> Option<FontVec> {
-        let data = match &self.data {
-            FontData::File(path) => std::fs::read(path).ok()?,
-            FontData::Static(bytes) => bytes.to_vec(),
+    /// The font, shared with every other set that lists the same source:
+    /// fallback fonts (CJK faces of 20–50 MB) appear in each family's list.
+    fn load(&self) -> Option<FontArc> {
+        type Key = (String, u32, Option<u32>);
+        static LOADED: OnceLock<Mutex<HashMap<Key, Option<FontArc>>>> = OnceLock::new();
+        let id = match &self.data {
+            FontData::File(path) => path.display().to_string(),
+            FontData::Static(bytes) => format!("static:{:p}", bytes.as_ptr()),
         };
-        let mut font = FontVec::try_from_vec_and_index(data, self.index).ok()?;
-        if let Some(weight) = self.weight {
-            font.set_variation(b"wght", weight);
-        }
-        Some(font)
+        let key = (id, self.index, self.weight.map(f32::to_bits));
+        let mut loaded = LOADED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        loaded
+            .entry(key)
+            .or_insert_with(|| {
+                let bytes = match &self.data {
+                    FontData::File(path) => mapped(path)?,
+                    FontData::Static(bytes) => bytes,
+                };
+                let mut font = FontRef::try_from_slice_and_index(bytes, self.index).ok()?;
+                if let Some(weight) = self.weight {
+                    font.set_variation(b"wght", weight);
+                }
+                Some(FontArc::new(font))
+            })
+            .clone()
     }
+}
+
+/// `path` mapped into memory for the rest of the process. Fonts are read
+/// lazily this way: only the glyphs used are paged in, and those pages are
+/// shared with every other app using the font, instead of a private copy of
+/// every fallback font. Each file is mapped once.
+fn mapped(path: &Path) -> Option<&'static [u8]> {
+    /// Mapped files by path; `None` for files that couldn't be mapped.
+    type Maps = Mutex<HashMap<PathBuf, Option<&'static [u8]>>>;
+    static MAPS: OnceLock<Maps> = OnceLock::new();
+    let mut maps = MAPS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    *maps.entry(path.to_path_buf()).or_insert_with(|| {
+        let file = std::fs::File::open(path).ok()?;
+        // SAFETY: system and app font files aren't modified while in use; if
+        // one were, glyphs could render wrongly, but the mapping stays valid.
+        let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+        Some(&**Box::leak(Box::new(map)))
+    })
 }
 
 /// A primary font plus fallbacks, consulted per character in order.
 pub struct FontSet {
-    fonts: Vec<FontVec>,
+    fonts: Vec<FontArc>,
 }
 
 impl FontSet {
@@ -110,7 +145,7 @@ impl FontSet {
     }
 
     /// Scale such that one em equals `size` pixels.
-    fn px_scale(font: &FontVec, size: f32) -> ab_glyph::PxScale {
+    fn px_scale(font: &FontArc, size: f32) -> ab_glyph::PxScale {
         let upem = font.units_per_em().unwrap_or(1000.0);
         ab_glyph::PxScale::from(size * font.height_unscaled() / upem)
     }

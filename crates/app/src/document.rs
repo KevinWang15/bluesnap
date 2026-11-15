@@ -3,6 +3,7 @@
 
 use anyhow::Context as _;
 use bluesnap_core::pixels::swap_red_blue;
+use bluesnap_core::shape::Shape;
 use bluesnap_core::{Document, Editor, Pixmap};
 use gpui::{App, AppContext, Bounds, DisplayId, TitlebarOptions, WindowBounds, WindowKind, WindowOptions, px, size};
 
@@ -14,15 +15,16 @@ use crate::gpu_image::ImageTiles;
 const CHROME: (f32, f32) = (32.0, 96.0);
 
 /// Opens an editor window for `image`, an opaque screenshot whose pixels are
-/// `scale` times its logical size, on `display` (else the primary display).
-pub fn open(image: Pixmap, scale: f32, display: Option<DisplayId>, cx: &mut App) -> anyhow::Result<()> {
+/// `scale` times its logical size, on `display` (else the primary display),
+/// with `shapes` (annotations carried over) already on it.
+pub fn open(image: Pixmap, scale: f32, display: Option<DisplayId>, shapes: Vec<Shape>, cx: &mut App) -> anyhow::Result<()> {
     let (width, height) = (image.width(), image.height());
     // Opaque, so premultiplied and straight alpha are the same bytes.
     let rgba = image.take();
     let tiles = ImageTiles::from_bgra(width, height, swap_red_blue(&rgba)).context("bad image")?;
     let doc = Document::from_rgba(width, height, rgba).context("bad image")?;
     let fonts = cx.global::<AppState>().fonts.clone();
-    let editor = Editor::for_document(doc, fonts, scale);
+    let editor = Editor::for_document(doc, fonts, scale).with_shapes(shapes);
 
     // Big enough to show the image at its native size, within 85% of the display.
     let screen = display

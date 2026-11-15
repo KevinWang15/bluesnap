@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::render::{swap_red_blue, to_bgra_straight};
-use bluesnap_core::{Fonts, Document, Editor, FontSet, Point, RedactArea, RedactEffect, Rect, Tool};
+use bluesnap_core::{Document, Editor, FontSet, Fonts, Point, RedactArea, RedactEffect, Rect, TextStyle, Tool};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const W4K: u32 = 3840;
@@ -259,5 +259,82 @@ fn redaction(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, startup, frames, output, redaction);
+/// Full-screen selection with 4 of each newer annotation kind too: highlights,
+/// counters and text in each style.
+fn annotated_all(w: u32, h: u32) -> Editor {
+    let mut e = annotated(w, h);
+    for i in 0..4 {
+        let y = 300.0 + i as f32 * 400.0;
+        e.toggle_tool(Tool::Highlighter);
+        let mut x = 200.0;
+        e.pointer_down(Point::new(x, y));
+        while x < 1400.0 {
+            x += 4.0;
+            e.pointer_move(Point::new(x, y + (x / 40.0).sin() * 20.0), false);
+        }
+        e.pointer_up(Point::new(x, y));
+        e.toggle_tool(Tool::Highlighter);
+        e.toggle_tool(Tool::Counter);
+        e.pointer_down(Point::new(1600.0 + i as f32 * 80.0, y));
+        e.pointer_up(Point::new(1600.0 + i as f32 * 80.0, y));
+        e.toggle_tool(Tool::Counter);
+    }
+    for (i, style) in TextStyle::ALL.into_iter().enumerate() {
+        e.toggle_tool(Tool::Text);
+        e.set_text_style(style);
+        e.pointer_down(Point::new(2200.0, 200.0 + i as f32 * 120.0));
+        e.text_replace(None, "Deploy key: 7HQK-2M9X 部署", false, None);
+        e.finish_text();
+        e.toggle_tool(Tool::Text);
+    }
+    e
+}
+
+fn tools(c: &mut Criterion) {
+    let mut g = c.benchmark_group("tools");
+    // Committing a shape or changing the selection re-renders every other
+    // annotation (now 55 of every kind) into the static layer.
+    let e = annotated_all(W4K, H4K);
+    g.bench_function("static_layer/4k_55_mixed", |b| b.iter(|| black_box(present(&e))));
+    g.bench_function("export/4k_55_mixed", |b| {
+        let mut e = annotated_all(W4K, H4K);
+        b.iter(|| black_box(e.export()))
+    });
+    // One mouse move at the end of a long highlighter stroke (600 samples):
+    // the stroke is re-swept every frame.
+    g.bench_function("highlighter_drag/600_point_stroke", |b| {
+        let mut e = annotated(W4K, H4K);
+        e.toggle_tool(Tool::Highlighter);
+        // Start in the gap between the annotations' columns, so the press draws.
+        e.pointer_down(Point::new(550.0, 1000.0));
+        for i in 0..600 {
+            e.pointer_move(Point::new(550.0 + i as f32 * 4.5, 1000.0 + (i as f32 / 20.0).sin() * 200.0), false);
+        }
+        let mut presenter = Presenter::default();
+        presenter.present(&e);
+        let mut i = 0;
+        b.iter(|| {
+            i += 1;
+            e.pointer_move(Point::new(3200.0 + (i % 2) as f32 * 3.0, 1000.0), false);
+            black_box(presenter.present(&e))
+        });
+    });
+    g.bench_function("type_boxed_text/4k_55_mixed", |b| {
+        let mut e = annotated_all(W4K, H4K);
+        e.toggle_tool(Tool::Text);
+        e.set_text_style(TextStyle::RoundedBoxed);
+        e.pointer_down(Point::new(1200.0, 2050.0));
+        assert!(e.is_editing_text());
+        let mut presenter = Presenter::default();
+        presenter.present(&e);
+        b.iter(|| {
+            e.text_replace(None, "a", false, None);
+            black_box(presenter.present(&e))
+        });
+    });
+    g.finish();
+
+}
+
+criterion_group!(benches, startup, frames, output, redaction, tools);
 criterion_main!(benches);

@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 ab_glyph = "0.2"
+# Font files are mapped rather than read: see `text::mapped`.
+memmap2 = "0.9"
 tiny-skia = "0.12"
 
 [dev-dependencies]
