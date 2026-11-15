@@ -1,6 +1,12 @@
 //! Scrolling screenshots: stitches frames of a scrolling region into one tall image.
 //!
-//! Frames are hashed in narrow column strips per row. For each new frame:
+//! Frames are reduced to cells: the average brightness of each row of each
+//! narrow column strip. Matching compares cells with a tolerance, after a
+//! little vertical smoothing, because apps often redraw scrolled content at
+//! fractional pixel offsets (display scaling, trackpads), so frames are rarely
+//! exact shifted copies. The stitched image is still built from the real pixels.
+//!
+//! For each new frame:
 //!
 //! - strips identical at the same position in both frames are fixed content
 //!   (side panels, margins); the scrolling area is the span between them;
@@ -22,10 +28,25 @@ use crate::pixels::pixmap_from_rgba;
 const STRIP: usize = 8;
 /// Rows of overlap needed to trust a match.
 const MIN_OVERLAP: usize = 24;
-/// Distinct (non-uniform) rows that must match for a shift to be accepted.
+/// Distinct (non-uniform) rows needed as evidence for a shift.
 const MIN_MATCHING_ROWS: usize = 8;
-/// Share of distinct overlapping rows allowed to differ (animations, carets).
-const MAX_MISMATCH: f32 = 0.05;
+/// Cells at the same position this close (brightness levels) are unchanged.
+const SAME_CELL: u8 = 3;
+/// Cells whose brightness spans at most this are a single color.
+const FLAT_CELL: u8 = 6;
+/// Average smoothed-cell difference above which two rows don't match.
+const ROW_TOL: f32 = 14.0;
+/// Share of distinct overlapping rows allowed not to match (animations, carets).
+const MAX_BAD_ROWS: f32 = 0.10;
+/// Average row difference over the overlap that a shift must stay below.
+const AVG_TOL: f32 = 5.0;
+/// A candidate shift is abandoned once its average over at least this many
+/// distinct rows exceeds `AVG_TOL` by `HOPELESS` times: wrong shifts average
+/// far above it, so this rejects them after a few dozen rows.
+const EARLY_ROWS: usize = 32;
+const HOPELESS: f32 = 2.5;
+/// Smoothed cells further apart than this don't follow the shift (scrollbars).
+const NOISY_CELL: u8 = 8;
 /// The scrolling middle must keep at least this many rows after removing
 /// sticky header and footer.
 const MIN_MIDDLE: usize = 40;
@@ -65,43 +86,91 @@ struct Frame {
     width: usize,
     height: usize,
     strips: usize,
-    /// Hash of every (row, strip) cell, row-major.
-    cells: Vec<u64>,
-    /// The cell's color when the whole cell is one color.
-    flat: Vec<Option<u32>>,
+    /// Average brightness of every (row, strip) cell, row-major.
+    mean: Vec<u8>,
+    /// `mean` smoothed vertically ([1, 2, 1] / 4), for matching across
+    /// sub-pixel offsets.
+    smooth: Vec<u8>,
+    /// Whether the cell is (nearly) a single color.
+    flat: Vec<bool>,
 }
 
 impl Frame {
     fn new(width: usize, rgba: Vec<u8>) -> Self {
         let height = rgba.len() / (width * 4);
         let strips = width.div_ceil(STRIP);
-        let mut cells = Vec::with_capacity(height * strips);
+        let mut mean = Vec::with_capacity(height * strips);
         let mut flat = Vec::with_capacity(height * strips);
         for row in rgba.chunks_exact(width * 4) {
             for cell in row.chunks(STRIP * 4) {
-                cells.push(hash(cell));
+                let (mut sum, mut lo, mut hi) = (0u32, u8::MAX, 0u8);
                 let px = cell.as_chunks::<4>().0;
-                flat.push(px.iter().all(|p| *p == px[0]).then(|| u32::from_le_bytes(px[0])));
+                for p in px {
+                    let l = ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8;
+                    (sum, lo, hi) = (sum + l as u32, lo.min(l), hi.max(l));
+                }
+                mean.push((sum / px.len() as u32) as u8);
+                flat.push(hi - lo <= FLAT_CELL);
             }
         }
-        Self { rgba, width, height, strips, cells, flat }
+        let mut smooth = mean.clone();
+        for r in 0..height {
+            let (up, down) = (r.saturating_sub(1), (r + 1).min(height - 1));
+            for s in 0..strips {
+                let v = mean[up * strips + s] as u16 + 2 * mean[r * strips + s] as u16 + mean[down * strips + s] as u16;
+                smooth[r * strips + s] = ((v + 2) / 4) as u8;
+            }
+        }
+        Self { rgba, width, height, strips, mean, smooth, flat }
     }
 
-    fn cell(&self, row: usize, strip: usize) -> u64 {
-        self.cells[row * self.strips + strip]
+    fn at(&self, row: usize, strip: usize) -> usize {
+        row * self.strips + strip
     }
 
-    /// Per-row hash and uniform flag over `strips`, for `rows`.
-    fn band(&self, strips: &Range<usize>, rows: &Range<usize>) -> (Vec<u64>, Vec<bool>) {
-        rows.clone()
-            .map(|r| {
-                let cells = &self.cells[r * self.strips + strips.start..r * self.strips + strips.end];
-                let flats = &self.flat[r * self.strips + strips.start..r * self.strips + strips.end];
-                let h = cells.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, c| (h ^ c).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(23));
-                let uniform = flats[0].is_some() && flats.iter().all(|f| *f == flats[0]);
-                (h, uniform)
-            })
-            .unzip()
+    /// Whether the cell is unchanged between the frames at the same position.
+    fn same(&self, other: &Frame, row: usize, strip: usize) -> bool {
+        let i = self.at(row, strip);
+        self.mean[i].abs_diff(other.mean[i]) <= SAME_CELL
+    }
+
+    /// Whether `row` is one color across `strips` (matches anywhere).
+    fn uniform(&self, row: usize, strips: &Range<usize>) -> bool {
+        let cells = self.at(row, strips.start)..self.at(row, strips.end);
+        let (lo, hi) = self.mean[cells.clone()].iter().fold((u8::MAX, 0), |(lo, hi), &m| (lo.min(m), hi.max(m)));
+        self.flat[cells].iter().all(|f| *f) && hi - lo <= FLAT_CELL
+    }
+
+    /// Average difference of vertically smoothed cells, without any tolerance for
+    /// sub-pixel offsets: it changes steadily with the offset, so it measures it.
+    fn smooth_distance(&self, row: usize, other: &Frame, other_row: usize, strips: &Range<usize>) -> f32 {
+        let a = &self.smooth[self.at(row, strips.start)..self.at(row, strips.end)];
+        let b = &other.smooth[other.at(other_row, strips.start)..other.at(other_row, strips.end)];
+        a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u32).sum::<u32>() as f32 / strips.len() as f32
+    }
+
+    fn row_cells(&self, row: usize, strips: &Range<usize>) -> &[u8] {
+        &self.mean[self.at(row, strips.start)..self.at(row, strips.end)]
+    }
+
+    /// Average cell difference between our `row` and `other`'s `other_row`,
+    /// allowing for up to half a pixel of extra shift: the row is also compared
+    /// with the blends of `other_row` and each of its neighbors, which is what a
+    /// half-pixel offset produces, and the closest of the three counts.
+    fn row_distance(&self, row: usize, other: &Frame, other_row: usize, strips: &Range<usize>) -> f32 {
+        let (b, a) = (self.row_cells(row, strips), other.row_cells(other_row, strips));
+        let exact: u32 = b.iter().zip(a).map(|(x, y)| x.abs_diff(*y) as u32).sum();
+        let blended = |n: &[u8]| -> u32 {
+            b.iter().zip(a).zip(n).map(|((x, y), z)| (2 * *x as i32 - *y as i32 - *z as i32).unsigned_abs() / 2).sum()
+        };
+        let mut best = exact;
+        if other_row > 0 {
+            best = best.min(blended(other.row_cells(other_row - 1, strips)));
+        }
+        if other_row + 1 < other.height {
+            best = best.min(blended(other.row_cells(other_row + 1, strips)));
+        }
+        best as f32 / strips.len() as f32
     }
 
     /// Pixel columns covered by `strips`.
@@ -114,20 +183,6 @@ impl Frame {
         let stride = self.width * 4;
         rows.flat_map(|r| &self.rgba[r * stride + columns.start * 4..r * stride + columns.end * 4]).copied().collect()
     }
-}
-
-fn hash(bytes: &[u8]) -> u64 {
-    // Fast multiplicative hash over 8-byte words; collisions only cost a
-    // spurious match, which the mismatch threshold tolerates.
-    let mut h = 0x9E37_79B9_7F4A_7C15u64;
-    let (words, rest) = bytes.as_chunks::<8>();
-    for w in words {
-        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(29);
-    }
-    for b in rest {
-        h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01B3);
-    }
-    h
 }
 
 /// Decided at the first scroll.
@@ -151,6 +206,10 @@ pub struct Stitcher {
     /// The frame `body` currently ends with.
     last: Option<Frame>,
     layout: Option<Layout>,
+    /// Content offset of `last` relative to the first frame, in fractional
+    /// pixels. Rows are appended so the body tracks its rounded value, which
+    /// keeps sub-pixel shifts from accumulating into drift.
+    position: f32,
     lost_before_start: u32,
     full: bool,
 }
@@ -163,6 +222,7 @@ impl Stitcher {
             body: Vec::new(),
             last: None,
             layout: None,
+            position: 0.0,
             lost_before_start: 0,
             full: false,
         }
@@ -190,6 +250,7 @@ impl Stitcher {
         self.body = frame.rgba.clone();
         self.last = Some(frame);
         self.layout = None;
+        self.position = 0.0;
         self.lost_before_start = 0;
         Progress::Started
     }
@@ -202,7 +263,7 @@ impl Stitcher {
         if self.full {
             return Progress::Full;
         }
-        if prev.height != cur.height || prev.cells == cur.cells || local_change(prev, &cur) {
+        if prev.height != cur.height || local_change(prev, &cur) {
             return Progress::Unchanged;
         }
         match self.layout.is_some() {
@@ -215,7 +276,7 @@ impl Stitcher {
         let prev = self.last.as_ref().expect("checked by push");
         let n = cur.height;
         let fixed = |s: usize| {
-            let changed = (0..n).filter(|&r| prev.cell(r, s) != cur.cell(r, s)).count();
+            let changed = (0..n).filter(|&r| !prev.same(&cur, r, s)).count();
             changed as f32 <= n as f32 * FIXED_TOLERANCE
         };
         let Some(first) = (0..cur.strips).find(|&s| !fixed(s)) else { return Progress::Unchanged };
@@ -223,7 +284,7 @@ impl Stitcher {
         let mut stored = first..last + 1;
 
         let shift = match estimate_shift(prev, &cur, &stored, &(0..n)) {
-            Some(shift) if shift > 0 => shift as usize,
+            Some(shift) if shift > 0.0 => shift,
             Some(_) => return Progress::ScrolledUp,
             None => {
                 self.lost_before_start += 1;
@@ -241,7 +302,7 @@ impl Stitcher {
         // Blank margins never change either, but belong to the scrolling page,
         // unlike a side panel with content of its own: extend over them.
         let blank = |s: usize| {
-            let flat = middle.clone().filter(|&r| cur.flat[r * cur.strips + s].is_some()).count();
+            let flat = middle.clone().filter(|&r| cur.flat[cur.at(r, s)]).count();
             flat as f32 >= middle.len() as f32 * (1.0 - FIXED_TOLERANCE)
         };
         while stored.start > 0 && blank(stored.start - 1) {
@@ -250,7 +311,7 @@ impl Stitcher {
         while stored.end < cur.strips && blank(stored.end) {
             stored.end += 1;
         }
-        let keep = trim_noisy_edges(prev, &cur, stored.clone(), &middle, shift);
+        let keep = trim_noisy_edges(prev, &cur, stored.clone(), &middle, shift.round() as usize);
 
         // The first frame becomes the start of the body: scrolling span only, and
         // without the footer, which belongs at the very end.
@@ -270,17 +331,21 @@ impl Stitcher {
         let shift = estimate_shift(prev, &cur, &layout.keep, &middle)
             .or_else(|| estimate_shift(prev, &cur, &layout.keep, &(0..n)));
         let shift = match shift {
-            Some(shift) if shift > 0 => shift as usize,
+            Some(shift) if shift > 0.0 => shift,
             Some(_) => return Progress::ScrolledUp,
             None => return Progress::LostTrack,
         };
-        let keep = trim_noisy_edges(prev, &cur, layout.keep.clone(), &middle, shift);
+        let keep = trim_noisy_edges(prev, &cur, layout.keep.clone(), &middle, shift.round() as usize);
         self.layout.as_mut().expect("checked above").keep = keep;
         self.append(cur, shift)
     }
 
-    /// Adds the `shift` newly revealed rows of `cur` above its footer.
-    fn append(&mut self, cur: Frame, shift: usize) -> Progress {
+    /// Adds the rows of `cur` revealed by scrolling `shift` more pixels, above
+    /// its footer.
+    fn append(&mut self, cur: Frame, shift: f32) -> Progress {
+        let new_position = self.position + shift;
+        let shift = (new_position.round() - self.position.round()).max(0.0) as usize;
+        self.position = new_position;
         let layout = self.layout.as_ref().expect("set before appending");
         let columns = cur.columns(&layout.stored);
         let stride = columns.len() * 4;
@@ -319,21 +384,24 @@ impl Stitcher {
     }
 }
 
-/// Whether the frames differ only within one narrow run of strips.
+/// Whether the frames are the same, or differ only within one narrow run of strips.
 fn local_change(prev: &Frame, cur: &Frame) -> bool {
-    let changed = |s: usize| (0..cur.height).any(|r| prev.cell(r, s) != cur.cell(r, s));
+    let changed = |s: usize| {
+        let rows = (0..cur.height).filter(|&r| !prev.same(cur, r, s)).count();
+        rows as f32 > cur.height as f32 * FIXED_TOLERANCE
+    };
     let Some(first) = (0..cur.strips).find(|&s| changed(s)) else { return true };
     let last = (0..cur.strips).rev().find(|&s| changed(s)).expect("found one");
     last - first < MAX_LOCAL_CHANGE && last - first + 1 < cur.strips
 }
 
-/// Rows identical at the same position in both frames over `strips`, from the
+/// Rows unchanged at the same position in both frames over `strips`, from the
 /// top and from the bottom. A few differing strips per row (a scrollbar) are
 /// tolerated.
 fn sticky_bands(prev: &Frame, cur: &Frame, strips: &Range<usize>) -> (usize, usize) {
     let n = cur.height;
     let tolerance = strips.len() / 10;
-    let same = |r: usize| strips.clone().filter(|&s| prev.cell(r, s) != cur.cell(r, s)).count() <= tolerance;
+    let same = |r: usize| strips.clone().filter(|&s| !prev.same(cur, r, s)).count() <= tolerance;
     let top = (0..n).take_while(|&r| same(r)).count();
     let bottom = (0..n).rev().take_while(|&r| same(r)).count();
     // Leave a scrolling middle; if the bands would eat it, assume no sticky parts.
@@ -341,64 +409,136 @@ fn sticky_bands(prev: &Frame, cur: &Frame, strips: &Range<usize>) -> (usize, usi
 }
 
 /// The vertical shift that lines `cur` up with `prev` within `strips` and
-/// `rows`: positive when the content moved up (the user scrolled down). Bands
-/// of strips search independently and vote with their matched rows.
-fn estimate_shift(prev: &Frame, cur: &Frame, strips: &Range<usize>, rows: &Range<usize>) -> Option<i32> {
+/// `rows`, in fractional pixels: positive when the content moved up (the user
+/// scrolled down). Bands of strips search independently and vote, weighted by
+/// their evidence.
+fn estimate_shift(prev: &Frame, cur: &Frame, strips: &Range<usize>, rows: &Range<usize>) -> Option<f32> {
     let bands = (strips.len() / MIN_BAND_STRIPS).clamp(1, MAX_BANDS);
-    let mut votes: Vec<(i32, usize)> = Vec::new();
-    for b in 0..bands {
-        let band = strips.start + strips.len() * b / bands..strips.start + strips.len() * (b + 1) / bands;
-        let (ph, pf) = prev.band(&band, rows);
-        let (ch, cf) = cur.band(&band, rows);
+    let band = |b: usize| strips.start + strips.len() * b / bands..strips.start + strips.len() * (b + 1) / bands;
+    let search = |band: Range<usize>| {
         // Rows that don't move in this band (a header over just this part).
-        let n = ph.len();
-        let mut top = (0..n).take_while(|&i| ph[i] == ch[i]).count();
-        let mut bottom = (0..n).rev().take_while(|&i| ph[i] == ch[i]).count();
-        if top + bottom + MIN_MIDDLE > n {
+        let same = |r: usize| band.clone().all(|s| prev.same(cur, r, s));
+        let mut top = rows.clone().take_while(|&r| same(r)).count();
+        let mut bottom = rows.clone().rev().take_while(|&r| same(r)).count();
+        if top + bottom + MIN_MIDDLE > rows.len() {
             (top, bottom) = (0, 0);
         }
-        let mid = top..n - bottom;
-        if let Some((shift, matched)) = find_shift(&ph[mid.clone()], &pf[mid.clone()], &ch[mid.clone()], &cf[mid]) {
-            match votes.iter_mut().find(|(s, _)| *s == shift) {
-                Some((_, total)) => *total += matched,
-                None => votes.push((shift, matched)),
-            }
+        let middle = rows.start + top..rows.end - bottom;
+        let uniform = |f: &Frame| (0..f.height).map(|r| middle.contains(&r) && f.uniform(r, &band)).collect::<Vec<_>>();
+        let (pu, cu) = (uniform(prev), uniform(cur));
+        find_shift(prev, cur, &Band { strips: band.clone(), prev_uniform: &pu, cur_uniform: &cu }, &middle)
+    };
+    // Bands are independent: search them in parallel.
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..bands).map(|b| scope.spawn(move || search(band(b)))).collect();
+        let mut results = vec![search(band(0))];
+        results.extend(handles.into_iter().map(|h| h.join().expect("band search panicked")));
+        results
+    });
+    // (integer shift, total evidence, evidence-weighted sum of fractional shifts)
+    let mut votes: Vec<(i32, usize, f32)> = Vec::new();
+    for (shift, evidence, fine) in results.into_iter().flatten() {
+        match votes.iter_mut().find(|(s, _, _)| *s == shift) {
+            Some((_, total, sum)) => (*total, *sum) = (*total + evidence, *sum + fine * evidence as f32),
+            None => votes.push((shift, evidence, fine * evidence as f32)),
         }
     }
-    votes.into_iter().max_by_key(|&(shift, matched)| (matched, std::cmp::Reverse(shift.abs()))).map(|(s, _)| s)
+    votes
+        .into_iter()
+        .max_by_key(|&(shift, evidence, _)| (evidence, std::cmp::Reverse(shift.abs())))
+        .map(|(_, evidence, sum)| sum / evidence as f32)
 }
 
-/// Best shift between two row-hash sequences, with its number of matched rows.
-fn find_shift(prev: &[u64], prev_flat: &[bool], cur: &[u64], cur_flat: &[bool]) -> Option<(i32, usize)> {
-    let n = cur.len();
-    let mut best: Option<(usize, i32)> = None;
-    for dy in 1..n.saturating_sub(MIN_OVERLAP) {
-        for (sign, (a, af, b, bf)) in [(1, (prev, prev_flat, cur, cur_flat)), (-1, (cur, cur_flat, prev, prev_flat))] {
-            // Row `i` of `b` should equal row `i + dy` of `a`.
-            let (mut matched, mut distinct, mut mismatched) = (0, 0, 0);
-            let budget = ((n - dy) as f32 * MAX_MISMATCH) as usize;
-            for i in 0..n - dy {
-                if bf[i] && af[i + dy] {
-                    continue;
-                }
-                distinct += 1;
-                if a[i + dy] == b[i] {
-                    matched += 1;
-                } else {
-                    mismatched += 1;
-                    if mismatched > budget {
-                        break;
-                    }
-                }
+/// A band of strips with its rows' uniformity precomputed for both frames.
+struct Band<'a> {
+    strips: Range<usize>,
+    prev_uniform: &'a [bool],
+    cur_uniform: &'a [bool],
+}
+
+/// Average difference of rows of `b` against rows of `a` shifted by `dy`, over
+/// distinct rows, or `None` without enough evidence or with too many rows that
+/// don't match. Stops early once that is certain.
+fn shift_cost(a: &Frame, au: &[bool], b: &Frame, bu: &[bool], band: &Range<usize>, rows: &Range<usize>, dy: usize) -> Option<(f32, usize)> {
+    let n = rows.len();
+    if dy + MIN_OVERLAP >= n {
+        return None;
+    }
+    let (mut distinct, mut bad, mut total) = (0usize, 0usize, 0f32);
+    let budget = ((n - dy) as f32 * MAX_BAD_ROWS) as usize;
+    for i in rows.start..rows.end - dy {
+        // Row `i` of `b` should look like row `i + dy` of `a`.
+        if bu[i] && au[i + dy] {
+            continue;
+        }
+        distinct += 1;
+        let d = b.row_distance(i, a, i + dy, band);
+        total += d.min(ROW_TOL * 2.0);
+        if d > ROW_TOL {
+            bad += 1;
+            if bad > budget {
+                return None;
             }
-            let ok = matched >= MIN_MATCHING_ROWS && mismatched <= ((distinct as f32) * MAX_MISMATCH) as usize;
-            // Prefer the most matched rows; on ties the smaller shift (more overlap).
-            if ok && best.is_none_or(|(m, _)| matched > m) {
-                best = Some((matched, sign * dy as i32));
+        }
+        if distinct >= EARLY_ROWS && total > distinct as f32 * AVG_TOL * HOPELESS {
+            return None;
+        }
+    }
+    if distinct < MIN_MATCHING_ROWS || bad as f32 > distinct as f32 * MAX_BAD_ROWS {
+        return None;
+    }
+    Some((total / distinct as f32, distinct))
+}
+
+/// Best shift of `cur` against `prev` within one band: the integer shift, the
+/// number of distinct rows supporting it, and a sub-pixel refinement.
+fn find_shift(prev: &Frame, cur: &Frame, band: &Band, rows: &Range<usize>) -> Option<(i32, usize, f32)> {
+    let mut best: Option<(f32, i32, usize)> = None;
+    let (pu, cu) = (band.prev_uniform, band.cur_uniform);
+    for dy in 1..rows.len().saturating_sub(MIN_OVERLAP) {
+        for (sign, a, au, b, bu) in [(1, prev, pu, cur, cu), (-1, cur, cu, prev, pu)] {
+            let Some((avg, distinct)) = shift_cost(a, au, b, bu, &band.strips, rows, dy) else { continue };
+            // Lowest average difference wins; on ties the smaller shift.
+            if avg <= AVG_TOL && best.is_none_or(|(best_avg, _, _)| avg < best_avg) {
+                best = Some((avg, sign * dy as i32, distinct));
             }
         }
     }
-    best.map(|(matched, dy)| (dy, matched))
+    let (_, shift, distinct) = best?;
+    // Sub-pixel refinement from the plain (smoothed) cost around the match: pick
+    // the closest integer shift, then fit a parabola through its neighbors.
+    let cost = |d: i32| refine_cost(prev, cur, band, rows, d);
+    let center = (shift - 1..=shift + 1).filter_map(|d| cost(d).map(|c| (c, d))).min_by(|a, b| a.0.total_cmp(&b.0))?.1;
+    let fine = match (cost(center - 1), cost(center), cost(center + 1)) {
+        (Some(lo), Some(mid), Some(hi)) => {
+            let curvature = lo - 2.0 * mid + hi;
+            if curvature > 1e-3 { (0.5 * (lo - hi) / curvature).clamp(-0.5, 0.5) } else { 0.0 }
+        }
+        _ => 0.0,
+    };
+    Some((shift, distinct, center as f32 + fine))
+}
+
+/// Average smoothed difference between `cur` and `prev` shifted by `dy`
+/// (positive: content moved up) over the rows that aren't uniform in both.
+fn refine_cost(prev: &Frame, cur: &Frame, band: &Band, rows: &Range<usize>, dy: i32) -> Option<f32> {
+    let (a, au, b, bu, d) = if dy >= 0 {
+        (prev, band.prev_uniform, cur, band.cur_uniform, dy as usize)
+    } else {
+        (cur, band.cur_uniform, prev, band.prev_uniform, (-dy) as usize)
+    };
+    if d + MIN_OVERLAP >= rows.len() {
+        return None;
+    }
+    let (mut distinct, mut total) = (0usize, 0f32);
+    for i in rows.start..rows.end - d {
+        if bu[i] && au[i + d] {
+            continue;
+        }
+        distinct += 1;
+        total += b.smooth_distance(i, a, i + d, &band.strips);
+    }
+    (distinct >= MIN_MATCHING_ROWS).then(|| total / distinct as f32)
 }
 
 /// Drops strips at either edge of `keep` that don't follow `shift` (scrollbar
@@ -409,12 +549,12 @@ fn trim_noisy_edges(prev: &Frame, cur: &Frame, mut keep: Range<usize>, rows: &Ra
     let mismatch = |s: usize| -> Option<f32> {
         let (mut evidence, mut wrong) = (0, 0);
         for r in rows.start..rows.end.saturating_sub(shift) {
-            let (a, b) = ((r + shift) * prev.strips + s, r * cur.strips + s);
-            if prev.flat[a].is_some() && prev.flat[a] == cur.flat[b] {
+            let (a, b) = (prev.at(r + shift, s), cur.at(r, s));
+            if prev.flat[a] && cur.flat[b] && prev.mean[a].abs_diff(cur.mean[b]) <= SAME_CELL {
                 continue;
             }
             evidence += 1;
-            wrong += (prev.cells[a] != cur.cells[b]) as usize;
+            wrong += (prev.smooth[a].abs_diff(cur.smooth[b]) > NOISY_CELL) as usize;
         }
         (evidence >= MIN_MATCHING_ROWS).then(|| wrong as f32 / evidence as f32)
     };
@@ -610,6 +750,68 @@ mod tests {
         let out = s.finish().unwrap();
         assert_eq!(out.width() as usize, cw);
         assert!(out.data() == rows_w(&doc, cw, 0, 290 + height));
+    }
+
+    /// A text-like page at twice the resolution: lines of dark "words".
+    fn page_2x(w: usize, h: usize) -> Vec<u8> {
+        let mut img = vec![255u8; w * h * 4];
+        let mut seed = 0x1234_5679u32;
+        let mut rnd = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        let mut y = 20;
+        while y + 30 < h {
+            let mut x = 40 + rnd(40) as usize;
+            while x + 120 < w {
+                let (len, shade) = (30 + rnd(120) as usize, rnd(120) as u8);
+                for yy in y..y + 26 {
+                    for xx in x..x + len {
+                        img[(yy * w + xx) * 4..(yy * w + xx) * 4 + 3].copy_from_slice(&[shade, shade, shade]);
+                    }
+                }
+                x += len + 14;
+            }
+            y += 48 + 24 * rnd(3) as usize;
+        }
+        img
+    }
+
+    /// A `height`-row frame of `page` (2x) starting at half-pixel offset `y2`.
+    fn downsampled(page: &[u8], w2: usize, y2: usize, height: usize) -> Vec<u8> {
+        let w = w2 / 2;
+        let mut out = vec![255u8; w * height * 4];
+        for y in 0..height {
+            for x in 0..w {
+                for c in 0..3 {
+                    let at = |yy: usize, xx: usize| page[(yy * w2 + xx) * 4 + c] as u32;
+                    let (r0, r1, c0) = (y2 + 2 * y, y2 + 2 * y + 1, 2 * x);
+                    out[(y * w + x) * 4 + c] = ((at(r0, c0) + at(r0, c0 + 1) + at(r1, c0) + at(r1, c0 + 1) + 2) / 4) as u8;
+                }
+            }
+        }
+        out
+    }
+
+
+    #[test]
+    fn sub_pixel_scrolling_keeps_track_without_drift() {
+        // Content redrawn at half-pixel offsets, as with fractional display scaling.
+        let (w2, h2, height) = (192, 3200, 240);
+        let page = page_2x(w2, h2);
+        let mut s = Stitcher::new((w2 / 2) as u32, 100_000);
+        let mut y2 = 0;
+        for step in [0, 7, 3, 15, 9, 11, 21, 5, 13, 17, 25, 1, 19, 23, 7, 31, 9, 15, 27, 11, 13, 29, 5, 17] {
+            y2 += step;
+            let p = s.push(height as u32, downsampled(&page, w2, y2, height));
+            assert_ne!(p, Progress::LostTrack, "lost track at half-pixel offset {y2}");
+        }
+        // The page shown so far is (y2 / 2 + height) rows; allow rounding at the end.
+        let expected = (y2 as f32 / 2.0 + height as f32).round() as i32;
+        let got = s.finish().unwrap().height() as i32;
+        assert!((got - expected).abs() <= 2, "height {got}, expected about {expected}");
     }
 
     #[test]

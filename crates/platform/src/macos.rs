@@ -132,8 +132,11 @@ impl Platform for Native {
         let ns_window = ns_window(window)?;
         ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         ns_window.setHidesOnDeactivate(false);
-        // The frame has nothing to click; letting all input through is simplest.
+        // The dim layer has nothing to click; letting all input through is simplest.
         ns_window.setIgnoresMouseEvents(hole.is_some());
+        // Window shadows follow transparency, so one would be drawn inside the
+        // hole, over the content being captured.
+        ns_window.setHasShadow(false);
         ns_window.setAcceptsMouseMovedEvents(true);
         let s = display.scale_factor as f64;
         let b = display.bounds;

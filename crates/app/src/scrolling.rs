@@ -1,7 +1,8 @@
 //! Scrolling screenshots: after the user picks a region and presses the toolbar
-//! button, the overlay closes so the real app underneath can be scrolled. A
-//! click-through frame marks the region, a small bar shows progress, and the
-//! region is captured ~10 times a second and stitched into one tall image.
+//! button, the overlay closes so the real app underneath can be scrolled. The
+//! screen stays dimmed except for a click-through hole over the region, a small
+//! bar shows progress, and the region is captured ~10 times a second and
+//! stitched into one tall image.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +21,7 @@ use crate::{AppState, output};
 
 /// Time between captures. Fast enough that normal scrolling keeps an overlap.
 const INTERVAL: Duration = Duration::from_millis(100);
-/// Frame border thickness and gap to the bar, in logical pixels.
+/// Border around the hole and gap to the bar, in logical pixels.
 const BORDER: f32 = 2.0;
 const GAP: f32 = 8.0;
 const BAR_SIZE: (f32, f32) = (430.0, 44.0);
@@ -32,12 +33,34 @@ fn hsla(c: Color) -> Hsla {
     rgb(c.to_hex()).into()
 }
 
-/// Draws the blue border; the platform makes everything inside it click-through.
-struct Frame;
+/// Dims the screen around the captured region (the "hole", in logical pixels)
+/// and outlines it, like the capture overlay. The platform makes the hole
+/// click-through, so the app underneath can be scrolled.
+struct Dim {
+    hole: Bounds<gpui::Pixels>,
+}
 
-impl Render for Frame {
+impl Render for Dim {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().border(px(BORDER)).border_color(hsla(THEME_BLUE))
+        let h = self.hole;
+        let dim = || div().absolute().bg(rgba(0x0000_0073));
+        div()
+            .size_full()
+            .relative()
+            .child(dim().left_0().right_0().top_0().h(h.top()))
+            .child(dim().left_0().right_0().top(h.bottom()).bottom_0())
+            .child(dim().left_0().w(h.left()).top(h.top()).h(h.size.height))
+            .child(dim().left(h.right()).right_0().top(h.top()).h(h.size.height))
+            .child(
+                div()
+                    .absolute()
+                    .left(h.left() - px(BORDER))
+                    .top(h.top() - px(BORDER))
+                    .w(h.size.width + px(2.0 * BORDER))
+                    .h(h.size.height + px(2.0 * BORDER))
+                    .border(px(BORDER))
+                    .border_color(hsla(THEME_BLUE)),
+            )
     }
 }
 
@@ -119,21 +142,19 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, cx: &mut
         rect.y + rect.height + gap
     };
     let bar_rect = PixelRect { x: bar_x, y: bar_y, width: bar_w, height: bar_h };
-    let frame_rect = PixelRect {
-        x: rect.x - border,
-        y: rect.y - border,
-        width: rect.width + 2 * border,
-        height: rect.height + 2 * border,
-    };
-
+    // The dim layer covers the whole display; only the region is a hole.
+    let screen_rect = PixelRect { x: 0, y: 0, width: screen_w, height: screen_h };
+    let hole = Bounds::new(
+        point(px(rect.x as f32 / scale), px(rect.y as f32 / scale)),
+        size(px(rect.width as f32 / scale), px(rect.height as f32 / scale)),
+    );
     let frame = cx.open_window(
-        helper_window_options(logical_bounds(origin, frame_rect, scale), gpui_display.id(), true),
-        |_, cx| cx.new(|_| Frame),
+        helper_window_options(logical_bounds(origin, screen_rect, scale), gpui_display.id(), true),
+        |_, cx| cx.new(|_| Dim { hole }),
     )?;
     frame.update(cx, |_, window, _| {
-        let hole = PixelRect { x: border, y: border, width: rect.width, height: rect.height };
-        if let Err(e) = platform.place_floating_window(window, &display, frame_rect, Some(hole)) {
-            log::warn!("scrolling frame setup: {e:#}");
+        if let Err(e) = platform.place_floating_window(window, &display, screen_rect, Some(rect)) {
+            log::warn!("scrolling dim layer setup: {e:#}");
         }
     })?;
 
@@ -250,6 +271,9 @@ fn capture_and_stitch(
     let image = bluesnap_platform::native().capture_region(display, rect)?;
     let mut bgrx = image.bgrx;
     let rgba = split_bgrx(&mut bgrx);
+    // For diagnosing stitching problems on real apps: BLUESNAP_DEBUG_FRAMES=<dir>
+    // saves every frame, named by sequence number and outcome.
+    let debug_copy = std::env::var_os("BLUESNAP_DEBUG_FRAMES").map(|dir| (dir, rgba.clone()));
     let mut stitcher = stitcher.lock().unwrap_or_else(|e| e.into_inner());
     let stitcher = stitcher.get_or_insert_with(|| {
         let by_memory = (MAX_BYTES / (image.width as u64 * 4).max(1)) as u32;
@@ -259,6 +283,14 @@ fn capture_and_stitch(
         anyhow::bail!("frame size changed");
     }
     let progress = stitcher.push(image.height, rgba);
+    if let Some((dir, rgba)) = debug_copy {
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::Path::new(&dir).join(format!("frame-{n:04}-{progress:?}.png"));
+        if let Some(pixmap) = bluesnap_core::pixels::pixmap_from_rgba(image.width, image.height, rgba) {
+            pixmap.save_png(&path).ok();
+        }
+    }
     Ok((progress, stitcher.height()))
 }
 

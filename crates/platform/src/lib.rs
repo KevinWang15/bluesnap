@@ -100,10 +100,10 @@ pub trait Platform {
     /// flickers the cursor.
     fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image>;
 
-    /// Places a helper window (the scrolling-capture frame or panel) exactly at
+    /// Places a helper window (the scrolling-capture dim layer or bar) exactly at
     /// `rect` (in `display`'s image pixels), above other windows, without taking
     /// focus. Mouse input inside `hole` (relative to `rect`) goes to the windows
-    /// below, so the user can scroll the captured app through the frame.
+    /// below, so the user can scroll the captured app through it.
     fn place_floating_window(
         &self,
         window: &dyn HasWindowHandle,
