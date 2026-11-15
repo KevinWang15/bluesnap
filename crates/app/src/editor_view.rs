@@ -75,6 +75,8 @@ pub struct EditorView {
     status: Option<SharedString>,
     /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
+    /// Running AI redaction, if any. Dropping it cancels the UI update.
+    auto: Option<Task<()>>,
     /// While the redact strength slider is dragged: its style bar's window x.
     slider: Option<f32>,
 }
@@ -149,6 +151,7 @@ impl EditorView {
             finished: false,
             status: None,
             ocr: None,
+            auto: None,
             slider: None,
         }
     }
@@ -317,8 +320,8 @@ impl EditorView {
 
     /// A press on the redact strength slider: jumps to the pointer and follows
     /// it until release, as one undo step.
-    pub fn press_slider(&mut self, x: Pixels, window: &Window) {
-        let Some(bar) = self.panel_positions(window).1 else { return };
+    pub fn press_slider(&mut self, x: Pixels, window: &Window, cx: &App) {
+        let Some(bar) = self.panel_positions(window, cx).1 else { return };
         self.editor.begin_continuous_edit();
         self.slider = Some(bar.x);
         self.drag_slider(x);
@@ -331,8 +334,93 @@ impl EditorView {
         }
     }
 
+    /// The redact bar's Auto button: offered when an AI model is set up.
+    fn auto_state(&self, cx: &App) -> Option<toolbar::Auto> {
+        let configured = cx.global::<AppState>().ai.is_configured();
+        configured.then_some(if self.auto.is_some() { toolbar::Auto::Running } else { toolbar::Auto::Ready })
+    }
+
+    /// Finds sensitive text in the selection (as displayed, so what's already
+    /// redacted isn't found again) and covers it with area redactions in the
+    /// current effect, as one undo step. Text is recognized locally; only the
+    /// text goes to the configured AI endpoints.
+    pub fn auto_redact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.auto.is_some() {
+            return;
+        }
+        let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
+        let origin = (sel.round().x, sel.round().y);
+        let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
+        let settings = cx.global::<AppState>().ai.clone();
+        let image = pixmap;
+        let fonts = cx.global::<AppState>().fonts.clone();
+        self.status = Some("Finding sensitive text…".into());
+        let started = std::time::Instant::now();
+        let found = cx.background_executor().spawn(async move {
+            let lines: Vec<(PxRect, String)> = bluesnap_platform::native()
+                .recognize_text(width, height, &rgba)?
+                .into_iter()
+                .map(|l| (PxRect::new(l.bounds.x as f32, l.bounds.y as f32, l.bounds.width as f32, l.bounds.height as f32), l.text))
+                .collect();
+            let ocr_time = started.elapsed();
+            let (rects, report) = bluesnap_ai::locate_sensitive(&settings, &image, &lines, &fonts)?;
+            log::info!(
+                "auto redact: {} lines, {} findings, {}/{} requests failed; OCR {ocr_time:?}, total {:?}",
+                lines.len(),
+                report.findings.len(),
+                report.failed,
+                report.requests,
+                started.elapsed()
+            );
+            // Found in the selection's pixels; placed on the screenshot.
+            let at = bluesnap_core::Point::new(origin.0, origin.1);
+            anyhow::Ok((rects.into_iter().map(|r| r.translate(at)).collect::<Vec<_>>(), report.failed))
+        });
+        self.auto = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = found.await;
+            this.update_in(cx, |this, window, cx| this.auto_redacted(result, window, cx)).ok();
+        }));
+        cx.notify();
+    }
+
+    fn auto_redacted(&mut self, result: anyhow::Result<(Vec<PxRect>, usize)>, window: &mut Window, cx: &mut Context<Self>) {
+        self.auto = None;
+        let message = match result {
+            Ok((rects, failed)) => {
+                let added = self.editor.add_redactions(&rects);
+                let found = match added {
+                    0 => "Nothing sensitive found".to_string(),
+                    1 => "Redacted 1 item".to_string(),
+                    n => format!("Redacted {n} items"),
+                };
+                // Some lines went unchecked: say so rather than imply all is covered.
+                if failed > 0 { format!("{found} · some text could not be checked") } else { found }
+            }
+            Err(e) => {
+                log::error!("auto redact failed: {e:#}");
+                let e = format!("{e:#}");
+                format!("Auto redact failed: {}", e.chars().take(120).collect::<String>())
+            }
+        };
+        let shown: SharedString = message.into();
+        self.status = Some(shown.clone());
+        // The result stays readable briefly, then gets out of the way.
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(2500)).await;
+            this.update(cx, |this, cx| {
+                if this.status.as_ref() == Some(&shown) {
+                    this.status = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ocr.is_none() {
+        if self.ocr.is_none() && self.auto.is_none() {
             self.status = None;
         }
         if let Surface::Document = self.surface
@@ -480,8 +568,9 @@ impl EditorView {
     }
 
     /// Where the toolbar and style bar go, in window coordinates.
-    fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
-        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool));
+    fn panel_positions(&self, window: &Window, cx: &App) -> (Point<f32>, Option<Point<f32>>) {
+        let auto = self.auto_state(cx).is_some();
+        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool, auto));
         match self.surface {
             Surface::Capture { .. } => {
                 let sel = self.editor.selection().unwrap_or_default();
@@ -591,11 +680,12 @@ impl Render for EditorView {
                 Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
                 Surface::Document => toolbar::DOCUMENT_TOOLBAR,
             };
-            let (at, style_at) = self.panel_positions(window);
+            let (at, style_at) = self.panel_positions(window, cx);
+            let auto = self.auto_state(cx);
             root = root.child(toolbar::toolbar(self, groups, at.x, at.y, cx));
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
                 root = root.child(match self.editor.current_redaction() {
-                    Some(redaction) => toolbar::redact_bar(redaction, style.size, at.x, at.y, cx),
+                    Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, at.x, at.y, cx),
                     None => {
                         let numbering = self.editor.current_counter_format();
                         toolbar::style_bar(tool, style.size, style.color, numbering, at.x, at.y, cx)

@@ -342,6 +342,32 @@ impl Editor {
         }
     }
 
+    /// Adds area redactions over `rects` (found automatically), with the
+    /// current redaction settings, as one undo step. Parts outside the
+    /// selection are dropped. Returns how many were added.
+    pub fn add_redactions(&mut self, rects: &[Rect]) -> usize {
+        let Some(sel) = self.selection else { return 0 };
+        self.finish_text();
+        self.begin_change();
+        let style = self.styles[Tool::Redact.index()];
+        let before = self.shapes.len();
+        for r in rects.iter().filter_map(|r| r.intersect(&sel)) {
+            let geometry = Geometry::Redact {
+                area: RedactShape::Rect(r),
+                effect: self.redaction.effect,
+                strength: self.redaction.strength,
+            };
+            let shape = Shape { geometry, style };
+            if !shape.is_degenerate() {
+                self.shapes.push(shape);
+            }
+        }
+        self.end_change();
+        self.selected = None;
+        self.touch_shapes();
+        self.shapes.len() - before
+    }
+
     /// Starts a run of changes that should undo as one (a slider drag).
     pub fn begin_continuous_edit(&mut self) {
         self.continuous = Some(false);
@@ -1272,6 +1298,20 @@ mod tests {
         // The ring shows the highlighter's width.
         e.pointer_move(Point::new(300.0, 200.0), false);
         assert_eq!(e.brush_ring(), Some((Point::new(300.0, 200.0), 9.0)));
+    }
+
+    #[test]
+    fn found_redactions_are_one_undo_step_inside_the_selection() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (300.0, 200.0));
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| r.effect = crate::style::RedactEffect::Gray);
+        let rects = [Rect::new(10.0, 10.0, 50.0, 12.0), Rect::new(280.0, 190.0, 50.0, 20.0), Rect::new(500.0, 10.0, 5.0, 5.0)];
+        // The second is clipped to the selection; the third is outside it.
+        assert_eq!(e.add_redactions(&rects), 2);
+        assert!(matches!(&e.shapes[1].geometry, Geometry::Redact { area: RedactShape::Rect(r), effect: crate::style::RedactEffect::Gray, .. } if *r == Rect::new(280.0, 190.0, 20.0, 10.0)));
+        assert!(e.undo());
+        assert!(e.shapes.is_empty() && !e.can_undo());
     }
 
     #[test]

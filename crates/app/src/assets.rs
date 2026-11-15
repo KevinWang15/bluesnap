@@ -17,7 +17,7 @@ macro_rules! icons {
 icons![
     "rect", "ellipse", "arrow", "pen", "highlighter", "counter", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
     // The redact style bar.
-    "brush", "area", "blur", "gray",
+    "brush", "area", "blur", "gray", "auto",
 ];
 
 impl AssetSource for Assets {

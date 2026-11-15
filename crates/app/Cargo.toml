@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 bluesnap-core.workspace = true
 bluesnap-platform.workspace = true
+bluesnap-ai.workspace = true
 anyhow.workspace = true
 log.workspace = true
 arboard = { version = "3", default-features = false, features = ["image-data"] }

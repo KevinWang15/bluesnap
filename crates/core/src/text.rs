@@ -51,6 +51,22 @@ impl FontSet {
         ab_glyph::PxScale::from(size * font.height_unscaled() / upem)
     }
 
+    /// Where the bytes `range` of `text` sit within `line`, the box OCR found
+    /// for all of `text`: their share of its width as laid out in these fonts
+    /// (close enough for proportional UI fonts), padded a little since glyphs
+    /// differ. Without fonts, the whole line.
+    pub fn span_rect(&self, line: Rect, text: &str, range: std::ops::Range<usize>) -> Rect {
+        let width = |s: &str| self.layout(s, 100.0).width;
+        let total = width(text);
+        if total <= 0.0 || range.end > text.len() || !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+            return line;
+        }
+        let pad = line.h * 0.15;
+        let x0 = line.x + line.w * width(&text[..range.start]) / total - pad;
+        let x1 = line.x + line.w * width(&text[..range.end]) / total + pad;
+        Rect::from_edges(x0.max(line.x - pad), line.y, x1.min(line.right() + pad), line.bottom())
+    }
+
     /// Lays out `text` (with `\n` line breaks) at `size` pixels per em, top-left at the origin.
     pub fn layout(&self, text: &str, size: f32) -> TextLayout {
         let (ascent, line_height) = match self.fonts.first() {
@@ -185,5 +201,26 @@ impl TextLayout {
             .iter()
             .min_by(|a, b| (a.1 - p.x).abs().total_cmp(&(b.1 - p.x).abs()))
             .map_or(0, |c| c.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spans_take_their_share_of_the_line() {
+        let fonts = FontSet::load(&["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"]);
+        if fonts.is_empty() {
+            return;
+        }
+        // Monospace: 10 characters over 100 px, so 10 px each (plus padding).
+        let line = Rect::new(0.0, 0.0, 100.0, 20.0);
+        let r = fonts.span_rect(line, "key=secret", 4..10);
+        assert!((r.x - 37.0).abs() < 0.5 && (r.right() - 103.0).abs() < 0.5, "{r:?}");
+        assert_eq!((r.y, r.h), (0.0, 20.0));
+        // Bad ranges and no fonts: the whole line.
+        assert_eq!(fonts.span_rect(line, "key", 0..9), line);
+        assert_eq!(FontSet::empty().span_rect(line, "key=secret", 4..10), line);
     }
 }

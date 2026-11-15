@@ -6,6 +6,7 @@
 
 pub mod editor;
 pub mod geom;
+pub mod ink;
 pub mod layout;
 pub mod pixels;
 pub mod reading_order;

@@ -67,6 +67,7 @@ pub struct Capture {
 pub enum TrayCommand {
     Capture,
     EditSettings,
+    AiSettings,
     Quit,
 }
 

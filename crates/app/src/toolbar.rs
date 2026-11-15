@@ -26,6 +26,8 @@ const BORDER: f32 = 1.0;
 const SLIDER: f32 = 120.0;
 const SLIDER_INSET: f32 = 9.0;
 const THUMB: f32 = 14.0;
+/// Width of the redact bar's Auto button (AI redaction).
+const AUTO: f32 = 64.0;
 /// Redact style bar buttons before the slider: area and effect segments.
 const REDACT_SEGMENTS: usize = RedactArea::ALL.len() + RedactEffect::ALL.len();
 
@@ -140,15 +142,16 @@ pub fn panel_size(groups: &[&[Action]], extra: f32) -> (f32, f32) {
 
 /// Logical size of the style bar: 3 sizes, then (if the tool has a color) | 6
 /// colors, then for counters | 4 numberings. The redact tool's bar is area |
-/// effect | strength slider | 3 sizes.
-pub fn style_bar_size(tool: Tool) -> (f32, f32) {
+/// effect | strength slider | 3 sizes, then `| Auto` when AI is set up.
+pub fn style_bar_size(tool: Tool, auto: bool) -> (f32, f32) {
     let (buttons, seps, extra) = match tool {
+        Tool::Redact if auto => (REDACT_SEGMENTS + 3, 4, SLIDER + AUTO),
         Tool::Redact => (REDACT_SEGMENTS + 3, 3, SLIDER),
         Tool::Counter => (3 + PALETTE.len() + CounterFormat::ALL.len(), 2, 0.0),
         _ if tool.uses_color() => (3 + PALETTE.len(), 1, 0.0),
         _ => (3, 0, 0.0),
     };
-    let children = buttons + seps + usize::from(extra > 0.0);
+    let children = buttons + seps + usize::from(extra > 0.0) + usize::from(auto && tool == Tool::Redact);
     let width =
         2.0 * (BORDER + PAD) + buttons as f32 * STYLE_BUTTON + seps as f32 * SEP + extra + (children - 1) as f32 * GAP;
     (width, 2.0 * (BORDER + PAD) + STYLE_BUTTON)
@@ -331,7 +334,7 @@ pub fn style_bar(
     y: f32,
     cx: &mut Context<EditorView>,
 ) -> AnyElement {
-    let mut bar = size_dots(floating_panel(style_bar_size(tool), x, y), size, true, cx);
+    let mut bar = size_dots(floating_panel(style_bar_size(tool, false), x, y), size, true, cx);
     if tool.uses_color() {
         bar = bar.child(separator());
         for c in PALETTE {
@@ -375,11 +378,25 @@ pub fn style_bar(
     bar.into_any_element()
 }
 
+/// Whether the redact bar offers AI redaction, and if it's running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Auto {
+    Ready,
+    Running,
+}
+
 /// The redact tool's style bar: brush or area | mosaic, blur or gray |
-/// strength slider | brush size. Controls that don't apply are grayed out
-/// rather than hidden, so the bar keeps its layout.
-pub fn redact_bar(redaction: Redaction, size: SizeLevel, x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
-    let mut bar = floating_panel(style_bar_size(Tool::Redact), x, y);
+/// strength slider | brush size, then | Auto when AI is set up. Controls that
+/// don't apply are grayed out rather than hidden, so the bar keeps its layout.
+pub fn redact_bar(
+    redaction: Redaction,
+    size: SizeLevel,
+    auto: Option<Auto>,
+    x: f32,
+    y: f32,
+    cx: &mut Context<EditorView>,
+) -> AnyElement {
+    let mut bar = floating_panel(style_bar_size(Tool::Redact, auto.is_some()), x, y);
     for area in RedactArea::ALL {
         let (label, icon) = match area {
             RedactArea::Brush => ("Brush: paint over what to hide", "icons/brush.svg"),
@@ -405,7 +422,40 @@ pub fn redact_bar(redaction: Redaction, size: SizeLevel, x: f32, y: f32, cx: &mu
         );
     }
     bar = bar.child(separator()).child(slider(redaction, cx)).child(separator());
-    size_dots(bar, size, redaction.area == RedactArea::Brush, cx).into_any_element()
+    bar = size_dots(bar, size, redaction.area == RedactArea::Brush, cx);
+    if let Some(auto) = auto {
+        let running = auto == Auto::Running;
+        let color: Hsla = if running { rgb(0x999999).into() } else { hsla(THEME_BLUE) };
+        bar = bar.child(separator()).child(
+            div()
+                .id("auto")
+                .tooltip(tooltip(if running {
+                    "Finding sensitive text…"
+                } else {
+                    "Auto: find passwords, keys, contact details, IDs and card numbers with AI, and cover them"
+                }))
+                .flex_none()
+                .w(px(AUTO))
+                .h(px(STYLE_BUTTON))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(4.))
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(color)
+                .when(running, |d| d.bg(rgba(0x0000_000A)))
+                .when(!running, |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(rgba(0x1677_FF1F)))
+                        .on_mouse_down(MouseButton::Left, on_press(cx, |this, window, cx| this.auto_redact(window, cx)))
+                })
+                .child(svg().path("icons/auto.svg").size(px(14.)).text_color(color))
+                .child(if running { "Finding…" } else { "Auto" }),
+        );
+    }
+    bar.into_any_element()
 }
 
 /// The strength slider. A press anywhere on it jumps the thumb there and
@@ -450,7 +500,7 @@ fn slider(redaction: Redaction, cx: &mut Context<EditorView>) -> Stateful<Div> {
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.press_slider(ev.position.x, window);
+                    this.press_slider(ev.position.x, window, cx);
                     cx.notify();
                 }),
             )
@@ -477,20 +527,22 @@ mod tests {
     fn style_bar_sizes_follow_the_tool() {
         let frame = 2.0 * (BORDER + PAD);
         // 3 sizes | 6 colors: 9 buttons, a separator, 9 gaps.
-        assert_eq!(style_bar_size(Tool::Rect).0, frame + 9.0 * STYLE_BUTTON + SEP + 9.0 * GAP);
+        assert_eq!(style_bar_size(Tool::Rect, false).0, frame + 9.0 * STYLE_BUTTON + SEP + 9.0 * GAP);
         // Counters add | 4 numberings: 13 buttons, 2 separators, 14 gaps.
-        assert_eq!(style_bar_size(Tool::Counter).0, frame + 13.0 * STYLE_BUTTON + 2.0 * SEP + 14.0 * GAP);
+        assert_eq!(style_bar_size(Tool::Counter, false).0, frame + 13.0 * STYLE_BUTTON + 2.0 * SEP + 14.0 * GAP);
         // 2 areas | 3 effects | slider | 3 sizes: 8 buttons, 3 separators and
         // the slider, so 11 gaps.
         let redact = frame + 8.0 * STYLE_BUTTON + 3.0 * SEP + SLIDER + 11.0 * GAP;
-        assert_eq!(style_bar_size(Tool::Redact), (redact, frame + STYLE_BUTTON));
+        assert_eq!(style_bar_size(Tool::Redact, false), (redact, frame + STYLE_BUTTON));
+        // With AI set up: | Auto, one more separator and button, two more gaps.
+        assert_eq!(style_bar_size(Tool::Redact, true).0, redact + SEP + AUTO + 2.0 * GAP);
     }
 
     #[test]
     fn slider_maps_its_track_to_strength() {
         let (lo, hi) = slider_ends(100.0);
         // The slider sits after the segments and two separators, inside the bar.
-        assert!(lo > 100.0 + 5.0 * STYLE_BUTTON && hi < 100.0 + style_bar_size(Tool::Redact).0);
+        assert!(lo > 100.0 + 5.0 * STYLE_BUTTON && hi < 100.0 + style_bar_size(Tool::Redact, false).0);
         assert_eq!(hi - lo, SLIDER - 2.0 * SLIDER_INSET);
         assert_eq!(slider_value(100.0, lo), 0.0);
         assert_eq!(slider_value(100.0, (lo + hi) / 2.0), 0.5);

@@ -1,0 +1,16 @@
+[package]
+name = "bluesnap-ai"
+description = "Optional AI services: finding sensitive text to redact with a user-configured LLM and/or decision model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bluesnap-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Blocking client: requests run on worker threads, fanned out in parallel.
+# rustls with the OS certificate store, so corporate CAs work.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }

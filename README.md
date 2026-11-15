@@ -25,6 +25,10 @@ Press the hotkey, then:
   undo step per drag). Select an existing redaction to change its effect or
   strength; area redactions can be resized with their handles. Effects always
   read the original screenshot, and mosaic blocks line up across strokes.
+- with an AI model set up (see [AI redaction](#ai-redaction)), the Redact bar has
+  an **Auto** button: it finds passwords, keys, tokens, contact details, IDs and
+  card numbers in the selection and covers each with an area redaction in the
+  current effect, in about a second. One undo removes them all.
 - the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
   copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.
@@ -49,12 +53,48 @@ Press the hotkey, then:
   picking, or exits when nothing is selected.
 
 bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
-Take Screenshot, Edit Settings… and Quit; on Windows, left-clicking the tray icon
+Take Screenshot, Edit Settings…, AI Redaction… and Quit; on Windows, left-clicking the tray icon
 also takes a screenshot.
 
 Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. It is set in
 `config.toml`, created on first run in the OS config directory
 (`%APPDATA%\bluesnap\` on Windows, `~/Library/Application Support/bluesnap/` on macOS).
+
+## AI redaction
+
+Optional, and off until set up in **AI Redaction…** in the tray / menu bar menu.
+Two endpoints can be configured, each with a URL, token and model; either or both:
+
+- an **LLM** behind an OpenAI-compatible Responses API (`/v1/responses`);
+- a **decision model** behind a Decisions API (`/v1/decisions`).
+
+Each section has a Test button. The settings are saved to `ai.json` beside
+`config.toml`, readable only by the user (it holds the tokens).
+
+Text is recognized on the computer with the same OCR as To text; only the
+recognized text is sent to the endpoints, never the image. The lines are sent in
+reading order, 8 per LLM request and one per decision request, all in parallel (up
+to 16 at a time per model; busy responses are retried). Each finding is then
+placed on the screen: the line's words are matched to the clusters of ink in the
+pixels, so boxes fit the actual glyphs in any font, descenders included.
+
+How this was chosen: 12 synthetic screenshots (settings page, terminal, chat,
+Chinese form and chat, config file, email, bank page, code diff, admin table, and
+two with nothing sensitive) with 48 known sensitive spans, scored by the share of
+spans covered and the share of redacted area that is sensitive:
+
+| approach | found | precision | time |
+|---|---|---|---|
+| screenshot image to the LLM, asked for boxes | 8–12% | — | 27 s |
+| OCR lines to the LLM, reasoning on | 100% | 92% | 2–4 s |
+| **OCR lines to the LLM, no reasoning, 8 lines per request** | 96–100% | 95% | 0.4 s |
+| OCR lines to the decision model, one per line | 96% | 69% | 0.5 s |
+| **both: decision model adds lines it is sure about** | 98–100% | 93% | 0.4 s |
+
+(Times are for the AI requests after OCR, with DeepSeek V4.1 Flash and d3-ultra.)
+The image route places boxes far from the text; local OCR boxes are exact, so no
+extra model is downloaded. The decision model alone redacts whole lines minus a
+short label, so it works best next to an LLM.
 
 ## Layout
 
@@ -69,6 +109,8 @@ crates/
               macos.rs    CoreGraphics capture and window list, AppKit overlay setup
               linux.rs    stub (builds, capture returns an error)
   ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
+  ai/         bluesnap-ai: optional AI endpoints (settings, Responses / Decisions API
+              calls) and finding sensitive text in OCR lines for Auto redaction.
   app/        bluesnap: the GPUI frontend.
               editor_view.rs  the editing view, on two surfaces: the full-screen capture
                               overlay and a document window (scrolling screenshots)
@@ -77,6 +119,7 @@ crates/
               toolbar.rs      one table of toolbar actions; toolbars are lists of them
               viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU images
               output.rs       copy / save / cancel
+              ai_settings.rs  the AI Redaction window; text_field.rs  its text inputs
 packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
 third_party/xattr   patched copy of a gpui dependency (see below)
 ```

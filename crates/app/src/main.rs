@@ -3,6 +3,7 @@
 // No console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod ai_settings;
 mod assets;
 mod capture;
 mod config;
@@ -11,6 +12,7 @@ mod editor_view;
 mod gpu_image;
 mod output;
 mod scrolling;
+mod text_field;
 mod toolbar;
 mod viewport;
 
@@ -32,6 +34,10 @@ use crate::config::Config;
 
 pub struct AppState {
     pub config: Config,
+    /// The optional AI endpoints (see [`ai_settings`]).
+    pub ai: Arc<bluesnap_ai::AiSettings>,
+    /// The open AI settings window, if any.
+    pub ai_window: Option<AnyWindowHandle>,
     pub(crate) fonts: Arc<FontSet>,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
@@ -81,7 +87,19 @@ fn main() {
         if fonts.is_empty() {
             log::warn!("no usable font found; text annotations will be invisible");
         }
-        cx.set_global(AppState { config, fonts, overlay: None, scrolling: None, _hotkeys: hotkeys, _tray: tray });
+        text_field::bind_keys(cx);
+        ai_settings::bind_keys(cx);
+        let ai = Arc::new(ai_settings::load());
+        cx.set_global(AppState {
+            config,
+            ai,
+            ai_window: None,
+            fonts,
+            overlay: None,
+            scrolling: None,
+            _hotkeys: hotkeys,
+            _tray: tray,
+        });
     });
 }
 
@@ -155,6 +173,9 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                         None => log::error!("no config directory on this system"),
                     })
                     .ok();
+                }
+                TrayCommand::AiSettings => {
+                    cx.update(ai_settings::open).ok();
                 }
                 TrayCommand::Quit => {
                     cx.update(|cx| cx.quit()).ok();
