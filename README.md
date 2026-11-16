@@ -164,7 +164,7 @@ crates/
               windows.rs  GDI capture, EnumWindows + DWM window bounds, topmost overlay
               macos.rs    CoreGraphics capture and window list, AppKit overlay setup
               linux.rs    stub (builds, capture returns an error) plus demo mode
-  ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
+  ocr/        bluesnap-ocr: embedded PP-OCRv6 models (small det + medium rec) run by tract.
   ai/         bluesnap-ai: optional AI endpoints (settings, Responses / Decisions API
               calls) and finding sensitive text in OCR lines for Auto redaction.
   app/        bluesnap: the GPUI frontend.
@@ -183,10 +183,11 @@ third_party/xattr   patched copy of a gpui dependency (see below)
 ```
 
 Text recognition is per OS: macOS uses the built-in Vision framework (Simplified and
-Traditional Chinese plus English), Windows uses the embedded PP-OCRv6 small model
-(Simplified/Traditional Chinese, English, Japanese and 46 Latin-script languages).
-The models are only compiled into non-macOS builds; they add about 38 MB to the
-binary (about 28 MB compressed).
+Traditional Chinese plus English), Windows uses embedded PP-OCRv6 models (`small`
+detection + `medium` recognition, covering Simplified/Traditional Chinese, English,
+Japanese and 46 Latin-script languages). The models are only compiled into non-macOS
+builds; with `float16` weight storage on the recognizer they add about 48 MB to the
+binary (about 36 MB compressed).
 
 The capture happens before the overlay window opens. The overlay shows the frozen
 screenshot, so the image is exactly what was on screen when the hotkey was pressed.
@@ -279,22 +280,12 @@ columns of the transposed tile, which vectorizes, and use AVX2 when the CPU has 
 On macOS, opening the capture overlay starts warming Vision in the background so
 its model loading usually finishes before you use To text.
 
-Text recognition with the embedded model (Windows) reads high-DPI screenshots at
-their logical size (half the pixels each way at 200%): text there is drawn larger
-than the models need, so detection, most of the time on large images, gets about
-4× faster at 200%, and the result reads at least as well (underscores and shell
-prompts come out better). `cargo bench -p bluesnap-ocr` uses the demo desktop at
-200%:
-
-| image | time | at full resolution |
-|---|---|---|
-| 800×450 selection (4 chat messages) | 0.19 s | 0.24 s |
-| 1180×880 window | 0.29 s | 0.52 s |
-| 2560×1440 screen | 0.60 s | 1.50 s |
-
-The first recognition loads the models (about 0.1 s), and a selection size seen for
-the first time adds 0.1–0.2 s while tract compiles plans for its shapes. While warm
-the engine holds 0.5–0.9 GB, so it unloads after a minute.
+Text recognition with the embedded models (Windows) caps detection on large high-DPI
+captures at their logical size (at least 1600 px) while always cropping recognition
+lines from the full-resolution image, so small UI text and dense CJK strokes stay
+sharp across any display scale. The `PP-OCRv6_medium` recognizer is compiled once
+with a symbolic width dimension, keeping memory around 0.2–0.5 GB without per-width
+plan recompilation, and unloads after a minute idle.
 
 ## Known limitations
 

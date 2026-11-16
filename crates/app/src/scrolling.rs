@@ -22,8 +22,8 @@ use crate::output::{self, Finish};
 use crate::toolbar::{self, Action};
 use crate::{AppState, document};
 
-/// Time between captures. Fast enough that normal scrolling keeps an overlap.
-const INTERVAL: Duration = Duration::from_millis(100);
+/// Time between captures. Fast enough that normal wheel/trackpad scrolling keeps an overlap.
+const INTERVAL: Duration = Duration::from_millis(60);
 /// Border around the hole and gap to the bar, in logical pixels.
 const BORDER: f32 = 2.0;
 const GAP: f32 = 8.0;

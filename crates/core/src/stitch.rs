@@ -296,7 +296,8 @@ impl Stitcher {
         };
         // Sticky bars first: rows that don't move would otherwise make every strip
         // whose only content they are (blank margins) look like a scrollbar.
-        let (top, bottom) = sticky_bands(prev, &cur, &stored);
+        let dy = shift.round() as usize;
+        let (top, bottom) = sticky_bands(prev, &cur, &stored, &(0..n), Some(dy));
         let middle = top..n - bottom;
 
         // Blank margins never change either, but belong to the scrolling page,
@@ -311,7 +312,8 @@ impl Stitcher {
         while stored.end < cur.strips && blank(stored.end) {
             stored.end += 1;
         }
-        let keep = trim_noisy_edges(prev, &cur, stored.clone(), &middle, shift.round() as usize);
+        let min_keep = stored.len().div_ceil(2).max(stored.len().saturating_sub(16));
+        let keep = trim_noisy_edges(prev, &cur, stored.clone(), &middle, dy, min_keep);
 
         // The first frame becomes the start of the body: scrolling span only, and
         // without the footer, which belongs at the very end.
@@ -325,7 +327,8 @@ impl Stitcher {
         let prev = self.last.as_ref().expect("checked by push");
         let layout = self.layout.as_ref().expect("checked by push");
         let n = cur.height;
-        let middle = layout.top..n - layout.bottom;
+        let (extra_top, _) = sticky_bands(prev, &cur, &layout.keep, &(layout.top..n - layout.bottom), None);
+        let middle = layout.top + extra_top..n - layout.bottom;
         // If the sticky bands stopped holding (e.g. a header that hides on
         // scroll), try again over the whole height.
         let shift = estimate_shift(prev, &cur, &layout.keep, &middle)
@@ -335,8 +338,15 @@ impl Stitcher {
             Some(_) => return Progress::ScrolledUp,
             None => return Progress::LostTrack,
         };
-        let keep = trim_noisy_edges(prev, &cur, layout.keep.clone(), &middle, shift.round() as usize);
-        self.layout.as_mut().expect("checked above").keep = keep;
+        let dy = shift.round() as usize;
+        let (detected_top, _) = sticky_bands(prev, &cur, &layout.keep, &(0..n - layout.bottom), Some(dy));
+        let active_top = layout.top.max(detected_top);
+        let active_middle = active_top..n - layout.bottom;
+        let min_keep = layout.stored.len().div_ceil(2).max(layout.stored.len().saturating_sub(16));
+        let keep = trim_noisy_edges(prev, &cur, layout.keep.clone(), &active_middle, dy, min_keep);
+        let layout = self.layout.as_mut().expect("checked above");
+        layout.top = active_top;
+        layout.keep = keep;
         self.append(cur, shift)
     }
 
@@ -395,15 +405,123 @@ fn local_change(prev: &Frame, cur: &Frame) -> bool {
     last - first < MAX_LOCAL_CHANGE && last - first + 1 < cur.strips
 }
 
-/// Rows unchanged at the same position in both frames over `strips`, from the
-/// top and from the bottom. A few differing strips per row (a scrollbar) are
-/// tolerated.
-fn sticky_bands(prev: &Frame, cur: &Frame, strips: &Range<usize>) -> (usize, usize) {
-    let n = cur.height;
+/// Rows held fixed at the top and bottom of `rows` over `strips`, including
+/// semi-transparent / blurred bars whose background tint changes as content
+/// scrolls behind them while their own horizontal features stay put.
+fn sticky_bands(prev: &Frame, cur: &Frame, strips: &Range<usize>, rows: &Range<usize>, shift: Option<usize>) -> (usize, usize) {
+    let n = rows.len();
+    if strips.is_empty() || n <= MIN_MIDDLE {
+        return (0, 0);
+    }
     let tolerance = strips.len() / 10;
-    let same = |r: usize| strips.clone().filter(|&s| !prev.same(cur, r, s)).count() <= tolerance;
-    let top = (0..n).take_while(|&r| same(r)).count();
-    let bottom = (0..n).rev().take_while(|&r| same(r)).count();
+    let unchanged = |r: usize| strips.clone().filter(|&s| !prev.same(cur, r, s)).count() <= tolerance;
+
+    // A frosted-glass bar (`backdrop-filter: blur`) shifts in brightness when
+    // dark/light sections pass behind it, but its horizontal steps (logo, nav
+    // links, buttons) stay at the same columns.
+    let translucent_fixed = |r: usize| {
+        if strips.len() < 6 {
+            return false;
+        }
+        let pairs = strips.len() - 1;
+        let (mut bg_pairs, mut bg_steady, mut features, mut matched) = (0usize, 0usize, 0usize, 0usize);
+        for s in strips.start + 1..strips.end {
+            let (pa, pb) = (prev.at(r, s - 1), prev.at(r, s));
+            let (ca, cb) = (cur.at(r, s - 1), cur.at(r, s));
+            let dp = prev.mean[pb] as i16 - prev.mean[pa] as i16;
+            let dc = cur.mean[cb] as i16 - cur.mean[ca] as i16;
+            let dd = (dp - dc).abs();
+            let detail = (!prev.flat[pb] && !cur.flat[cb]) || dp.abs() > FLAT_CELL as i16 || dc.abs() > FLAT_CELL as i16;
+            if detail {
+                features += 1;
+                // Opaque text/buttons on a translucent bar keep their brightness
+                // while the bar's background shifts, scaling edge steps slightly
+                // without moving or flipping them.
+                if dd <= (dp.abs().max(dc.abs()) / 3).max(6) {
+                    matched += 1;
+                }
+            } else {
+                bg_pairs += 1;
+                if dd <= 6 {
+                    bg_steady += 1;
+                }
+            }
+        }
+        // Two vertical card borders produce at most 4 edge transitions; a real
+        // bar with a title, icon or links has more regardless of viewport width.
+        features >= 6.min(pairs) && bg_steady * 20 >= bg_pairs * 17 && matched * 4 >= features * 3
+    };
+
+    // Uniform padding rows inside a translucent bar: allowed only when followed
+    // by a confirmed non-uniform stationary row.
+    let smooth_tint = |r: usize| {
+        let mild = strips
+            .clone()
+            .filter(|&s| prev.mean[prev.at(r, s)].abs_diff(cur.mean[cur.at(r, s)]) <= 64)
+            .count();
+        if mild * 10 < strips.len() * 9 {
+            return false;
+        }
+        if strips.len() < 2 {
+            return true;
+        }
+        let pairs = strips.len() - 1;
+        let smooth = (strips.start + 1..strips.end)
+            .filter(|&s| {
+                let dp = prev.mean[prev.at(r, s)] as i16 - prev.mean[prev.at(r, s - 1)] as i16;
+                let dc = cur.mean[cur.at(r, s)] as i16 - cur.mean[cur.at(r, s - 1)] as i16;
+                (dp - dc).abs() <= 4
+            })
+            .count();
+        smooth * 10 >= pairs * 9
+    };
+
+    let scan = |iter: &mut dyn Iterator<Item = usize>| {
+        let (mut seen, mut confirmed, mut bridged) = (0usize, 0usize, false);
+        for r in iter.take(n / 3) {
+            seen += 1;
+            if translucent_fixed(r) {
+                confirmed = seen;
+            } else if unchanged(r) {
+                if !bridged || !cur.uniform(r, strips) {
+                    confirmed = seen;
+                }
+            } else if smooth_tint(r) {
+                bridged = true;
+            } else {
+                break;
+            }
+        }
+        confirmed
+    };
+
+    let mut top = scan(&mut (rows.start..rows.end));
+    let mut bottom = scan(&mut (rows.start..rows.end).rev());
+
+    // Once `shift` is known, include any trailing padding/border rows of a
+    // detected translucent bar that also didn't move with `shift`.
+    if let Some(dy) = shift.filter(|&d| d > 0) {
+        let limit = n / 3;
+        if top > 0 {
+            while top < limit && rows.start + top + dy < rows.end {
+                let r = rows.start + top;
+                if cur.row_distance(r, prev, r + dy, strips) <= ROW_TOL {
+                    break;
+                }
+                top += 1;
+            }
+        }
+        if bottom > 0 {
+            while bottom < limit && rows.start + dy + bottom < rows.end {
+                let r = rows.end - 1 - bottom;
+                if cur.row_distance(r - dy, prev, r, strips) <= ROW_TOL {
+                    break;
+                }
+                bottom += 1;
+            }
+        }
+    }
+
     // Leave a scrolling middle; if the bands would eat it, assume no sticky parts.
     if top + bottom + MIN_MIDDLE > n { (0, 0) } else { (top, bottom) }
 }
@@ -413,16 +531,13 @@ fn sticky_bands(prev: &Frame, cur: &Frame, strips: &Range<usize>) -> (usize, usi
 /// scrolled down). Bands of strips search independently and vote, weighted by
 /// their evidence.
 fn estimate_shift(prev: &Frame, cur: &Frame, strips: &Range<usize>, rows: &Range<usize>) -> Option<f32> {
+    let (g_top, g_bottom) = sticky_bands(prev, cur, strips, rows, None);
+    let rows = &(rows.start + g_top..rows.end - g_bottom);
     let bands = (strips.len() / MIN_BAND_STRIPS).clamp(1, MAX_BANDS);
     let band = |b: usize| strips.start + strips.len() * b / bands..strips.start + strips.len() * (b + 1) / bands;
     let search = |band: Range<usize>| {
         // Rows that don't move in this band (a header over just this part).
-        let same = |r: usize| band.clone().all(|s| prev.same(cur, r, s));
-        let mut top = rows.clone().take_while(|&r| same(r)).count();
-        let mut bottom = rows.clone().rev().take_while(|&r| same(r)).count();
-        if top + bottom + MIN_MIDDLE > rows.len() {
-            (top, bottom) = (0, 0);
-        }
+        let (top, bottom) = sticky_bands(prev, cur, &band, rows, None);
         let middle = rows.start + top..rows.end - bottom;
         let uniform = |f: &Frame| (0..f.height).map(|r| middle.contains(&r) && f.uniform(r, &band)).collect::<Vec<_>>();
         let (pu, cu) = (uniform(prev), uniform(cur));
@@ -466,22 +581,28 @@ fn shift_cost(a: &Frame, au: &[bool], b: &Frame, bu: &[bool], band: &Range<usize
     }
     let (mut distinct, mut bad, mut total) = (0usize, 0usize, 0f32);
     let budget = ((n - dy) as f32 * MAX_BAD_ROWS) as usize;
-    for i in rows.start..rows.end - dy {
-        // Row `i` of `b` should look like row `i + dy` of `a`.
-        if bu[i] && au[i + dy] {
-            continue;
-        }
-        distinct += 1;
-        let d = b.row_distance(i, a, i + dy, band);
-        total += d.min(ROW_TOL * 2.0);
-        if d > ROW_TOL {
-            bad += 1;
-            if bad > budget {
+    let end = rows.end - dy;
+    // Sample evenly across the overlap first so an un-trimmed banner or hover
+    // effect at the top cannot trip `EARLY_ROWS` before the body is checked.
+    let stride = 16.min((end - rows.start).max(1));
+    for rem in 0..stride {
+        for i in (rows.start + rem..end).step_by(stride) {
+            // Row `i` of `b` should look like row `i + dy` of `a`.
+            if bu[i] && au[i + dy] {
+                continue;
+            }
+            distinct += 1;
+            let d = b.row_distance(i, a, i + dy, band);
+            total += d.min(ROW_TOL * 2.0);
+            if d > ROW_TOL {
+                bad += 1;
+                if bad > budget {
+                    return None;
+                }
+            }
+            if distinct >= EARLY_ROWS && total > distinct as f32 * AVG_TOL * HOPELESS {
                 return None;
             }
-        }
-        if distinct >= EARLY_ROWS && total > distinct as f32 * AVG_TOL * HOPELESS {
-            return None;
         }
     }
     if distinct < MIN_MATCHING_ROWS || bad as f32 > distinct as f32 * MAX_BAD_ROWS {
@@ -498,9 +619,14 @@ fn find_shift(prev: &Frame, cur: &Frame, band: &Band, rows: &Range<usize>) -> Op
     for dy in 1..rows.len().saturating_sub(MIN_OVERLAP) {
         for (sign, a, au, b, bu) in [(1, prev, pu, cur, cu), (-1, cur, cu, prev, pu)] {
             let Some((avg, distinct)) = shift_cost(a, au, b, bu, &band.strips, rows, dy) else { continue };
-            // Lowest average difference wins; on ties the smaller shift.
-            if avg <= AVG_TOL && best.is_none_or(|(best_avg, _, _)| avg < best_avg) {
-                best = Some((avg, sign * dy as i32, distinct));
+            if avg > AVG_TOL {
+                continue;
+            }
+            // Weight by `sqrt(distinct)` so a tiny periodic overlap (e.g. a CSS
+            // checkerboard near the edge) doesn't beat a full-page sub-pixel match.
+            let score = (avg + 1.0) / (distinct as f32).sqrt();
+            if best.is_none_or(|(best_score, _, _)| score < best_score) {
+                best = Some((score, sign * dy as i32, distinct));
             }
         }
     }
@@ -545,7 +671,14 @@ fn refine_cost(prev: &Frame, cur: &Frame, band: &Band, rows: &Range<usize>, dy: 
 /// thumbs move differently from the content). Judged against the typical strip,
 /// because rows that don't move at all (sticky bars) affect every strip equally.
 /// Never trims below half.
-fn trim_noisy_edges(prev: &Frame, cur: &Frame, mut keep: Range<usize>, rows: &Range<usize>, shift: usize) -> Range<usize> {
+fn trim_noisy_edges(
+    prev: &Frame,
+    cur: &Frame,
+    mut keep: Range<usize>,
+    rows: &Range<usize>,
+    shift: usize,
+    min_len: usize,
+) -> Range<usize> {
     let mismatch = |s: usize| -> Option<f32> {
         let (mut evidence, mut wrong) = (0, 0);
         for r in rows.start..rows.end.saturating_sub(shift) {
@@ -565,7 +698,6 @@ fn trim_noisy_edges(prev: &Frame, cur: &Frame, mut keep: Range<usize>, rows: &Ra
     rates.sort_by(f32::total_cmp);
     let typical = rates[rates.len() / 2];
     let noisy = |s: usize| mismatch(s).is_some_and(|rate| rate > typical + NOISY_EDGE);
-    let min_len = keep.len().div_ceil(2);
     while keep.len() > min_len && noisy(keep.start) {
         keep.start += 1;
     }
@@ -827,5 +959,106 @@ mod tests {
         assert_eq!(s.push(200, v(0)), Progress::Started);
         assert_eq!(s.push(200, v(60)), Progress::Appended(60));
         assert!(s.finish().unwrap().data() == rows(&doc, 0, 260));
+    }
+
+    #[test]
+    fn translucent_sticky_header_over_dark_hero_and_light_body_keeps_track() {
+        // Reproduces sticky frosted-glass navbars (like `position: sticky; top: 0;
+        // background: rgba(11, 17, 32, 0.9); backdrop-filter: blur(...)`) whose
+        // background tint shifts as a dark hero section slides underneath and then
+        // gives way to sparse white cards.
+        let (w, height, nav_h, doc_h) = (192usize, 320usize, 56usize, 2000usize);
+        let mut page = vec![248u8; w * doc_h * 4];
+        for p in page.as_chunks_mut::<4>().0 {
+            p[3] = 255;
+        }
+        // Dark hero at rows 56..360, then sparse cards on a light page.
+        for y in nav_h..360 {
+            for x in 0..w {
+                let shade = if (16..w - 16).contains(&x) && y % 28 < 12 && (x * 7 + y) % 5 != 0 { 220 } else { 14 };
+                page[(y * w + x) * 4..(y * w + x) * 4 + 3].fill(shade);
+            }
+        }
+        let mut seed = 0x9E37_79B9u32;
+        for y in (380..doc_h).step_by(44) {
+            for dy in 0..14 {
+                for x in 20..w - 20 {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    if (seed >> (dy % 5)) & 3 == 0 {
+                        page[((y + dy) * w + x) * 4..((y + dy) * w + x) * 4 + 3].fill((seed & 63) as u8);
+                    }
+                }
+            }
+        }
+        let frame_at = |scroll_y: usize| {
+            let mut f = rows_w(&page, w, scroll_y, scroll_y + height).to_vec();
+            // Composite a 90%-opaque dark navbar with stationary logo/link blocks
+            // over a horizontally blurred background tint.
+            for r in 0..nav_h {
+                let bg = if scroll_y == 0 || scroll_y + r >= 360 { 248u32 } else { 14u32 };
+                for x in 0..w {
+                    let on_item = (12..38).contains(&r)
+                        && ((16..44).contains(&x) || (56..88).contains(&x) || (112..140).contains(&x) || (148..176).contains(&x));
+                    let c = if r + 1 == nav_h {
+                        38
+                    } else if on_item {
+                        235
+                    } else {
+                        ((14 * 9 + bg) / 10) as u8
+                    };
+                    f[(r * w + x) * 4..(r * w + x) * 4 + 3].fill(c);
+                }
+            }
+            f
+        };
+
+        let mut s = Stitcher::new(w as u32, 100_000);
+        for (i, y) in (0..=960).step_by(60).enumerate() {
+            let p = s.push(height as u32, frame_at(y));
+            if i == 0 {
+                assert_eq!(p, Progress::Started);
+            } else {
+                assert!(matches!(p, Progress::Appended(_)), "lost track at scroll y={y}: {p:?}");
+            }
+        }
+        let out = s.finish().unwrap();
+        assert_eq!(out.height(), (960 + height) as u32);
+    }
+
+    #[test]
+    fn periodic_checkerboard_does_not_hijack_subpixel_scroll() {
+        // 2x-rendered page with a large 16px checkerboard stage and a small
+        // formula box, scrolled at half-pixel offsets.
+        let (w2, h2, height) = (256usize, 2400usize, 260usize);
+        let mut page = vec![255u8; w2 * h2 * 4];
+        for y in 0..h2 {
+            for x in 0..w2 {
+                // 8px checkerboard at 1x -> 16px squares at 2x, contrast 255 vs 243.
+                let shade = if ((x / 16) + (y / 16)) % 2 == 0 { 255 } else { 243 };
+                page[(y * w2 + x) * 4..(y * w2 + x) * 4 + 3].fill(shade);
+            }
+        }
+        // Sparse distinct content bands (headers / rendered formulas) every ~260 rows.
+        for base in (80..h2 - 80).step_by(260) {
+            for dy in 0..36 {
+                for x in 32..w2 - 32 {
+                    if ((x * 3 + base) / 17 + dy / 7) % 4 == 0 {
+                        page[((base + dy) * w2 + x) * 4..((base + dy) * w2 + x) * 4 + 3].fill(30);
+                    }
+                }
+            }
+        }
+        let mut s = Stitcher::new((w2 / 2) as u32, 100_000);
+        let mut y2 = 0usize;
+        for step in [0, 85, 91, 79, 95, 83, 89, 77, 93] {
+            y2 += step;
+            let p = s.push(height as u32, downsampled(&page, w2, y2, height));
+            assert_ne!(p, Progress::LostTrack, "lost track at y2={y2}");
+        }
+        let expected = (y2 as f32 / 2.0 + height as f32).round() as i32;
+        let got = s.finish().unwrap().height() as i32;
+        assert!((got - expected).abs() <= 2, "height {got}, expected about {expected}");
     }
 }

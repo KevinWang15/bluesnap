@@ -852,8 +852,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "geo-types",
  "image",
+ "ndarray",
  "pure-onnx-ocr",
+ "rayon",
+ "tract-linalg",
+ "tract-onnx",
 ]
 
 [[package]]
