@@ -66,6 +66,13 @@ impl ImageTiles {
             .filter(|(b, _)| b.intersects(&visible))
             .collect()
     }
+
+    /// Frees every tile texture from gpui's image atlas before closing the window.
+    pub fn drop_images(&mut self, window: &mut Window) {
+        for (_, image) in self.tiles.drain(..) {
+            window.drop_image(image).ok();
+        }
+    }
 }
 
 /// Paints `tiles` (from [`ImageTiles::visible`]).
@@ -99,6 +106,13 @@ impl LayerCache {
 
     pub fn image(&self) -> Option<&(PxRect, Arc<RenderImage>)> {
         self.image.as_ref()
+    }
+
+    pub fn drop_image(&mut self, window: &mut Window) {
+        self.key = None;
+        if let Some((_, old)) = self.image.take() {
+            window.drop_image(old).ok();
+        }
     }
 }
 

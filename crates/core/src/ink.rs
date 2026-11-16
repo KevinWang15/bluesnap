@@ -27,13 +27,21 @@ const INK_CONTRAST: i32 = 48;
 /// `fonts` over the whole line and its edges snapped to nearby gaps. Spans
 /// reaching either end of the line end at its first or last ink.
 pub fn place_span(image: &Pixmap, fonts: &FontSet, line: Rect, text: &str, range: Range<usize>) -> Rect {
+    if range.start > range.end
+        || range.end > text.len()
+        || !text.is_char_boundary(range.start)
+        || !text.is_char_boundary(range.end)
+    {
+        return line;
+    }
     let estimate = fonts.span_rect(line, text, range.clone());
     let Some((x0, columns)) = ink_columns(image, line) else { return estimate };
     let (Some(first), Some(last)) = (columns.iter().position(|&c| c), columns.iter().rposition(|&c| c)) else {
         return estimate;
     };
+    let all_gaps = gaps(&columns);
     let words = words(text);
-    let (mut left, mut right) = match word_clusters(&columns, words.len()) {
+    let (mut left, mut right) = match word_clusters(&columns, &all_gaps, words.len()) {
         Some(clusters) => {
             let metrics = Metrics::fitting(fonts, text, &words, &clusters);
             let x_at = |offset: usize, edge: Edge| -> f32 {
@@ -51,12 +59,12 @@ pub fn place_span(image: &Pixmap, fonts: &FontSet, line: Rect, text: &str, range
                 let word = &text[w.clone()];
                 let share = metrics.share(word, offset.clamp(w.start, w.end) - w.start);
                 let x = c0 as f32 + share * (c1 - c0) as f32;
-                x0 as f32 + snap_edge(&columns, x, edge, 1.0, 0.45 * line.h).unwrap_or(x)
+                x0 as f32 + snap_edge(&all_gaps, x, edge, 1.0, 0.45 * line.h).unwrap_or(x)
             };
             (x_at(range.start, Edge::Start) - 1.0, x_at(range.end, Edge::End) + 1.0)
         }
         None => {
-            let snapped = snap_with(&columns, x0, line.h, estimate);
+            let snapped = snap_with(&all_gaps, x0, line.h, estimate);
             (snapped.x, snapped.right())
         }
     };
@@ -142,13 +150,13 @@ impl<'a> Metrics<'a> {
 
 /// The ink split into `n` clusters at its `n - 1` widest gaps, if those are
 /// clearly word gaps: wider than every other gap and than a hairline.
-fn word_clusters(columns: &[bool], n: usize) -> Option<Vec<(usize, usize)>> {
+fn word_clusters(columns: &[bool], all_gaps: &[(usize, usize)], n: usize) -> Option<Vec<(usize, usize)>> {
     let first = columns.iter().position(|&c| c)?;
     let last = columns.iter().rposition(|&c| c)?;
     if n == 0 {
         return None;
     }
-    let mut inner: Vec<(usize, usize)> = gaps(columns).into_iter().filter(|(a, b)| *a > first && *b <= last).collect();
+    let mut inner: Vec<(usize, usize)> = all_gaps.iter().copied().filter(|(a, b)| *a > first && *b <= last).collect();
     if inner.len() < n - 1 {
         return None;
     }
@@ -205,9 +213,8 @@ enum Edge {
 
 /// The gap edge nearest `target` (local column) among gaps at least
 /// `min_width` wide, within `window` pixels.
-fn snap_edge(columns: &[bool], target: f32, edge: Edge, min_width: f32, window: f32) -> Option<f32> {
-    gaps(columns)
-        .iter()
+fn snap_edge(gaps: &[(usize, usize)], target: f32, edge: Edge, min_width: f32, window: f32) -> Option<f32> {
+    gaps.iter()
         .filter(|g| (g.1 - g.0) as f32 >= min_width)
         .map(|g| match edge {
             Edge::Start => g.1 as f32,
@@ -220,11 +227,11 @@ fn snap_edge(columns: &[bool], target: f32, edge: Edge, min_width: f32, window: 
 /// `span`'s edges moved to the nearest word gap within 1.5 line heights (font
 /// estimates drift that far over a long line in another font), else the
 /// nearest glyph gap within half a line height.
-fn snap_with(columns: &[bool], x0: usize, h: f32, span: Rect) -> Rect {
+fn snap_with(gaps: &[(usize, usize)], x0: usize, h: f32, span: Rect) -> Rect {
     let snap = |x: f32, edge| {
         let local = x - x0 as f32;
-        snap_edge(columns, local, edge, word_gap(h), 1.5 * h)
-            .or_else(|| snap_edge(columns, local, edge, 1.0, 0.45 * h))
+        snap_edge(gaps, local, edge, word_gap(h), 1.5 * h)
+            .or_else(|| snap_edge(gaps, local, edge, 1.0, 0.45 * h))
             .map(|e| x0 as f32 + e)
     };
     let left = snap(span.x, Edge::Start).map_or(span.x, |e| e - 1.0);
@@ -240,7 +247,7 @@ fn snap_with(columns: &[bool], x0: usize, h: f32, span: Rect) -> Rect {
 #[cfg(test)]
 fn snap_span(image: &Pixmap, line: Rect, span: Rect) -> Rect {
     match ink_columns(image, line) {
-        Some((x0, columns)) => snap_with(&columns, x0, line.h, span),
+        Some((x0, columns)) => snap_with(&gaps(&columns), x0, line.h, span),
         None => span,
     }
 }
@@ -392,10 +399,18 @@ mod tests {
     fn word_and_cluster_helpers() {
         assert_eq!(words(" ab  c "), vec![1..3, 5..6]);
         let cols: Vec<bool> = "..xx.xx....xxx..".chars().map(|c| c == 'x').collect();
-        assert_eq!(word_clusters(&cols, 2), Some(vec![(2, 7), (11, 14)]));
-        assert_eq!(word_clusters(&cols, 1), Some(vec![(2, 14)]));
+        let all_gaps = gaps(&cols);
+        assert_eq!(word_clusters(&cols, &all_gaps, 2), Some(vec![(2, 7), (11, 14)]));
+        assert_eq!(word_clusters(&cols, &all_gaps, 1), Some(vec![(2, 14)]));
         // Three words but only one clear word gap: no mapping.
-        assert_eq!(word_clusters(&cols, 3), None);
+        assert_eq!(word_clusters(&cols, &all_gaps, 3), None);
+        // Bad byte ranges return the whole line without panicking.
+        let image = line_image(&[(10, 6), (25, 6)]);
+        let line = Rect::new(8.0, 5.0, 30.0, 20.0);
+        assert_eq!(place_span(&image, &FontSet::empty(), line, "密 a", 1..4), line);
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = 4..1;
+        assert_eq!(place_span(&image, &FontSet::empty(), line, "密 a", reversed), line);
     }
 
     #[test]

@@ -277,8 +277,12 @@ impl Engine {
 /// text and dense CJK strokes aren't degraded by downscaling. Boxes are in
 /// `width` × `height` pixels.
 pub fn recognize(width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Result<Vec<Line>> {
-    anyhow::ensure!(rgba.len() == width as usize * height as usize * 4, "buffer size mismatch");
-    let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect();
+    let pixels = width as usize * height as usize;
+    anyhow::ensure!(rgba.len() == pixels * 4, "buffer size mismatch");
+    let mut rgb = Vec::with_capacity(pixels * 3);
+    for &[r, g, b, _] in rgba.as_chunks::<4>().0 {
+        rgb.extend_from_slice(&[r, g, b]);
+    }
     let image = image::RgbImage::from_raw(width, height, rgb).context("buffer size mismatch")?;
     let mut warm = state().lock().unwrap_or_else(|e| e.into_inner());
     if warm.is_none() {

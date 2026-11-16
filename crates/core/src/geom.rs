@@ -149,7 +149,7 @@ impl Rect {
             .min_by(|a, b| {
                 let da = self.handle_point(*a).distance(p);
                 let db = self.handle_point(*b).distance(p);
-                da.total_cmp(&db)
+                da.total_cmp(&db).then_with(|| b.is_corner().cmp(&a.is_corner()))
             })
     }
 
@@ -211,6 +211,10 @@ impl Handle {
         }
     }
 
+    pub fn is_corner(self) -> bool {
+        matches!(self, Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft)
+    }
+
     pub fn cursor(self) -> CursorKind {
         match self {
             Handle::TopLeft | Handle::BottomRight => CursorKind::ResizeNwSe,
@@ -267,6 +271,8 @@ mod tests {
     fn handle_hit_prefers_nearest() {
         let r = Rect::new(0.0, 0.0, 10.0, 10.0);
         assert_eq!(r.handle_at(Point::new(1.0, 1.0), 6.0), Some(Handle::TopLeft));
+        // Equidistant between `Top` (5, 0) and `TopRight` (10, 0): corner wins.
+        assert_eq!(r.handle_at(Point::new(7.5, 0.0), 6.0), Some(Handle::TopRight));
         assert_eq!(r.handle_at(Point::new(50.0, 50.0), 6.0), None);
     }
 }

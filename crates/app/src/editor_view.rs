@@ -28,8 +28,9 @@ use gpui::{
 
 use crate::gpu_image::{ImageTiles, LayerCache, paint_tiles};
 use crate::output::{self, Finish};
+use crate::text_field::{byte_to_utf16, range_from_utf16, range_to_utf16, truncate_chars, utf16_to_byte};
 use crate::toast::{self, Toast};
-use crate::toolbar::{self, Action};
+use crate::toolbar::{self, Action, hsla};
 use crate::viewport::Viewport;
 use crate::AppState;
 
@@ -88,20 +89,9 @@ pub struct EditorView {
     slider: Option<f32>,
 }
 
-fn color(c: bluesnap_core::Color) -> Hsla {
-    rgb(c.to_hex()).into()
-}
-
 /// An error's message, short enough for a toast.
 fn short_error(e: &anyhow::Error) -> String {
-    truncate(&format!("{e:#}"), 200)
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &s[..i]),
-        None => s.to_string(),
-    }
+    truncate_chars(&format!("{e:#}"), 200)
 }
 
 /// "1 line", "5 lines".
@@ -141,7 +131,7 @@ fn permission_banner(url: &'static str, cx: &mut Context<EditorView>) -> impl In
                     .px(px(10.0))
                     .py(px(4.0))
                     .rounded(px(5.0))
-                    .bg(color(THEME_BLUE))
+                    .bg(hsla(THEME_BLUE))
                     .cursor_pointer()
                     .child("Open Settings")
                     .on_mouse_down(
@@ -269,6 +259,18 @@ impl EditorView {
         }
     }
 
+    fn drop_gpu_images(&mut self, window: &mut Window) {
+        self.image.drop_images(window);
+        self.static_layer.drop_image(window);
+        self.active_layer.drop_image(window);
+        self.loupe.drop_image(window);
+        if let Some((_, _, old)) = self.text_previews.take() {
+            for (_, img, _) in old {
+                window.drop_image(img).ok();
+            }
+        }
+    }
+
     pub fn finish(&mut self, how: Finish, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.finished, true) {
             return;
@@ -277,6 +279,7 @@ impl EditorView {
             Finish::Cancel => None,
             Finish::Copy | Finish::Save => self.editor.export(),
         };
+        self.drop_gpu_images(window);
         window.remove_window();
         output::deliver(how, image, cx);
     }
@@ -379,6 +382,7 @@ impl EditorView {
                 log::info!("copied {} characters of recognized text", text.chars().count());
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.finished = true;
+                self.drop_gpu_images(window);
                 window.remove_window();
                 return;
             }
@@ -467,7 +471,7 @@ impl EditorView {
         current: bluesnap_core::TextStyle,
         color: bluesnap_core::Color,
         bar: Point<f32>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let scale = window.scale_factor();
@@ -482,7 +486,11 @@ impl EditorView {
                     Some((style, crate::gpu_image::pixmap_image(&sample)?, size))
                 })
                 .collect();
-            self.text_previews = Some((color, scale, previews));
+            if let Some((_, _, old)) = self.text_previews.replace((color, scale, previews)) {
+                for (_, img, _) in old {
+                    window.drop_image(img).ok();
+                }
+            }
         }
         let previews = self.text_previews.as_ref().expect("just made").2.clone();
         let (x, y, _) = self.text_menu_origin(bar, window);
@@ -643,7 +651,7 @@ impl EditorView {
                         match (report.failed, report.first_error) {
                             (0, _) | (_, None) => toast,
                             (failed, Some(e)) => Toast::new(toast::Kind::Error, format!("{} · {} failed", toast.title, plural(failed, "request")))
-                                .detail(format!("Some text wasn't checked: {}", truncate(&e, 160)))
+                                .detail(format!("Some text wasn't checked: {}", truncate_chars(&e, 160)))
                                 .action("AI Settings…", toast::Action::OpenAiSettings),
                         }
                     }
@@ -809,7 +817,7 @@ impl EditorView {
             }),
             caret: e.text_caret_rect().map(|r| {
                 let color = e.text_ink().unwrap_or(THEME_BLUE);
-                (v.to_window(r), self::color(color))
+                (v.to_window(r), hsla(color))
             }),
             cursor: match e.cursor() {
                 CursorKind::Default => CursorStyle::Arrow,
@@ -1025,7 +1033,7 @@ struct Scene {
 
 impl Scene {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
-        let blue = color(THEME_BLUE);
+        let blue = hsla(THEME_BLUE);
         if let Some(backdrop) = self.backdrop {
             window.paint_quad(fill(bounds, backdrop));
             let frame = self.image_bounds.dilate(px(1.));
@@ -1134,29 +1142,6 @@ impl Scene {
 // gpui speaks UTF-16 offsets (the platform IME convention); the editor uses
 // UTF-8 byte offsets into the text being edited.
 
-fn utf16_to_byte(text: &str, offset: usize) -> usize {
-    let mut units = 0;
-    for (i, c) in text.char_indices() {
-        if units >= offset {
-            return i;
-        }
-        units += c.len_utf16();
-    }
-    text.len()
-}
-
-fn byte_to_utf16(text: &str, offset: usize) -> usize {
-    text[..offset.min(text.len())].chars().map(char::len_utf16).sum()
-}
-
-fn range_to_bytes(text: &str, r: &Range<usize>) -> Range<usize> {
-    utf16_to_byte(text, r.start)..utf16_to_byte(text, r.end)
-}
-
-fn range_to_utf16(text: &str, r: &Range<usize>) -> Range<usize> {
-    byte_to_utf16(text, r.start)..byte_to_utf16(text, r.end)
-}
-
 impl EntityInputHandler for EditorView {
     fn text_for_range(
         &mut self,
@@ -1166,7 +1151,7 @@ impl EntityInputHandler for EditorView {
         _: &mut Context<Self>,
     ) -> Option<String> {
         let text = self.editor.text_content()?;
-        let bytes = range_to_bytes(text, &range);
+        let bytes = range_from_utf16(text, &range);
         adjusted.replace(range_to_utf16(text, &bytes));
         Some(text[bytes].to_string())
     }
@@ -1189,7 +1174,7 @@ impl EntityInputHandler for EditorView {
 
     fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
         let Some(content) = self.editor.text_content() else { return };
-        let range = range.map(|r| range_to_bytes(content, &r));
+        let range = range.map(|r| range_from_utf16(content, &r));
         self.editor.text_replace(range, text, false, None);
         cx.notify();
     }
@@ -1203,7 +1188,7 @@ impl EntityInputHandler for EditorView {
         cx: &mut Context<Self>,
     ) {
         let Some(content) = self.editor.text_content() else { return };
-        let range = range.map(|r| range_to_bytes(content, &r));
+        let range = range.map(|r| range_from_utf16(content, &r));
         let caret = new_selected.map(|r| utf16_to_byte(new_text, r.end));
         self.editor.text_replace(range, new_text, true, caret);
         cx.notify();
@@ -1242,5 +1227,9 @@ mod tests {
         assert_eq!(utf16_to_byte(s, 99), s.len());
         assert_eq!(byte_to_utf16(s, 8), 4);
         assert_eq!(range_to_utf16(s, &(1..8)), 1..4);
+        // Reversed UTF-16 ranges normalize without panicking.
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = 4..1;
+        assert_eq!(range_from_utf16(s, &reversed), 1..8);
     }
 }

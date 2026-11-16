@@ -83,8 +83,10 @@ impl AiSettings {
 #[cfg(unix)]
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    // `mode(0o600)` only applies on creation; tighten existing `.tmp` files too.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     f.write_all(data)
 }
 
@@ -122,6 +124,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Even when a stale `.tmp` file had wide permissions, `save` tightens it to 0600.
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, b"stale").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            settings.save(&path).unwrap();
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         std::fs::remove_dir_all(dir).ok();

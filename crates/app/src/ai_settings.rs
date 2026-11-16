@@ -7,14 +7,14 @@ use bluesnap_ai::{AiSettings, Endpoint};
 use bluesnap_platform::Platform;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
+    KeyBinding, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
     TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions, actions, div, prelude::FluentBuilder, px, rgb,
     rgba, size,
 };
 
 use crate::AppState;
 use crate::config::Config;
-use crate::text_field::TextField;
+use crate::text_field::{TextField, truncate_chars};
 
 actions!(ai_settings, [NextField, PreviousField, Save, Close]);
 
@@ -167,7 +167,7 @@ impl SettingsView {
             }
             Err(e) => {
                 log::error!("could not save the AI settings: {e:#}");
-                self.error = Some(format!("Could not save: {}", shorten(&format!("{e:#}"))).into());
+                self.error = Some(format!("Could not save: {}", truncate_chars(&format!("{e:#}"), 220)).into());
                 cx.notify();
             }
         }
@@ -196,7 +196,7 @@ impl SettingsView {
                     Ok(()) => Check::Passed,
                     Err(e) => {
                         log::warn!("AI endpoint test failed: {e:#}");
-                        Check::Failed(shorten(&format!("{e:#}")).into())
+                        Check::Failed(truncate_chars(&format!("{e:#}"), 220).into())
                     }
                 };
                 this.sections[i].test = None;
@@ -279,15 +279,6 @@ impl SettingsView {
 /// OS is still delivering a key or IME event to it is a crash risk.
 fn close_soon(window: &mut Window, cx: &mut Context<SettingsView>) {
     cx.defer_in(window, |_, window, _| window.remove_window());
-}
-
-/// An error message short enough for the form (the full one is logged).
-fn shorten(message: &str) -> String {
-    const MAX: usize = 220;
-    match message.char_indices().nth(MAX) {
-        Some((i, _)) => format!("{}…", &message[..i]),
-        None => message.to_string(),
-    }
 }
 
 /// A labeled form row.
@@ -380,7 +371,7 @@ impl Render for SettingsView {
                             .cursor_pointer()
                             .hover(|s| s.bg(rgb(0x4096FF)))
                             .child("Save")
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.save(&Save, window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.save(&Save, window, cx))),
                     ),
             )
     }

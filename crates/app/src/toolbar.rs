@@ -253,7 +253,7 @@ pub fn slider_value(bar_x: f32, x: f32) -> f32 {
     ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
 }
 
-fn hsla(c: Color) -> Hsla {
+pub fn hsla(c: Color) -> Hsla {
     rgb(c.to_hex()).into()
 }
 

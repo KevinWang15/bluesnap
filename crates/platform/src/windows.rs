@@ -42,6 +42,34 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
+/// Runs `f` with per-monitor v2 DPI awareness so Win32 coordinates are physical
+/// pixels even if the host manifest wasn't applied.
+fn with_per_monitor_dpi<T>(f: impl FnOnce() -> T) -> T {
+    let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let result = f();
+    if !previous.is_null() {
+        unsafe { SetThreadDpiAwarenessContext(previous) };
+    }
+    result
+}
+
+fn win32_hwnd(window: &dyn HasWindowHandle) -> anyhow::Result<HWND> {
+    let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw() else {
+        bail!("not a Win32 window");
+    };
+    Ok(handle.hwnd.get() as HWND)
+}
+
+fn set_topmost_and_focus(window: &dyn HasWindowHandle) -> anyhow::Result<()> {
+    let hwnd = win32_hwnd(window)?;
+    let ok = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) };
+    if ok == FALSE {
+        bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+    }
+    unsafe { SetForegroundWindow(hwnd) };
+    Ok(())
+}
+
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
     const OVERLAY_FULLSCREEN: bool = true;
@@ -51,57 +79,29 @@ impl Platform for Native {
     }
 
     fn capture_display_under_cursor(&self) -> anyhow::Result<Capture> {
-        // All coordinates below must be physical pixels. gpui's manifest already makes
-        // the process per-monitor DPI aware; this guards against builds without it.
-        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        let result = capture_under_cursor();
-        if !previous.is_null() {
-            unsafe { SetThreadDpiAwarenessContext(previous) };
-        }
-        result
+        with_per_monitor_dpi(capture_under_cursor)
     }
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
-        let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw() else {
-            bail!("not a Win32 window");
-        };
-        let hwnd = handle.hwnd.get() as HWND;
         let _ = display; // gpui's fullscreen mode already covers exactly this monitor.
-        // Always on top, above the taskbar. Position and size stay as gpui set them.
-        let ok = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) };
-        if ok == FALSE {
-            bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
-        }
-        // Allowed because the process just received the hotkey input.
-        unsafe { SetForegroundWindow(hwnd) };
-        Ok(())
+        // Always on top, above the taskbar. Allowed to focus because the process
+        // just received the hotkey input.
+        set_topmost_and_focus(window)
     }
 
     fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
-        let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw() else {
-            bail!("not a Win32 window");
-        };
-        let hwnd = handle.hwnd.get() as HWND;
         // Topmost too, and set later, so it sits above the overlay.
-        let ok = unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW) };
-        if ok == FALSE {
-            bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
-        }
-        unsafe { SetForegroundWindow(hwnd) };
-        Ok(())
+        set_topmost_and_focus(window)
     }
 
     fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image> {
-        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);
-        let rc = RECT { left: x, top: y, right: x + rect.width, bottom: y + rect.height };
-        // No CAPTUREBLT: with DWM it isn't needed, and it makes the cursor flicker
-        // when called many times a second.
-        let result = capture_rect(&rc, SRCCOPY);
-        if !previous.is_null() {
-            unsafe { SetThreadDpiAwarenessContext(previous) };
-        }
-        result
+        with_per_monitor_dpi(|| {
+            let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);
+            let rc = RECT { left: x, top: y, right: x + rect.width, bottom: y + rect.height };
+            // No CAPTUREBLT: with DWM it isn't needed, and it makes the cursor flicker
+            // when called many times a second.
+            capture_rect(&rc, SRCCOPY)
+        })
     }
 
     fn place_floating_window(
@@ -111,52 +111,54 @@ impl Platform for Native {
         rect: PixelRect,
         hole: Option<PixelRect>,
     ) -> anyhow::Result<()> {
-        let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw()
-        else {
-            bail!("not a Win32 window");
-        };
-        let hwnd = handle.hwnd.get() as HWND;
-        let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);
-        let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
-        unsafe {
-            if SetWindowPos(hwnd, HWND_TOPMOST, x, y, rect.width, rect.height, flags) == FALSE {
-                bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+        let hwnd = win32_hwnd(window)?;
+        with_per_monitor_dpi(|| {
+            let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);
+            let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            unsafe {
+                if SetWindowPos(hwnd, HWND_TOPMOST, x, y, rect.width, rect.height, flags) == FALSE {
+                    bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+                }
+                // gpui keeps invisible resize borders around frameless windows; grow the
+                // window by them so the client area (what gpui draws) lands on `rect`.
+                let (mut outer, mut client) = (zeroed::<RECT>(), zeroed::<RECT>());
+                let mut origin = POINT { x: 0, y: 0 };
+                GetWindowRect(hwnd, &mut outer);
+                GetClientRect(hwnd, &mut client);
+                ClientToScreen(hwnd, &mut origin);
+                let (left, top) = (origin.x - outer.left, origin.y - outer.top);
+                let right = outer.right - (origin.x + client.right);
+                let bottom = outer.bottom - (origin.y + client.bottom);
+                if (left, top, right, bottom) != (0, 0, 0, 0) {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        x - left,
+                        y - top,
+                        rect.width + left + right,
+                        rect.height + top + bottom,
+                        SWP_NOACTIVATE,
+                    );
+                }
+                // Clip the window to its client area (the invisible borders would
+                // otherwise swallow clicks next to it), minus the pass-through hole.
+                let region = CreateRectRgn(left, top, left + rect.width, top + rect.height);
+                if !region.is_null() {
+                    if let Some(h) = hole {
+                        let inner = CreateRectRgn(left + h.x, top + h.y, left + h.x + h.width, top + h.y + h.height);
+                        if !inner.is_null() {
+                            CombineRgn(region, region, inner, RGN_DIFF);
+                            DeleteObject(inner);
+                        }
+                    }
+                    // On success the system owns the region.
+                    if SetWindowRgn(hwnd, region, TRUE) == 0 {
+                        DeleteObject(region);
+                    }
+                }
             }
-            // gpui keeps invisible resize borders around frameless windows; grow the
-            // window by them so the client area (what gpui draws) lands on `rect`.
-            let (mut outer, mut client) = (zeroed::<RECT>(), zeroed::<RECT>());
-            let mut origin = POINT { x: 0, y: 0 };
-            GetWindowRect(hwnd, &mut outer);
-            GetClientRect(hwnd, &mut client);
-            ClientToScreen(hwnd, &mut origin);
-            let (left, top) = (origin.x - outer.left, origin.y - outer.top);
-            let right = outer.right - (origin.x + client.right);
-            let bottom = outer.bottom - (origin.y + client.bottom);
-            if (left, top, right, bottom) != (0, 0, 0, 0) {
-                SetWindowPos(
-                    hwnd,
-                    HWND_TOPMOST,
-                    x - left,
-                    y - top,
-                    rect.width + left + right,
-                    rect.height + top + bottom,
-                    SWP_NOACTIVATE,
-                );
-            }
-            // Clip the window to its client area (the invisible borders would
-            // otherwise swallow clicks next to it), minus the pass-through hole.
-            let region = CreateRectRgn(left, top, left + rect.width, top + rect.height);
-            if let Some(h) = hole {
-                let inner = CreateRectRgn(left + h.x, top + h.y, left + h.x + h.width, top + h.y + h.height);
-                CombineRgn(region, region, inner, RGN_DIFF);
-                DeleteObject(inner);
-            }
-            // On success the system owns the region.
-            if SetWindowRgn(hwnd, region, TRUE) == 0 {
-                DeleteObject(region);
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
@@ -291,6 +293,10 @@ fn capture_rect(rc: &RECT, rop: ROP_CODE) -> anyhow::Result<Image> {
             bail!("GetDC failed");
         }
         let mem = CreateCompatibleDC(screen);
+        if mem.is_null() {
+            ReleaseDC(null_mut(), screen);
+            bail!("CreateCompatibleDC failed");
+        }
         let mut bmi: BITMAPINFO = zeroed();
         bmi.bmiHeader = BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,

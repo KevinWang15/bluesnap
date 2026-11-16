@@ -171,7 +171,12 @@ fn recognize_with_model(width: u32, height: u32, rgba: &[u8], scale: f32) -> any
         .into_iter()
         .map(|l| TextLine {
             text: l.text,
-            bounds: PixelRect { x: l.x as i32, y: l.y as i32, width: l.width as i32, height: l.height as i32 },
+            bounds: PixelRect {
+                x: l.x.round() as i32,
+                y: l.y.round() as i32,
+                width: l.width.round() as i32,
+                height: l.height.round() as i32,
+            },
         })
         .collect())
 }
@@ -194,13 +199,13 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::Native;
 
-/// The implementation for the OS being compiled for.
 /// A rounded face for platforms without one (OFL, see assets/fonts).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn bundled_rounded() -> FontSource {
     FontSource::bundled(include_bytes!("../assets/fonts/Nunito.ttf")).weight(800.0)
 }
 
+/// The implementation for the OS being compiled for.
 pub fn native() -> Native {
     Native
 }

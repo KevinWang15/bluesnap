@@ -135,7 +135,7 @@ impl Platform for Native {
         let demo = demo()?;
         let screen = demo.pixels();
         let (sw, sh) = (demo.screen.width as i32, demo.screen.height as i32);
-        if rect.x < 0 || rect.y < 0 || rect.x + rect.width > sw || rect.y + rect.height > sh {
+        if rect.width <= 0 || rect.height <= 0 || rect.x < 0 || rect.y < 0 || rect.x + rect.width > sw || rect.y + rect.height > sh {
             bail!("region outside the demo screen");
         }
         let mut out = Vec::with_capacity((rect.width * rect.height * 4) as usize);

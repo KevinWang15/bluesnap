@@ -76,6 +76,9 @@ pub fn find_sensitive(settings: &AiSettings, lines: &[String]) -> anyhow::Result
     if llm.is_none() && decisions.is_none() {
         bail!("no AI model is configured");
     }
+    if lines.is_empty() {
+        return Ok(Report::default());
+    }
     let errors = Mutex::new(Vec::new());
     let (from_llm, kinds) = std::thread::scope(|s| {
         let from_llm = llm.map(|e| s.spawn(|| ask_llm(e, lines, &errors)));
@@ -203,7 +206,7 @@ fn parse_reply(reply: &str, lines: &[String], chunk: Range<usize>) -> Vec<Findin
             if let Some(range) = find_loose(&lines[line], text) {
                 return Some(Finding { line, range });
             }
-            if let Some((other, range)) = chunk.clone().find_map(|i| Some((i, find_loose(&lines[i], text)?))) {
+            if let Some((other, range)) = chunk.clone().filter(|&i| i != line).find_map(|i| Some((i, find_loose(&lines[i], text)?))) {
                 return Some(Finding { line: other, range });
             }
             let range = find_approx(&lines[line], text).unwrap_or_else(|| {
@@ -215,11 +218,16 @@ fn parse_reply(reply: &str, lines: &[String], chunk: Range<usize>) -> Vec<Findin
         .collect()
 }
 
+fn non_ws_chars(hay: &str, needle: &str) -> (Vec<(usize, char)>, Vec<char>) {
+    let hay = hay.char_indices().filter(|(_, c)| !c.is_whitespace()).collect();
+    let needle = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    (hay, needle)
+}
+
 /// Byte range of `needle` in `hay`, ignoring whitespace and ASCII case (models
 /// sometimes normalize spaces in long numbers).
 fn find_loose(hay: &str, needle: &str) -> Option<Range<usize>> {
-    let hay: Vec<(usize, char)> = hay.char_indices().filter(|(_, c)| !c.is_whitespace()).collect();
-    let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    let (hay, needle) = non_ws_chars(hay, needle);
     if needle.is_empty() || needle.len() > hay.len() {
         return None;
     }
@@ -232,8 +240,7 @@ fn find_loose(hay: &str, needle: &str) -> Option<Range<usize>> {
 /// Like [`find_loose`], allowing one differing character in five (OCR and the
 /// model disagree on look-alikes such as O and 0).
 fn find_approx(hay: &str, needle: &str) -> Option<Range<usize>> {
-    let hay: Vec<(usize, char)> = hay.char_indices().filter(|(_, c)| !c.is_whitespace()).collect();
-    let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    let (hay, needle) = non_ws_chars(hay, needle);
     if needle.len() < 4 || needle.len() > hay.len() {
         return None;
     }

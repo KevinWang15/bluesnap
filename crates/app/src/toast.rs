@@ -75,7 +75,7 @@ pub fn render(
     on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
     const WIDTH: f32 = 420.0;
-    let width = WIDTH.min(window_width - 16.0);
+    let width = (window_width - 16.0).clamp(0.0, WIDTH);
     let left = (center_x - width / 2.0).clamp(8.0, (window_width - width - 8.0).max(8.0));
     let icon = match toast.kind {
         Kind::Busy => svg()

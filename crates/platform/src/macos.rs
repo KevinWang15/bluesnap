@@ -69,6 +69,7 @@ impl Platform for Native {
         let image = to_bgrx(&image)?;
         let captured = started.elapsed();
 
+        anyhow::ensure!(bounds.size.width > 0.0 && bounds.size.height > 0.0, "empty display bounds");
         let scale = image.width as f64 / bounds.size.width;
         let display = DisplayInfo {
             id,
@@ -362,10 +363,10 @@ fn recognize_with_vision_locked(width: u32, height: u32, rgba: &[u8]) -> anyhow:
         lines.push(TextLine {
             text: best.string().to_string(),
             bounds: PixelRect {
-                x: x as i32,
-                y: y as i32,
-                width: (b.size.width * w as f64) as i32,
-                height: (b.size.height * h as f64) as i32,
+                x: x.round() as i32,
+                y: y.round() as i32,
+                width: (b.size.width * w as f64).round() as i32,
+                height: (b.size.height * h as f64).round() as i32,
             },
         });
     }

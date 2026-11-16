@@ -118,7 +118,7 @@ fn output_text(reply: &Value) -> Option<String> {
     if let Some(text) = reply.get("output_text").and_then(Value::as_str) {
         return Some(text.to_string());
     }
-    let text: String = reply
+    let parts: Vec<&str> = reply
         .get("output")?
         .as_array()?
         .iter()
@@ -127,7 +127,7 @@ fn output_text(reply: &Value) -> Option<String> {
         .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect();
-    Some(text)
+    (!parts.is_empty()).then(|| parts.concat())
 }
 
 /// Asks the decision model which of `criteria` (name → description) best
@@ -173,6 +173,7 @@ mod tests {
         ]});
         assert_eq!(output_text(&reply).as_deref(), Some("[1,2]"));
         assert_eq!(output_text(&json!({"output_text": "hi"})).as_deref(), Some("hi"));
+        assert_eq!(output_text(&json!({"output": [{"type": "reasoning"}]})), None);
     }
 
     #[test]

@@ -46,6 +46,13 @@ impl Loupe {
         self.copied_at = Some(Instant::now());
     }
 
+    pub fn drop_image(&mut self, window: &mut Window) {
+        self.key = None;
+        if let Some(old) = self.image.take() {
+            window.drop_image(old).ok();
+        }
+    }
+
     /// The loupe for the cursor at `cursor` (window coordinates) over image
     /// pixel `pixel` of `doc`. `selection` is the size of what's highlighted
     /// (hovered window or region being dragged), `screen` the window size.

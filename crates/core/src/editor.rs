@@ -566,10 +566,14 @@ impl Editor {
     fn shape_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
         let idx = self.selected?;
         let radius = HANDLE_HIT_RADIUS * self.ui_scale;
+        let is_corner = |h: EditHandle| matches!(h, EditHandle::Bounds(b) if b.is_corner());
         self.shapes[idx]
             .handles()
             .into_iter()
-            .find(|(_, hp)| hp.distance(p) <= radius)
+            .filter(|(_, hp)| hp.distance(p) <= radius)
+            .min_by(|(ha, pa), (hb, pb)| {
+                pa.distance(p).total_cmp(&pb.distance(p)).then_with(|| is_corner(*hb).cmp(&is_corner(*ha)))
+            })
             .map(|(h, _)| (idx, h))
     }
 
@@ -700,7 +704,7 @@ impl Editor {
             }
             Drag::SelResize { handle, orig, start } => {
                 let r = orig.resized(*handle, p - *start);
-                self.selection = Some(r.intersect(&screen).unwrap_or(Rect::new(r.x, r.y, 1.0, 1.0)));
+                self.selection = Some(r.intersect(&screen).unwrap_or_else(|| Rect::new(r.x, r.y, 1.0, 1.0).clamp_within(&screen)));
             }
             Drag::SelMove { orig, start } => {
                 self.selection = Some(orig.translate(p - *start).clamp_within(&screen));
@@ -1688,5 +1692,18 @@ mod tests {
         assert_eq!(e.right_click(), RightClick::Handled);
         assert!(e.is_picking());
         assert_eq!(e.right_click(), RightClick::Exit);
+    }
+
+    #[test]
+    fn overlapping_shape_handles_pick_nearest() {
+        let mut e = editor();
+        click(&mut e, 60.0, 60.0);
+        e.toggle_tool(Tool::Arrow);
+        // Short 6 px arrow: both endpoints lie inside the 8 px handle hit radius.
+        drag(&mut e, (80.0, 80.0), (86.0, 80.0));
+        // Dragging right on the tip (`(86, 80)`) must move the tip, not the tail.
+        drag(&mut e, (86.0, 80.0), (120.0, 80.0));
+        let (_, handles) = e.selected_frame().unwrap();
+        assert_eq!(handles, vec![Point::new(80.0, 80.0), Point::new(120.0, 80.0)]);
     }
 }

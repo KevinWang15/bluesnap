@@ -1197,6 +1197,6 @@ mod tests {
         // Downscaled thumbnail has exact byte length and opaque alpha everywhere.
         let small = s.thumbnail_bgra(24, 96).unwrap();
         assert_eq!(small.len(), 24 * 96 * 4);
-        assert!(small.chunks_exact(4).all(|px| px[3] == 255));
+        assert!(small.as_chunks::<4>().0.iter().all(|px| px[3] == 255));
     }
 }

@@ -157,7 +157,12 @@ impl FontSet {
     pub fn span_rect(&self, line: Rect, text: &str, range: std::ops::Range<usize>) -> Rect {
         let width = |s: &str| self.layout(s, 100.0).width;
         let total = width(text);
-        if total <= 0.0 || range.end > text.len() || !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+        if total <= 0.0
+            || range.start > range.end
+            || range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+        {
             return line;
         }
         let pad = line.h * 0.15;

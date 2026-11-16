@@ -484,17 +484,22 @@ fn convex_hull(mut points: Vec<Point>) -> Vec<Point> {
     }
     let cross = |o: Point, a: Point, b: Point| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
     let mut hull: Vec<Point> = Vec::with_capacity(points.len() * 2);
-    for pass in [false, true] {
-        let start = hull.len();
-        let ordered: Box<dyn Iterator<Item = &Point>> = if pass { Box::new(points.iter().rev()) } else { Box::new(points.iter()) };
-        for &p in ordered {
-            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
-                hull.pop();
-            }
-            hull.push(p);
+    let push = |hull: &mut Vec<Point>, p: Point, start: usize| {
+        while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
         }
-        hull.pop();
+        hull.push(p);
+    };
+    let lower = hull.len();
+    for &p in &points {
+        push(&mut hull, p, lower);
     }
+    hull.pop();
+    let upper = hull.len();
+    for &p in points.iter().rev() {
+        push(&mut hull, p, upper);
+    }
+    hull.pop();
     hull
 }
 

@@ -141,8 +141,12 @@ pub fn to_rgba_straight(pixmap: &Pixmap) -> Vec<u8> {
     unpremultiply(pixmap.data(), false)
 }
 
-/// Copies the `w`x`h` block at (`x`, `y`) of `src` (which must contain it).
+/// Copies the `w`x`h` block at (`x`, `y`) of `src`, returning `None` if empty
+/// or out of bounds.
 pub fn crop(src: &Pixmap, x: u32, y: u32, w: u32, h: u32) -> Option<Pixmap> {
+    if x.checked_add(w).is_none_or(|r| r > src.width()) || y.checked_add(h).is_none_or(|b| b > src.height()) {
+        return None;
+    }
     let mut out = Pixmap::new(w, h)?;
     let (stride, row) = (src.width() as usize * 4, w as usize * 4);
     let start = y as usize * stride + x as usize * 4;
@@ -564,5 +568,7 @@ mod tests {
         let c = crop(&src, 10, 5, 20, 7).unwrap();
         assert_eq!(c.pixel(0, 0), src.pixel(10, 5));
         assert_eq!(c.pixel(19, 6), src.pixel(29, 11));
+        assert!(crop(&src, 40, 5, 20, 7).is_none());
+        assert!(crop(&src, 10, 35, 20, 7).is_none());
     }
 }

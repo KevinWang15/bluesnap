@@ -14,14 +14,14 @@ use bluesnap_core::stitch::{Progress, Stitcher};
 use bluesnap_core::{Color, Rect as PxRect, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyWindowHandle, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString, Styled, StyledImage, Task, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
-    prelude::FluentBuilder, px, rgb, rgba, size, svg,
+    prelude::FluentBuilder, px, rgba, size, svg,
 };
 
 use crate::output::{self, Finish};
-use crate::toolbar::{self, Action};
+use crate::toolbar::{self, Action, hsla};
 use crate::{AppState, document};
 
 /// Time between captures. Fast enough that normal wheel/trackpad scrolling keeps an overlap.
@@ -36,10 +36,6 @@ const STATUS_WIDTH: f32 = 330.0;
 /// Height cap: 30k rows, and at most ~300 MB of pixels.
 const MAX_ROWS: u32 = 30_000;
 const MAX_BYTES: u64 = 300 << 20;
-
-fn hsla(c: Color) -> Hsla {
-    rgb(c.to_hex()).into()
-}
 
 /// Dims the screen around the captured region (the "hole", in logical pixels),
 /// outlines it, and renders the live stitched preview beside it. The platform
