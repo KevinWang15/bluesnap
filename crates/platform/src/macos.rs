@@ -29,6 +29,14 @@ pub struct Native;
 static VISION_LOCK: Mutex<()> = Mutex::new(());
 static VISION_PREWARMED: OnceLock<()> = OnceLock::new();
 
+/// The bundle identifier, so the login item reads as bluesnap's.
+const LAUNCH_AGENT_LABEL: &str = "com.kevinwang15.bluesnap";
+
+fn launch_agent_path() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    Some(home.join("Library/LaunchAgents").join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+}
+
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Cmd+A";
     const OVERLAY_FULLSCREEN: bool = false;
@@ -166,8 +174,46 @@ impl Platform for Native {
             icon_png: include_bytes!("../assets/tray-macos-template-36.png"),
             template: true,
             left_click_captures: false,
+            start_at_login: ("Open at Login", self.start_at_login()),
         };
         crate::tray::create(style, hotkey, on_command)
+    }
+
+    /// A LaunchAgent, which works on every supported macOS (`SMAppService`
+    /// needs macOS 13). launchd reads it at the next login, so writing it
+    /// doesn't start a second copy now.
+    fn start_at_login(&self) -> bool {
+        launch_agent_path().is_some_and(|path| path.exists())
+    }
+
+    fn set_start_at_login(&self, enabled: bool) -> anyhow::Result<()> {
+        let path = launch_agent_path().context("no home directory")?;
+        if !enabled {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context(format!("removing {}", path.display())),
+                _ => Ok(()),
+            };
+        }
+        let exe = std::env::current_exe().context("finding the bluesnap executable")?;
+        let exe = exe.to_str().context("the bluesnap executable's path isn't UTF-8")?;
+        let escaped = exe.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let plist = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n\
+             <dict>\n\
+             \t<key>Label</key>\n\t<string>{LAUNCH_AGENT_LABEL}</string>\n\
+             \t<key>ProgramArguments</key>\n\t<array>\n\t\t<string>{escaped}</string>\n\t</array>\n\
+             \t<key>RunAtLoad</key>\n\t<true/>\n\
+             \t<key>ProcessType</key>\n\t<string>Interactive</string>\n\
+             \t<key>LimitLoadToSessionType</key>\n\t<string>Aqua</string>\n\
+             </dict>\n\
+             </plist>\n"
+        );
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(&path, plist).with_context(|| format!("writing {}", path.display()))
     }
 
     fn permission_settings_url(&self) -> Option<&'static str> {

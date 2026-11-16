@@ -2,19 +2,23 @@
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::{FALSE, HWND, LPARAM, POINT, RECT, TRUE};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FALSE, HWND, LPARAM, POINT, RECT, TRUE};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
     HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, RGN_DIFF, ROP_CODE, ReleaseDC, SRCCOPY,
     SelectObject, SetWindowRgn,
+};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::HiDpi::{
@@ -28,6 +32,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::{Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
+
+/// Programs started at login, per user (under `HKEY_CURRENT_USER`).
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "bluesnap";
+
+/// A NUL-terminated UTF-16 string.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
@@ -151,8 +164,39 @@ impl Platform for Native {
             icon_png: include_bytes!("../assets/tray-windows-32.png"),
             template: false,
             left_click_captures: true,
+            start_at_login: ("Start with Windows", self.start_at_login()),
         };
         crate::tray::create(style, hotkey, on_command)
+    }
+
+    /// A value in the user's Run key, the same list Task Manager's Startup apps shows.
+    fn start_at_login(&self) -> bool {
+        let (key, name) = (wide(RUN_KEY), wide(RUN_VALUE));
+        let status = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_SZ, null_mut(), null_mut(), null_mut())
+        };
+        status == ERROR_SUCCESS
+    }
+
+    fn set_start_at_login(&self, enabled: bool) -> anyhow::Result<()> {
+        let (key, name) = (wide(RUN_KEY), wide(RUN_VALUE));
+        let status = if enabled {
+            let exe = std::env::current_exe().context("finding bluesnap.exe")?;
+            let mut command: Vec<u16> = "\"".encode_utf16().collect();
+            command.extend(exe.as_os_str().encode_wide());
+            command.extend("\"\0".encode_utf16());
+            let bytes = (command.len() * size_of::<u16>()) as u32;
+            unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), REG_SZ, command.as_ptr().cast(), bytes) }
+        } else {
+            match unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) } {
+                ERROR_FILE_NOT_FOUND => ERROR_SUCCESS,
+                status => status,
+            }
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32)).context("updating the Run registry key");
+        }
+        Ok(())
     }
 
     fn permission_settings_url(&self) -> Option<&'static str> {

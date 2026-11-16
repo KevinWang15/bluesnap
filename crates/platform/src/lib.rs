@@ -68,11 +68,23 @@ pub enum TrayCommand {
     Capture,
     EditSettings,
     AiSettings,
+    /// The start-at-login item was clicked (see [`Platform::set_start_at_login`]).
+    ToggleStartAtLogin,
     Quit,
 }
 
 /// Keeps the tray / menu bar icon alive; dropping it removes the icon.
-pub struct Tray(#[allow(dead_code)] Box<dyn std::any::Any>);
+pub struct Tray {
+    _icon: Box<dyn std::any::Any>,
+    show_start_at_login: Box<dyn Fn(bool)>,
+}
+
+impl Tray {
+    /// Sets the check mark of the start-at-login item.
+    pub fn show_start_at_login(&self, enabled: bool) {
+        (self.show_start_at_login)(enabled)
+    }
+}
 
 pub trait Platform {
     /// Hotkey used when the config file doesn't set one, in `global-hotkey` syntax.
@@ -122,6 +134,16 @@ pub trait Platform {
 
     /// Adds the tray (Windows) or menu bar (macOS) icon. `hotkey` is shown in its menu.
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray>;
+
+    /// Whether bluesnap is set to start when the user logs in.
+    fn start_at_login(&self) -> bool {
+        false
+    }
+
+    /// Makes this executable start when the user logs in, or stops that.
+    fn set_start_at_login(&self, _enabled: bool) -> anyhow::Result<()> {
+        anyhow::bail!("starting at login is not supported on this OS")
+    }
 
     /// Where the user grants the permission behind [`Capture::permission_missing`].
     fn permission_settings_url(&self) -> Option<&'static str>;

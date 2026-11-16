@@ -49,7 +49,7 @@ pub struct AppState {
     /// Unregisters the hotkey when dropped, so it must live as long as the app.
     _hotkeys: Option<GlobalHotKeyManager>,
     /// Removes the tray / menu bar icon when dropped.
-    _tray: Option<Tray>,
+    tray: Option<Tray>,
 }
 
 impl Global for AppState {}
@@ -78,6 +78,12 @@ fn main() {
                 None
             }
         };
+        // Points the login item at this copy, in case the app was moved or updated.
+        if platform.start_at_login()
+            && let Err(e) = platform.set_start_at_login(true)
+        {
+            log::warn!("could not update the login item: {e:#}");
+        }
         let tray = match create_tray(&platform, &config.hotkey, cx) {
             Ok(tray) => Some(tray),
             Err(e) => {
@@ -103,7 +109,7 @@ fn main() {
             overlay: None,
             scrolling: None,
             _hotkeys: hotkeys,
-            _tray: tray,
+            tray,
         });
         start_demo_capture(cx);
     });
@@ -215,6 +221,18 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                 }
                 TrayCommand::AiSettings => {
                     cx.update(|cx| ai_settings::open(false, cx)).ok();
+                }
+                TrayCommand::ToggleStartAtLogin => {
+                    cx.update(|cx| {
+                        let platform = bluesnap_platform::native();
+                        if let Err(e) = platform.set_start_at_login(!platform.start_at_login()) {
+                            show_error(format!("{e:#}"), cx);
+                        }
+                        if let Some(tray) = &cx.global::<AppState>().tray {
+                            tray.show_start_at_login(platform.start_at_login());
+                        }
+                    })
+                    .ok();
                 }
                 TrayCommand::Quit => {
                     cx.update(|cx| cx.quit()).ok();

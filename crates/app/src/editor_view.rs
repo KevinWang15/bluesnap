@@ -21,7 +21,7 @@ use bluesnap_platform::{DisplayInfo, Platform};
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection, Window, canvas, div,
     fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
@@ -870,6 +870,13 @@ impl Render for EditorView {
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, cx| {
+                let before = this.editor.revision();
+                this.editor.constrain_changed(ev.modifiers.shift);
+                if this.editor.revision() != before {
+                    cx.notify();
+                }
+            }))
             .child(
                 canvas(
                     |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),

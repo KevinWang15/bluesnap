@@ -644,7 +644,9 @@ impl Editor {
         self.touch_shapes();
     }
 
-    /// `constrain` (usually Shift) keeps rectangles square and ellipses circular.
+    /// `constrain` (usually Shift) keeps rectangles square and ellipses
+    /// circular, and makes arrows and brush strokes straight lines at a
+    /// multiple of 45°.
     pub fn pointer_move(&mut self, p: Point, constrain: bool) {
         let prev = self.pointer;
         self.pointer = p;
@@ -683,11 +685,17 @@ impl Editor {
                     | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
                         *r = Rect::from_points(start, constrained(start, p, constrain))
                     }
-                    Geometry::Arrow { to, .. } => *to = p,
+                    Geometry::Arrow { to, .. } => *to = snapped(start, p, constrain),
                     // Placed where the press ends, so it can be positioned precisely.
                     Geometry::Counter { center, .. } => *center = p,
-                    // A straight line while constrained, for highlighting a line of text.
-                    Geometry::Highlight(pts) if constrain => *pts = vec![start, p],
+                    // A straight line while constrained (e.g. along a line of text).
+                    Geometry::Pen(pts)
+                    | Geometry::Highlight(pts)
+                    | Geometry::Redact { area: RedactShape::Brush(pts), .. }
+                        if constrain =>
+                    {
+                        *pts = vec![start, snapped(start, p, true)]
+                    }
                     Geometry::Pen(pts)
                     | Geometry::Highlight(pts)
                     | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
@@ -710,6 +718,15 @@ impl Editor {
         }
         if prev != p {
             if shape_drag { self.touch_active() } else { self.touch() }
+        }
+    }
+
+    /// Shift pressed or released: the shape being drawn follows at once,
+    /// without waiting for the pointer to move.
+    pub fn constrain_changed(&mut self, constrain: bool) {
+        if matches!(self.drag, Some(Drag::Create { .. })) {
+            self.pointer_move(self.pointer, constrain);
+            self.touch_active();
         }
     }
 
@@ -1053,6 +1070,21 @@ fn constrained(start: Point, p: Point, constrain: bool) -> Point {
     Point::new(start.x + side.copysign(d.x), start.y + side.copysign(d.y))
 }
 
+/// Snaps `p` so the line from `start` points in one of the eight directions
+/// (a multiple of 45°), at the point of that line nearest `p`.
+fn snapped(start: Point, p: Point, constrain: bool) -> Point {
+    let d = p - start;
+    if !constrain || d.length() == 0.0 {
+        return p;
+    }
+    const D: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const DIRECTIONS: [(f32, f32); 8] = [(1.0, 0.0), (D, D), (0.0, 1.0), (-D, D), (-1.0, 0.0), (-D, -D), (0.0, -1.0), (D, -D)];
+    let octant = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round().rem_euclid(8.0) as usize;
+    let (dx, dy) = DIRECTIONS[octant];
+    let along = d.x * dx + d.y * dy;
+    Point::new(start.x + along * dx, start.y + along * dy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1383,13 +1415,54 @@ mod tests {
             e.pointer_move(Point::new(x, 100.0 + x / 10.0), true);
         }
         e.pointer_up(Point::new(160.0, 116.0));
-        assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 116.0)]));
+        assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 100.0)]));
         // The ring shows the highlighter's width.
         e.pointer_move(Point::new(300.0, 200.0), false);
         // Medium: 18 px tall, 8.1 px wide.
         let ring = e.brush_ring().unwrap();
         assert_eq!((ring.center, ring.half_height), (Point::new(300.0, 200.0), 9.0));
         assert!(ring.half_width < ring.half_height);
+    }
+
+    #[test]
+    fn shift_locks_lines_to_45_degrees_and_squares_boxes() {
+        let start = Point::new(100.0, 100.0);
+        let draw = |tool: Tool, end: (f32, f32), shift: bool| {
+            let mut e = editor();
+            drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+            e.toggle_tool(tool);
+            e.pointer_down(start);
+            e.pointer_move(Point::new(130.0, 110.0), false);
+            e.pointer_move(Point::new(end.0, end.1), shift);
+            e.pointer_up(Point::new(end.0, end.1));
+            e.shapes[0].geometry.clone()
+        };
+        // Nearly diagonal: onto the diagonal, at the point nearest the pointer.
+        let diagonal = Point::new(150.0, 150.0);
+        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), true), Geometry::Arrow { from: start, to: diagonal });
+        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), false), Geometry::Arrow { from: start, to: Point::new(148.0, 152.0) });
+        // Brush strokes become one straight segment, dropping the wiggle.
+        assert_eq!(draw(Tool::Pen, (148.0, 152.0), true), Geometry::Pen(vec![start, diagonal]));
+        assert_eq!(draw(Tool::Pen, (100.0, 40.0), true), Geometry::Pen(vec![start, Point::new(100.0, 40.0)]));
+        assert_eq!(draw(Tool::Pen, (20.0, 97.0), true), Geometry::Pen(vec![start, Point::new(20.0, 100.0)]));
+        assert_eq!(draw(Tool::Pen, (148.0, 152.0), false), Geometry::Pen(vec![start, Point::new(130.0, 110.0), Point::new(148.0, 152.0)]));
+        let Geometry::Redact { area: RedactShape::Brush(pts), .. } = draw(Tool::Redact, (148.0, 152.0), true) else { panic!() };
+        assert_eq!(pts, vec![start, diagonal]);
+        assert_eq!(draw(Tool::Rect, (160.0, 120.0), true), Geometry::Rect(Rect::new(100.0, 100.0, 60.0, 60.0)));
+        assert_eq!(draw(Tool::Ellipse, (40.0, 130.0), true), Geometry::Ellipse(Rect::new(40.0, 100.0, 60.0, 60.0)));
+
+        // Pressing or releasing Shift mid-drag applies without moving the pointer.
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        e.toggle_tool(Tool::Arrow);
+        e.pointer_down(start);
+        e.pointer_move(Point::new(148.0, 152.0), false);
+        let revision = e.revision();
+        e.constrain_changed(true);
+        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: diagonal });
+        assert_ne!(e.revision(), revision);
+        e.constrain_changed(false);
+        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: Point::new(148.0, 152.0) });
     }
 
     #[test]

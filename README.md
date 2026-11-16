@@ -29,6 +29,10 @@ Press the hotkey, then:
   text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
+- hold **Shift** while drawing, as in Paint: arrows and pen, highlighter and redact
+  brush strokes become straight lines locked to one of eight directions (every
+  45°), and rectangles, ellipses and redact areas become squares and circles.
+  Pressing or releasing Shift mid-drag takes effect at once.
 - the **highlighter** draws translucent strokes (yellow by default) with an upright
   chisel nib, like a real highlighter: narrower than tall, so horizontal strokes
   are full height and vertical ones thin, with squarish rounded ends. Strokes don't
@@ -84,8 +88,13 @@ Press the hotkey, then:
   picking, or exits when nothing is selected.
 
 bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
-Take Screenshot, Edit Settings…, AI Settings… and Quit; on Windows, left-clicking the tray icon
-also takes a screenshot.
+Take Screenshot, Edit Settings…, AI Settings…, a start-at-login check item and Quit;
+on Windows, left-clicking the tray icon also takes a screenshot. The check item,
+**Start with Windows** (a `bluesnap` value in
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`) or **Open at
+Login** on macOS (`~/Library/LaunchAgents/com.kevinwang15.bluesnap.plist`), starts
+bluesnap when you log in. It's off by default. If the app has been moved, the entry
+is pointed at the new location the next time it runs.
 
 Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. It is set in
 `config.toml`, created on first run in the OS config directory
