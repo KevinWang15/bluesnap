@@ -417,6 +417,39 @@ impl EditorView {
         .detach();
     }
 
+    /// Demo mode: where the controls are (see [`crate::demo`]).
+    fn report_layout(&self, window: &Window) {
+        let mut items = Vec::new();
+        let (toolbar_at, style_at) = self.panel_positions(window);
+        let groups = match self.surface {
+            Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
+            Surface::Document => toolbar::DOCUMENT_TOOLBAR,
+        };
+        if self.editor.toolbar_visible() {
+            items.extend(toolbar::row_items(&toolbar::toolbar_slots(groups, 0.0), 32.0, (toolbar_at.x, toolbar_at.y)));
+        }
+        if let (true, Some(at), Some((tool, _))) = (self.editor.toolbar_visible(), style_at, self.editor.current_style()) {
+            let style = toolbar::row_items(&toolbar::style_slots(tool), 24.0, (at.x, at.y));
+            items.extend(style.into_iter().map(|(name, r)| (format!("style:{name}"), r)));
+            if self.text_menu {
+                let (x, y, w) = self.text_menu_origin(at, window);
+                for (i, style) in bluesnap_core::TextStyle::ALL.into_iter().enumerate() {
+                    let row = toolbar::text_style_menu_row(i);
+                    items.push((format!("menu:{style:?}"), (x + row.0, y + row.1, w - 2.0 * row.0, row.3)));
+                }
+            }
+        }
+        if let Some(sel) = self.editor.selection() {
+            let r = self.viewport.to_window_rect(sel);
+            items.push(("selection".into(), (r.x, r.y, r.w, r.h)));
+        }
+        let name = match self.surface {
+            Surface::Capture { .. } => "capture",
+            Surface::Document => "document",
+        };
+        crate::demo::report(name, window.scale_factor(), items);
+    }
+
     pub fn toggle_text_styles(&mut self) {
         self.text_menu = !self.text_menu;
     }
@@ -451,14 +484,20 @@ impl EditorView {
             self.text_previews = Some((color, scale, previews));
         }
         let previews = self.text_previews.as_ref().expect("just made").2.clone();
-        let (w, h) = toolbar::text_style_menu_size(previews.len());
+        let (x, y, _) = self.text_menu_origin(bar, window);
+        toolbar::text_style_menu(&previews, current, color.is_light(), x, y, cx)
+    }
+
+    /// The text style menu's top-left corner and width, for a style bar at `bar`.
+    fn text_menu_origin(&self, bar: Point<f32>, window: &Window) -> (f32, f32, f32) {
+        let (w, h) = toolbar::text_style_menu_size(bluesnap_core::TextStyle::ALL.len());
         let (button_x, _) = toolbar::text_style_button(bar.x);
-        let bar_h = toolbar::style_bar_size(bluesnap_core::Tool::Text, false).1;
+        let bar_h = toolbar::style_bar_size(bluesnap_core::Tool::Text).1;
         let win = window.viewport_size();
         let x = button_x.min(f32::from(win.width) - w - 8.0).max(8.0);
         let below = bar.y + bar_h + 4.0;
         let y = if below + h <= f32::from(win.height) - 8.0 { below } else { (bar.y - h - 4.0).max(8.0) };
-        toolbar::text_style_menu(&previews, current, color.is_light(), x, y, cx)
+        (x, y, w)
     }
 
     /// A press on the redact strength slider: jumps to the pointer and follows
@@ -786,7 +825,7 @@ impl EditorView {
 
     /// Where the toolbar and style bar go, in window coordinates.
     fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
-        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool, true));
+        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool));
         match self.surface {
             Surface::Capture { .. } => {
                 let sel = self.editor.selection().unwrap_or_default();
@@ -884,7 +923,7 @@ impl Render for EditorView {
                     // it in a narrow window.
                     let (_, style_at) = self.panel_positions(window);
                     let style_bottom = match (style_at, self.editor.current_style()) {
-                        (Some(at), Some((tool, _))) => at.y + toolbar::style_bar_size(tool, true).1,
+                        (Some(at), Some((tool, _))) => at.y + toolbar::style_bar_size(tool).1,
                         _ => 0.0,
                     };
                     (f32::from(win.width) / 2.0, self.top_bar.max(style_bottom) + 8.0)
@@ -907,6 +946,9 @@ impl Render for EditorView {
             ));
         }
 
+        if crate::demo::enabled() {
+            self.report_layout(window);
+        }
         if self.editor.toolbar_visible() {
             let groups = match self.surface {
                 Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,

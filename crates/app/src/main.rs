@@ -7,6 +7,7 @@ mod ai_settings;
 mod assets;
 mod capture;
 mod config;
+mod demo;
 mod document;
 mod editor_view;
 mod gpu_image;
@@ -104,7 +105,23 @@ fn main() {
             _hotkeys: hotkeys,
             _tray: tray,
         });
+        start_demo_capture(cx);
     });
+}
+
+/// Demo mode (Linux, see the platform crate): `BLUESNAP_DEMO_CAPTURE_AFTER_MS`
+/// starts a capture that long after launch, so recording scripts don't depend
+/// on the global hotkey.
+fn start_demo_capture(cx: &mut App) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(ms) = std::env::var("BLUESNAP_DEMO_CAPTURE_AFTER_MS").ok().and_then(|v| v.parse().ok()) else { return };
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(Duration::from_millis(ms)).await;
+        cx.update(capture::start_capture).ok();
+    })
+    .detach();
 }
 
 /// Appends panics (with a backtrace) to `crash.log` beside the config file, as

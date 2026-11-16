@@ -2,6 +2,18 @@
 
 A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https://gpui.rs).
 
+| | |
+|---|---|
+| **Pick a window** under the cursor<br>![Picking a window](docs/demo/pick-window.gif) | **Drag a region**, then resize or move it<br>![Selecting a region](docs/demo/select-region.gif) |
+| **Loupe**: magnified pixels, position, size and color<br>![The loupe](docs/demo/loupe.gif) | **Shapes**: rectangle, ellipse, arrow, pen<br>![Drawing shapes](docs/demo/shapes.gif) |
+| **Text** in seven styles<br>![Text styles](docs/demo/text-styles.gif) | **Highlighter** with a chisel nib<br>![The highlighter](docs/demo/highlighter.gif) |
+| **Counter**: numbered markers<br>![Counter markers](docs/demo/counter.gif) | **Redact** with mosaic, blur or gray<br>![Redacting](docs/demo/redact.gif) |
+| **Auto redact** with AI<br>![Auto redaction](docs/demo/auto-redact.gif) | **Scrolling screenshots**<br>![A scrolling screenshot](docs/demo/scrolling.gif) |
+| **To text**: copy the text in the selection<br>![To text](docs/demo/to-text.gif) | |
+
+These are recorded from the real app by `demo/record.sh` (see
+[Demo recordings](#demo-recordings)).
+
 Press the hotkey, then:
 
 - move the mouse: the window under the cursor is highlighted (blue border, size label)
@@ -135,7 +147,7 @@ crates/
   platform/   bluesnap-platform: every OS API call, behind the `Platform` trait.
               windows.rs  GDI capture, EnumWindows + DWM window bounds, topmost overlay
               macos.rs    CoreGraphics capture and window list, AppKit overlay setup
-              linux.rs    stub (builds, capture returns an error)
+              linux.rs    stub (builds, capture returns an error) plus demo mode
   ocr/        bluesnap-ocr: embedded PP-OCRv6 small models run by tract (pure Rust).
   ai/         bluesnap-ai: optional AI endpoints (settings, Responses / Decisions API
               calls) and finding sensitive text in OCR lines for Auto redaction.
@@ -201,6 +213,18 @@ If an old entry gets in the way: `tccutil reset ScreenCapture com.kevinwang15.bl
 
 `cargo test --workspace` runs the editor, geometry, layout and rendering tests.
 `RUST_LOG=bluesnap=debug` logs capture and overlay timings.
+
+### Demo recordings
+
+`demo/record.sh [scene ...]` builds the app and re-records the GIFs in
+`docs/demo/` (all of them by default, about 5 minutes). It runs on Linux and
+needs Xvfb, xdotool, ImageMagick, ffmpeg and Python 3 with Pillow, NumPy and
+Tk. The app runs on a private virtual display in demo mode: it "captures" a
+fake desktop drawn by `demo/desktop.py` and reports where its buttons are, so
+the scenes in `demo/scenes.py` click controls by name. The Auto redact scene
+needs `BLUESNAP_DEMO_AI_URL`, `BLUESNAP_DEMO_AI_TOKEN` and
+`BLUESNAP_DEMO_AI_LLM` and/or `BLUESNAP_DEMO_AI_DECISIONS`; without them it's
+skipped. Scratch files go to `demo/out/`.
 
 ## Performance
 

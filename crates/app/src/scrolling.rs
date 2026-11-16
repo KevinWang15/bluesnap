@@ -334,7 +334,11 @@ fn capture_and_stitch(
 }
 
 impl Render for ScrollingCapture {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::demo::enabled() {
+            let items = toolbar::row_items(&toolbar::toolbar_slots(toolbar::SCROLLING_BAR, STATUS_WIDTH), 32.0, (0.0, 0.0));
+            crate::demo::report("scrolling-bar", window.scale_factor(), items);
+        }
         let status_color = if self.warning { hsla(Color::rgb(0xD4380D)) } else { hsla(Color::rgb(0x333333)) };
         let mut bar = toolbar::panel().size_full().text_size(px(13.0)).child(
             div()
