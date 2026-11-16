@@ -257,8 +257,9 @@ selection, 20 annotations). On a 20-thread x86 Linux machine:
 | first mosaic stroke | 1.0 ms |
 | frame while drawing a 600-point highlighter stroke | 2.6 ms |
 | re-rendering 55 annotations of every kind (after committing one) | 10 ms |
-| frame while dragging the blur slider (1200×800 area) | 14 ms |
-| blur of 1000 rows of a 1600×30000 scrolling screenshot | 9 ms |
+| frame while dragging the blur slider (1200×800 area) | 11 ms |
+| blur of 1000 rows of a 1600×30000 scrolling screenshot | 5 ms |
+| stitching one 1600×1000 frame of a scrolling capture | 5 ms |
 
 Annotations are split into a cached layer of finished shapes and a small layer for
 the shape being edited; both are clipped to the selection on the GPU, so only the
@@ -272,14 +273,28 @@ copy per family took about 50 MB more on Linux and far more on macOS and Windows
 
 Redaction effects are computed in 256×256 tiles, only under redactions, in
 parallel, and cached for the four most recent effect settings, so slider drags
-and very tall images stay responsive.
+and very tall images stay responsive. The blur's horizontal passes run down the
+columns of the transposed tile, which vectorizes, and use AVX2 when the CPU has it.
 
 On macOS, opening the capture overlay starts warming Vision in the background so
 its model loading usually finishes before you use To text.
 
-Text recognition with the embedded model (Windows) takes about 0.5 s for an
-800×450 selection of dense text and 2 s for a full 1080p screen, plus about 0.4 s
-on first use. While warm it holds several hundred MB, so it unloads after a minute.
+Text recognition with the embedded model (Windows) reads high-DPI screenshots at
+their logical size (half the pixels each way at 200%): text there is drawn larger
+than the models need, so detection, most of the time on large images, gets about
+4× faster at 200%, and the result reads at least as well (underscores and shell
+prompts come out better). `cargo bench -p bluesnap-ocr` uses the demo desktop at
+200%:
+
+| image | time | at full resolution |
+|---|---|---|
+| 800×450 selection (4 chat messages) | 0.19 s | 0.24 s |
+| 1180×880 window | 0.29 s | 0.52 s |
+| 2560×1440 screen | 0.60 s | 1.50 s |
+
+The first recognition loads the models (about 0.1 s), and a selection size seen for
+the first time adds 0.1–0.2 s while tract compiles plans for its shapes. While warm
+the engine holds 0.5–0.9 GB, so it unloads after a minute.
 
 ## Known limitations
 

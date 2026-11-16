@@ -70,8 +70,22 @@ fn build_engine() -> anyhow::Result<OcrEngine> {
 
 /// Recognizes text in straight-alpha RGBA pixels. Blocks for a few hundred
 /// milliseconds on typical selections; call it off the UI thread.
-pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<Line>> {
-    let image = image::RgbaImage::from_raw(width, height, rgba.to_vec()).context("buffer size mismatch")?;
+///
+/// `scale` is the screen's pixels per logical pixel. On high-DPI screens text
+/// is drawn larger than the models need, so the image is read at logical size:
+/// detection, most of the time on large images, gets `scale`² times faster,
+/// and recognition sizes each line to 48 px tall either way. Boxes are in
+/// `width` × `height` pixels.
+pub fn recognize(width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Result<Vec<Line>> {
+    anyhow::ensure!(rgba.len() == width as usize * height as usize * 4, "buffer size mismatch");
+    let rgb: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect();
+    let mut image = image::RgbImage::from_raw(width, height, rgb).context("buffer size mismatch")?;
+    let factor = if scale.is_finite() { scale.clamp(1.0, 4.0) } else { 1.0 };
+    let size = ((width as f32 / factor).round().max(1.0) as u32, (height as f32 / factor).round().max(1.0) as u32);
+    if size != (width, height) {
+        image = pure_onnx_ocr::imgproc::resize_bilinear(&image, size.0, size.1);
+    }
+    let (sx, sy) = (width as f64 / size.0 as f64, height as f64 / size.1 as f64);
     let mut warm = state().lock().unwrap_or_else(|e| e.into_inner());
     if warm.is_none() {
         *warm = Some(Warm { engine: build_engine()?, last_used: Instant::now() });
@@ -79,7 +93,7 @@ pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<Lin
     let warm = warm.as_mut().expect("just loaded");
     let results = warm
         .engine
-        .run_from_image(&image::DynamicImage::ImageRgba8(image))
+        .run_from_image(&image::DynamicImage::ImageRgb8(image))
         .map_err(|e| anyhow!("OCR failed: {e}"));
     warm.last_used = Instant::now();
     Ok(results?
@@ -90,6 +104,7 @@ pub fn recognize(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<Lin
             for c in r.bounding_box.exterior().coords() {
                 (x0, y0, x1, y1) = (x0.min(c.x), y0.min(c.y), x1.max(c.x), y1.max(c.y));
             }
+            let (x0, y0, x1, y1) = (x0 * sx, y0 * sy, x1 * sx, y1 * sy);
             Line { text: r.text, x: x0 as f32, y: y0 as f32, width: (x1 - x0) as f32, height: (y1 - y0) as f32 }
         })
         .collect())

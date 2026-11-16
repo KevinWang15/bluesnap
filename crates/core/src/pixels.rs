@@ -33,6 +33,20 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec
     })
 }
 
+/// Runs `f(i, band)` over the `band_len`-byte bands of `out`, on threads when
+/// there are several (a thread costs tens of microseconds to start).
+fn par_bands(out: &mut [u8], band_len: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
+    if out.len() <= band_len {
+        return f(0, out);
+    }
+    std::thread::scope(|scope| {
+        for (i, band) in out.chunks_mut(band_len).enumerate() {
+            let f = &f;
+            scope.spawn(move || f(i, band));
+        }
+    });
+}
+
 /// Runs `f` over matching pieces of `dst` and `src`, in parallel for large buffers.
 /// Pieces are whole multiples of `unit` bytes (a pixel, or a band of rows).
 fn par_zip(dst: &mut [u8], src: &[u8], unit: usize, f: impl Fn(&mut [u8], &[u8]) + Sync) {
@@ -220,37 +234,31 @@ impl Mean {
     }
 }
 
-/// Box blur of `radius` along each row of `src` into `dst`, edges extended.
-/// Rows are independent, so they are split across threads.
-fn box_rows(src: &[u8], dst: &mut [u8], width: usize, radius: usize) {
-    let mean = Mean::new(radius);
-    let stride = width * 4;
-    let px = |row: &[u8], i: isize| -> [u32; 4] {
-        let p = i.clamp(0, width as isize - 1) as usize * 4;
-        [row[p] as u32, row[p + 1] as u32, row[p + 2] as u32, row[p + 3] as u32]
-    };
-    par_zip(dst, src, stride, |dst, src| {
-        for (out, row) in dst.chunks_exact_mut(stride).zip(src.chunks_exact(stride)) {
-            let r = radius as isize;
-            let mut sum = [0u32; 4];
-            for i in -r..=r {
-                let p = px(row, i);
-                (0..4).for_each(|c| sum[c] += p[c]);
-            }
-            for (x, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                (0..4).for_each(|c| o[c] = mean.of(sum[c]));
-                let (add, sub) = (x as isize + r + 1, x as isize - r);
-                if sub >= 0 && (add as usize) < width {
-                    // Interior: no clamping.
-                    let (a, b) = (&row[add as usize * 4..add as usize * 4 + 4], &row[sub as usize * 4..sub as usize * 4 + 4]);
-                    (0..4).for_each(|c| sum[c] = sum[c] + a[c] as u32 - b[c] as u32);
-                } else {
-                    let (a, b) = (px(row, add), px(row, sub));
-                    (0..4).for_each(|c| sum[c] = sum[c] + a[c] - b[c]);
+/// `src`, `width` × `height` pixels, flipped over its diagonal: row `y` of the
+/// result is column `y` of `src`. In tiles that stay in cache, and in bands of
+/// output rows across threads.
+fn transpose(src: &[u8], width: usize, height: usize) -> Vec<u8> {
+    const TILE: usize = 32;
+    let src = src.as_chunks::<4>().0;
+    let mut out = vec![0u8; width * height * 4];
+    let threads = threads_for(out.len());
+    let band = width.div_ceil(threads).div_ceil(TILE).max(1) * TILE;
+    par_bands(&mut out, band * height * 4, |i, rows| {
+        let rows = rows.as_chunks_mut::<4>().0;
+        let x0 = i * band;
+        let x1 = (x0 + rows.len() / height).min(width);
+        for tx in (x0..x1).step_by(TILE) {
+            for ty in (0..height).step_by(TILE) {
+                for x in tx..(tx + TILE).min(x1) {
+                    let row = &mut rows[(x - x0) * height..(x - x0 + 1) * height];
+                    for y in ty..(ty + TILE).min(height) {
+                        row[y] = src[y * width + x];
+                    }
                 }
             }
         }
     });
+    out
 }
 
 /// Box blur of `radius` down each column of `src` into `dst`, edges extended:
@@ -258,32 +266,50 @@ fn box_rows(src: &[u8], dst: &mut [u8], width: usize, radius: usize) {
 /// read sequentially. Bands of output rows are independent and split across
 /// threads (each starts its sums from its own first row).
 fn box_columns(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
-    let mean = Mean::new(radius);
     let stride = width * 4;
+    let threads = threads_for(dst.len());
+    let band = height.div_ceil(threads).max(1);
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    par_bands(dst, band * stride, |i, out| {
+        let y0 = i * band;
+        #[cfg(target_arch = "x86_64")]
+        if avx2 {
+            // SAFETY: the CPU has AVX2, checked above.
+            return unsafe { box_columns_band_avx2(src, out, stride, height, y0, radius) };
+        }
+        box_columns_band(src, out, stride, height, y0, radius)
+    });
+}
+
+/// [`box_columns`] for the output rows from `y0` on, in `out`.
+#[inline(always)]
+fn box_columns_band(src: &[u8], out: &mut [u8], stride: usize, height: usize, y0: usize, radius: usize) {
+    let mean = Mean::new(radius);
     let row = |y: isize| {
         let y = y.clamp(0, height as isize - 1) as usize;
         &src[y * stride..(y + 1) * stride]
     };
-    let threads = threads_for(dst.len());
-    let band = height.div_ceil(threads).max(1);
-    std::thread::scope(|scope| {
-        for (i, out) in dst.chunks_mut(band * stride).enumerate() {
-            scope.spawn(move || {
-                let y0 = (i * band) as isize;
-                let r = radius as isize;
-                let mut sum = vec![0u32; stride];
-                for y in y0 - r..=y0 + r {
-                    sum.iter_mut().zip(row(y)).for_each(|(s, v)| *s += *v as u32);
-                }
-                for (dy, line) in out.chunks_exact_mut(stride).enumerate() {
-                    line.iter_mut().zip(&sum).for_each(|(o, s)| *o = mean.of(*s));
-                    let y = y0 + dy as isize;
-                    let (add, sub) = (row(y + r + 1), row(y - r));
-                    sum.iter_mut().zip(add).zip(sub).for_each(|((s, a), b)| *s = *s + *a as u32 - *b as u32);
-                }
-            });
-        }
-    });
+    let (y0, r) = (y0 as isize, radius as isize);
+    let mut sum = vec![0u32; stride];
+    for y in y0 - r..=y0 + r {
+        sum.iter_mut().zip(row(y)).for_each(|(s, v)| *s += *v as u32);
+    }
+    for (dy, line) in out.chunks_exact_mut(stride).enumerate() {
+        line.iter_mut().zip(&sum).for_each(|(o, s)| *o = mean.of(*s));
+        let y = y0 + dy as isize;
+        let (add, sub) = (row(y + r + 1), row(y - r));
+        sum.iter_mut().zip(add).zip(sub).for_each(|((s, a), b)| *s = *s + *a as u32 - *b as u32);
+    }
+}
+
+/// [`box_columns_band`] compiled for AVX2, which multiplies eight 32-bit
+/// lanes at once (baseline x86-64 has no 32-bit vector multiply): about a
+/// third faster.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn box_columns_band_avx2(src: &[u8], out: &mut [u8], stride: usize, height: usize, y0: usize, radius: usize) {
+    box_columns_band(src, out, stride, height, y0, radius)
 }
 
 /// Approximately gaussian blur of `sigma` pixels, edges extended.
@@ -293,12 +319,20 @@ pub fn gaussian_blur(src: &Pixmap, sigma: f32) -> Pixmap {
     let mut b = vec![0u8; a.len()];
     let boxes = gaussian_boxes(sigma);
     // Box blurs are separable and commute: all horizontal passes, then all
-    // vertical, alternating between two buffers.
-    for r in boxes.into_iter().filter(|b| *b > 1).map(|b| b / 2) {
-        box_rows(&a, &mut b, w, r);
-        std::mem::swap(&mut a, &mut b);
+    // vertical. The horizontal ones run down the columns of the transposed
+    // image: the column pass updates whole rows of sums at once, which
+    // vectorizes, where sliding along a row goes one pixel at a time.
+    let radii: Vec<usize> = boxes.into_iter().filter(|b| *b > 1).map(|b| b / 2).collect();
+    if !radii.is_empty() {
+        a = transpose(&a, w, h);
+        b.resize(a.len(), 0);
+        for &r in &radii {
+            box_columns(&a, &mut b, h, w, r);
+            std::mem::swap(&mut a, &mut b);
+        }
+        a = transpose(&a, h, w);
     }
-    for r in boxes.into_iter().filter(|b| *b > 1).map(|b| b / 2) {
+    for &r in &radii {
         box_columns(&a, &mut b, w, h, r);
         std::mem::swap(&mut a, &mut b);
     }
@@ -462,6 +496,53 @@ mod tests {
         assert!((m0 - m1).abs() < 2.0, "mean {m0} -> {m1}");
         assert!(v1 < v0 / 10.0, "variance {v0} -> {v1}");
         assert!(out.data().chunks(4).all(|c| c[3] == 255));
+    }
+
+    /// The blur's horizontal passes as they were before going through a
+    /// transpose: sliding along each row.
+    fn box_rows_reference(src: &[u8], dst: &mut [u8], width: usize, radius: usize) {
+        let mean = Mean::new(radius);
+        let stride = width * 4;
+        let px = |row: &[u8], i: isize| -> [u32; 4] {
+            let p = i.clamp(0, width as isize - 1) as usize * 4;
+            [row[p] as u32, row[p + 1] as u32, row[p + 2] as u32, row[p + 3] as u32]
+        };
+        par_zip(dst, src, stride, |dst, src| {
+            for (out, row) in dst.chunks_exact_mut(stride).zip(src.chunks_exact(stride)) {
+                let r = radius as isize;
+                let mut sum = [0u32; 4];
+                for i in -r..=r {
+                    let p = px(row, i);
+                    (0..4).for_each(|c| sum[c] += p[c]);
+                }
+                for (x, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    (0..4).for_each(|c| o[c] = mean.of(sum[c]));
+                    let (add, sub) = (x as isize + r + 1, x as isize - r);
+                    if sub >= 0 && (add as usize) < width {
+                        // Interior: no clamping.
+                        let (a, b) = (&row[add as usize * 4..add as usize * 4 + 4], &row[sub as usize * 4..sub as usize * 4 + 4]);
+                        (0..4).for_each(|c| sum[c] = sum[c] + a[c] as u32 - b[c] as u32);
+                    } else {
+                        let (a, b) = (px(row, add), px(row, sub));
+                        (0..4).for_each(|c| sum[c] = sum[c] + a[c] - b[c]);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn horizontal_passes_match_sliding_along_rows() {
+        let (w, h) = (197usize, 61usize);
+        let src: Vec<u8> = (0..w * h * 4).map(|i| ((i * 7919) % 251) as u8).collect();
+        for r in [1, 3, 10, 120] {
+            let mut expected = vec![0u8; src.len()];
+            box_rows_reference(&src, &mut expected, w, r);
+            let t = transpose(&src, w, h);
+            let mut blurred = vec![0u8; t.len()];
+            box_columns(&t, &mut blurred, h, w, r);
+            assert!(transpose(&blurred, h, w) == expected, "radius {r}");
+        }
     }
 
     #[test]

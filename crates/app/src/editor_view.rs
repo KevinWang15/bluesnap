@@ -343,11 +343,12 @@ impl EditorView {
         }
         let Some(pixmap) = self.editor.export() else { return };
         let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
+        let scale = self.editor.scale();
         self.show_toast(Toast::new(toast::Kind::Busy, "Recognizing text…"), window, cx);
         let started = std::time::Instant::now();
         let recognized = cx
             .background_executor()
-            .spawn(async move { bluesnap_platform::native().recognize_text(width, height, &rgba) });
+            .spawn(async move { bluesnap_platform::native().recognize_text(width, height, &rgba, scale) });
         self.ocr = Some(cx.spawn_in(window, async move |this, cx| {
             let result = recognized.await;
             log::debug!("text recognition took {:?}", started.elapsed());
@@ -539,6 +540,7 @@ impl EditorView {
         let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
         let origin = bluesnap_core::Point::new(sel.round().x, sel.round().y);
         let fonts = cx.global::<AppState>().fonts.clone();
+        let scale = self.editor.scale();
         self.show_toast(Toast::new(toast::Kind::Busy, "Reading the text…"), window, cx);
         let started = std::time::Instant::now();
         self.auto = Some(cx.spawn_in(window, async move |this, cx| {
@@ -560,7 +562,7 @@ impl EditorView {
                     .spawn(async move {
                         let part = bluesnap_core::pixels::crop(&band, 0, read.start, band.width(), read.end - read.start)
                             .ok_or_else(|| anyhow::anyhow!("empty band"))?;
-                        bluesnap_platform::native().recognize_text(part.width(), part.height(), &to_rgba_straight(&part))
+                        bluesnap_platform::native().recognize_text(part.width(), part.height(), &to_rgba_straight(&part), scale)
                     })
                     .await;
                 let lines: Vec<(PxRect, String)> = match recognized {

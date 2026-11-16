@@ -336,5 +336,60 @@ fn tools(c: &mut Criterion) {
 
 }
 
-criterion_group!(benches, startup, frames, output, redaction, tools);
+/// A text-like page: lines of dark "words" on white, `w` × `h`.
+fn text_page(w: usize, h: usize) -> Vec<u8> {
+    let mut img = vec![255u8; w * h * 4];
+    let mut seed = 0x1234_5679u32;
+    let mut rnd = |n: u32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed % n
+    };
+    let mut y = 20;
+    while y + 30 < h {
+        let mut x = 40 + rnd(40) as usize;
+        while x + 120 < w {
+            let (len, shade) = (30 + rnd(120) as usize, rnd(120) as u8);
+            for yy in y..y + 26 {
+                img[(yy * w + x) * 4..(yy * w + x + len) * 4].as_chunks_mut::<4>().0.iter_mut().for_each(|p| p[..3].fill(shade));
+            }
+            x += len + 14;
+        }
+        y += 48 + 24 * rnd(3) as usize;
+    }
+    img
+}
+
+fn scrolling(c: &mut Criterion) {
+    let mut g = c.benchmark_group("scrolling");
+    // A 1600 × 1000 view with a 60-row fixed header, scrolled 60 px per frame.
+    let (w, h, header) = (1600usize, 1000usize, 60usize);
+    let page = text_page(w, 3000);
+    let bar = vec![40u8; w * header * 4];
+    let frames: Vec<Vec<u8>> = (0..20)
+        .map(|i| {
+            let y = i * 60;
+            let mut f = bar.clone();
+            f.extend_from_slice(&page[y * w * 4..(y + h - header) * w * 4]);
+            f
+        })
+        .collect();
+    g.bench_function("stitch_20_frames/1600x1000", |b| {
+        b.iter_batched(
+            || frames.clone(),
+            |frames| {
+                let mut s = bluesnap_core::stitch::Stitcher::new(w as u32, 30_000);
+                for f in frames {
+                    black_box(s.push(h as u32, f));
+                }
+                s
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    g.finish();
+}
+
+criterion_group!(benches, startup, frames, output, redaction, tools, scrolling);
 criterion_main!(benches);

@@ -12,3 +12,8 @@ pure-onnx-ocr = "0.3.2"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "recognize"
+harness = false

@@ -155,7 +155,7 @@ pub trait Platform {
 
     /// Recognizes text in straight-alpha RGBA pixels. Blocking; call it off the
     /// UI thread. Lines come back in no particular order.
-    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>>;
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Result<Vec<TextLine>>;
 
     /// Fonts for text in `family`, best first, bold-ish like annotation text
     /// in other tools. Each list ends with CJK-capable fallbacks so mixed-script
@@ -165,8 +165,8 @@ pub trait Platform {
 
 /// The embedded PP-OCRv6 engine, for OSes without a good built-in OCR API.
 #[cfg(not(target_os = "macos"))]
-fn recognize_with_model(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
-    let lines = bluesnap_ocr::recognize(width, height, rgba)?;
+fn recognize_with_model(width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Result<Vec<TextLine>> {
+    let lines = bluesnap_ocr::recognize(width, height, rgba, scale)?;
     Ok(lines
         .into_iter()
         .map(|l| TextLine {

@@ -205,8 +205,8 @@ impl Platform for Native {
 
     /// Windows.Media.Ocr only knows languages whose language pack is installed, and
     /// its accuracy on CJK is poor, so use the embedded model instead.
-    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
-        crate::recognize_with_model(width, height, rgba)
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Result<Vec<TextLine>> {
+        crate::recognize_with_model(width, height, rgba, scale)
     }
 
     fn fonts(&self, family: FontFamily) -> Vec<FontSource> {

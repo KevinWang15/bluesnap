@@ -3,7 +3,7 @@
 #[test]
 fn reads_chinese_japanese_and_latin_text() {
     let image = image::open(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/multilingual.png")).unwrap().to_rgba8();
-    let lines = bluesnap_ocr::recognize(image.width(), image.height(), image.as_raw()).unwrap();
+    let lines = bluesnap_ocr::recognize(image.width(), image.height(), image.as_raw(), 1.0).unwrap();
     let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
     for expected in [
         "Hello, bluesnap! Screenshot OCR test 2026.",

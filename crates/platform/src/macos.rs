@@ -225,7 +225,7 @@ impl Platform for Native {
     }
 
     /// Apple's Vision framework: no bundled model, and good at Chinese.
-    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<TextLine>> {
+    fn recognize_text(&self, width: u32, height: u32, rgba: &[u8], _scale: f32) -> anyhow::Result<Vec<TextLine>> {
         recognize_with_vision(width, height, rgba)
     }
 
