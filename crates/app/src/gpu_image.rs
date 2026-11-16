@@ -15,7 +15,8 @@ use crate::viewport::Viewport;
 /// beyond that, and smaller tiles let scrolling upload only what's visible.
 const TILE_ROWS: u32 = 4096;
 
-fn render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
+/// Wraps straight-alpha BGRA8 pixels in a gpui [`RenderImage`].
+pub fn render_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage>> {
     let buffer = image::RgbaImage::from_raw(width, height, bgra)?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }

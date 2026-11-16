@@ -392,6 +392,96 @@ impl Stitcher {
         }
         pixmap_from_rgba(keep.len() as u32, rows as u32, out)
     }
+
+    /// `(width, height)` of the image [`Self::finish`] would produce, or `None`
+    /// before the first frame.
+    pub fn dimensions(&self) -> Option<(u32, u32)> {
+        let last = self.last.as_ref()?;
+        let width = match &self.layout {
+            Some(layout) => last.columns(&layout.keep).len() as u32,
+            None => self.width as u32,
+        };
+        Some((width, self.height()))
+    }
+
+    /// Downscales the current stitched image into a `dst_w × dst_h` opaque BGRA8
+    /// buffer (ready for GPU upload) without cloning the full body.
+    pub fn thumbnail_bgra(&self, dst_w: u32, dst_h: u32) -> Option<Vec<u8>> {
+        if dst_w == 0 || dst_h == 0 {
+            return None;
+        }
+        let last = self.last.as_ref()?;
+        let (src_w, body_stride, body_x0, footer_x0, footer_rows) = match &self.layout {
+            Some(layout) => {
+                let stored = last.columns(&layout.stored);
+                let keep = last.columns(&layout.keep);
+                (keep.len(), stored.len() * 4, keep.start - stored.start, keep.start, layout.bottom)
+            }
+            None => (self.width, self.width * 4, 0, 0, 0),
+        };
+        if body_stride == 0 {
+            return None;
+        }
+        let body_rows = self.body.len() / body_stride;
+        let src_h = body_rows + footer_rows;
+        if src_w == 0 || src_h == 0 {
+            return None;
+        }
+        let last_stride = last.width * 4;
+        let footer_y0 = last.height - footer_rows;
+        let row_bytes = |sy: usize| -> &[u8] {
+            if sy < body_rows {
+                let start = sy * body_stride + body_x0 * 4;
+                &self.body[start..start + src_w * 4]
+            } else {
+                let fy = footer_y0 + (sy - body_rows);
+                let start = fy * last_stride + footer_x0 * 4;
+                &last.rgba[start..start + src_w * 4]
+            }
+        };
+
+        let (dw, dh) = (dst_w as usize, dst_h as usize);
+        let x_taps: Vec<([usize; 4], usize)> = (0..dw)
+            .map(|dx| {
+                let x0 = (dx * src_w) / dw;
+                let x1 = (((dx + 1) * src_w) / dw).max(x0 + 1).min(src_w);
+                let span = x1 - x0;
+                let nx = span.min(4);
+                let mut xs = [0usize; 4];
+                for (i, slot) in xs[..nx].iter_mut().enumerate() {
+                    *slot = (x0 + ((2 * i + 1) * span) / (2 * nx)).min(src_w - 1) * 4;
+                }
+                (xs, nx)
+            })
+            .collect();
+
+        let mut out = Vec::with_capacity(dw * dh * 4);
+        for dy in 0..dh {
+            let y0 = (dy * src_h) / dh;
+            let y1 = (((dy + 1) * src_h) / dh).max(y0 + 1).min(src_h);
+            let span = y1 - y0;
+            let ny = span.min(4);
+            let mut rows = [&[][..]; 4];
+            for (i, slot) in rows[..ny].iter_mut().enumerate() {
+                let sy = (y0 + ((2 * i + 1) * span) / (2 * ny)).min(src_h - 1);
+                *slot = row_bytes(sy);
+            }
+            for &(xs, nx) in &x_taps {
+                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                for row in &rows[..ny] {
+                    for &xb in &xs[..nx] {
+                        r += row[xb] as u32;
+                        g += row[xb + 1] as u32;
+                        b += row[xb + 2] as u32;
+                    }
+                }
+                let n = (nx * ny) as u32;
+                let half = n / 2;
+                out.extend_from_slice(&[((b + half) / n) as u8, ((g + half) / n) as u8, ((r + half) / n) as u8, 255]);
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Whether the frames are the same, or differ only within one narrow run of strips.
@@ -1060,5 +1150,53 @@ mod tests {
         let expected = (y2 as f32 / 2.0 + height as f32).round() as i32;
         let got = s.finish().unwrap().height() as i32;
         assert!((got - expected).abs() <= 2, "height {got}, expected about {expected}");
+    }
+
+    #[test]
+    fn thumbnail_matches_finished_image_before_and_after_scroll() {
+        let (left_panel, cw, sb, height, doc_h) = (16usize, 80usize, 16usize, 240usize, 2000usize);
+        let total_w = left_panel + cw + sb;
+        let doc = document_w(cw, doc_h, 42);
+        let footer: Vec<u8> = document_w(cw, 20, 777);
+        let mut s = Stitcher::new(total_w as u32, 100_000);
+        assert_eq!(s.dimensions(), None);
+        assert_eq!(s.thumbnail_bgra(20, 20), None);
+
+        let frame = |y: usize, thumb: bool| {
+            let top = y * height / doc_h;
+            let len = height * height / doc_h + 20;
+            let mut body_and_footer = rows_w(&doc, cw, y, y + height - 20).to_vec();
+            body_and_footer.extend_from_slice(&footer);
+            compose(&body_and_footer, cw, 0, height, left_panel, sb, |r, is_left| {
+                if is_left {
+                    [30, (r * 7 % 200) as u8, 90, 255]
+                } else if thumb && (top..top + len).contains(&r) {
+                    [90, 90, 90, 255]
+                } else {
+                    [235, 235, 235, 255]
+                }
+            })
+        };
+
+        assert_eq!(s.push(height as u32, frame(0, false)), Progress::Started);
+        let first = s.finish().unwrap();
+        assert_eq!(s.dimensions(), Some((first.width(), first.height())));
+        assert_eq!(s.thumbnail_bgra(first.width(), first.height()).unwrap(), crate::pixels::to_bgra_straight(&first));
+
+        for y in [50, 120, 200, 290, 380] {
+            assert!(matches!(s.push(height as u32, frame(y, true)), Progress::Appended(_)));
+        }
+        let finished = s.finish().unwrap();
+        assert_eq!(finished.width() as usize, cw);
+        assert_eq!(s.dimensions(), Some((finished.width(), finished.height())));
+        // At 1:1 dimensions, `thumbnail_bgra` must match `finish` pixel-for-pixel.
+        assert_eq!(
+            s.thumbnail_bgra(finished.width(), finished.height()).unwrap(),
+            crate::pixels::to_bgra_straight(&finished)
+        );
+        // Downscaled thumbnail has exact byte length and opaque alpha everywhere.
+        let small = s.thumbnail_bgra(24, 96).unwrap();
+        assert_eq!(small.len(), 24 * 96 * 4);
+        assert!(small.chunks_exact(4).all(|px| px[3] == 255));
     }
 }

@@ -73,9 +73,11 @@ Press the hotkey, then:
   copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.
 - the scrolling-screenshot button (a page with a down arrow) captures more than fits
-  on screen: the overlay closes, a blue frame marks the selection and a bar shows
-  progress. Scroll the window under the frame (mouse wheel or trackpad; input passes
-  through the frame) and bluesnap captures it about 10 times a second, stitching the
+  on screen: the overlay closes, a blue frame marks the selection, a live preview
+  beside its bottom edge grows upward (shrinking in width once it nears the top of
+  the screen) to show the stitched result so far, and a bar shows progress. Scroll
+  the window under the frame (mouse wheel or trackpad; input passes
+  through the frame) and bluesnap captures it about 16 times a second, stitching the
   frames into one tall image. Sticky headers and footers appear once. The bar
   next to the region has Edit, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
   image, Save writes a PNG, ✕ cancels, and Edit opens it in a window with the

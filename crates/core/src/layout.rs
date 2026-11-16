@@ -54,6 +54,44 @@ pub fn place_size_label(sel: Rect, screen: Rect, size: (f32, f32), gap: f32) -> 
     Point::new(x, y)
 }
 
+/// Bounds for the live scrolling-capture preview beside `sel`: bottom-aligned with
+/// `sel` on the right (or on the left when the right side lacks room), growing upward
+/// past `sel.y` as the stitched `image` (`(width, height)`) gets taller. Once its top
+/// reaches `margin` from the top of `screen`, its height stops growing and its width
+/// shrinks proportionally so the whole stitched image continues to fit.
+pub fn place_scrolling_preview(sel: Rect, screen: Rect, image: (u32, u32), gap: f32, margin: f32) -> Option<Rect> {
+    let (img_w, img_h) = (image.0 as f32, image.1 as f32);
+    if img_w <= 0.0 || img_h <= 0.0 {
+        return None;
+    }
+    let max_h = sel.bottom() - (screen.y + margin);
+    if max_h < 24.0 {
+        return None;
+    }
+
+    let right_avail = screen.right() - margin - (sel.right() + gap);
+    let left_avail = (sel.x - gap) - (screen.x + margin);
+    let ideal_w = (sel.w * 0.42).clamp(140.0, 240.0);
+    let (on_right, avail) = if right_avail >= ideal_w.min(140.0) || right_avail >= left_avail {
+        (true, right_avail)
+    } else {
+        (false, left_avail)
+    };
+    if avail < 48.0 {
+        return None;
+    }
+
+    let max_init_h = (sel.h * 0.6).min(max_h * 0.7);
+    let aspect_cap_w = max_init_h * (sel.w / sel.h.max(1.0));
+    let base_w = ideal_w.min(avail).min(aspect_cap_w).max(24.0_f32.min(avail));
+    let scale = (base_w / img_w).min(max_h / img_h);
+    let w = (img_w * scale).clamp(4.0, avail);
+    let h = (img_h * scale).clamp(4.0, max_h);
+    let x = if on_right { sel.right() + gap } else { sel.x - gap - w };
+    let y = sel.bottom() - h;
+    Some(Rect::new(x, y, w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +124,61 @@ mod tests {
         let full = place_panels(SCREEN, SCREEN, (300.0, 40.0), None, 8.0);
         assert_eq!(full.toolbar.y, 752.0);
         assert_eq!(full.toolbar.x, 700.0);
+    }
+
+    #[test]
+    fn scrolling_preview_grows_past_selection_then_shrinks_width_at_top_margin() {
+        let screen = Rect::new(0.0, 0.0, 1200.0, 800.0);
+        let sel = Rect::new(50.0, 200.0, 600.0, 400.0);
+
+        // Initial frame: on the right, bottom-aligned with selection, shorter than selection.
+        let p0 = place_scrolling_preview(sel, screen, (600, 400), 10.0, 10.0).unwrap();
+        assert_eq!(p0.x, 660.0);
+        assert_eq!(p0.bottom(), sel.bottom());
+        assert_eq!(p0.w, 240.0);
+        assert_eq!(p0.h, 160.0);
+
+        // Taller than selection: grows above `sel.y` without changing width or bottom edge.
+        let p1 = place_scrolling_preview(sel, screen, (600, 1200), 10.0, 10.0).unwrap();
+        assert_eq!(p1.x, 660.0);
+        assert_eq!(p1.bottom(), sel.bottom());
+        assert_eq!(p1.w, 240.0);
+        assert_eq!(p1.h, 480.0);
+        assert!(p1.y < sel.y);
+
+        // Reached 10px from top of screen (`max_h = 600 - 10 = 590`): height pins at 590
+        // (`y == 10.0`) and width shrinks proportionally as height keeps doubling.
+        let p2 = place_scrolling_preview(sel, screen, (600, 1770), 10.0, 10.0).unwrap();
+        assert!((p2.y - 10.0).abs() < 1e-4);
+        assert!((p2.bottom() - sel.bottom()).abs() < 1e-4);
+        assert!((p2.h - 590.0).abs() < 1e-4);
+        assert!((p2.w - 200.0).abs() < 1e-4);
+
+        let p3 = place_scrolling_preview(sel, screen, (600, 3540), 10.0, 10.0).unwrap();
+        assert!((p3.y - 10.0).abs() < 1e-4);
+        assert!((p3.h - 590.0).abs() < 1e-4);
+        assert!((p3.w - 100.0).abs() < 1e-4);
+        assert_eq!(p3.x, 660.0);
+    }
+
+    #[test]
+    fn scrolling_preview_prefers_right_flips_left_and_hides_when_full_width() {
+        // Slightly right of center still chooses right when right side fits comfortably.
+        let right_pref = place_scrolling_preview(Rect::new(400.0, 150.0, 430.0, 400.0), SCREEN, (430, 400), 10.0, 10.0).unwrap();
+        assert_eq!(right_pref.x, 840.0);
+
+        // Selection near right edge flips to left and keeps right edge anchored next to selection as it shrinks.
+        let sel_right = Rect::new(450.0, 200.0, 500.0, 400.0);
+        let left_initial = place_scrolling_preview(sel_right, SCREEN, (500, 400), 10.0, 10.0).unwrap();
+        assert!((left_initial.right() - 440.0).abs() < 1e-4);
+        assert_eq!(left_initial.bottom(), sel_right.bottom());
+
+        let left_shrunk = place_scrolling_preview(sel_right, SCREEN, (500, 3000), 10.0, 10.0).unwrap();
+        assert!((left_shrunk.right() - 440.0).abs() < 1e-4);
+        assert!((left_shrunk.y - 10.0).abs() < 1e-4);
+        assert!(left_shrunk.w < left_initial.w);
+
+        // Full-width selection has room on neither side: never overlap the captured hole.
+        assert_eq!(place_scrolling_preview(Rect::new(10.0, 100.0, 980.0, 500.0), SCREEN, (980, 500), 10.0, 10.0), None);
     }
 }

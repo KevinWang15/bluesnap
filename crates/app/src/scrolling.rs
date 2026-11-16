@@ -1,21 +1,23 @@
 //! Scrolling screenshots: after the user picks a region and presses the toolbar
 //! button, the overlay closes so the real app underneath can be scrolled. The
-//! screen stays dimmed except for a click-through hole over the region, a small
-//! bar shows progress, and the region is captured ~10 times a second and
-//! stitched into one tall image.
+//! screen stays dimmed except for a click-through hole over the region, a live
+//! preview beside the selection grows upward as content is stitched, and a small
+//! bar shows status and actions.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bluesnap_core::layout::place_scrolling_preview;
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::shape::Shape;
 use bluesnap_core::stitch::{Progress, Stitcher};
-use bluesnap_core::{Color, THEME_BLUE};
+use bluesnap_core::{Color, Rect as PxRect, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, Styled, Task, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, rgba, size, svg,
+    MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString, Styled, StyledImage, Task, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
+    prelude::FluentBuilder, px, rgb, rgba, size, svg,
 };
 
 use crate::output::{self, Finish};
@@ -24,9 +26,11 @@ use crate::{AppState, document};
 
 /// Time between captures. Fast enough that normal wheel/trackpad scrolling keeps an overlap.
 const INTERVAL: Duration = Duration::from_millis(60);
-/// Border around the hole and gap to the bar, in logical pixels.
+/// Border around the hole and gap to the bar / preview, in logical pixels.
 const BORDER: f32 = 2.0;
 const GAP: f32 = 8.0;
+/// Spacing kept between the live preview and the edges of the display, in logical pixels.
+const PREVIEW_MARGIN: f32 = 10.0;
 /// Width of the bar's status text, in logical pixels.
 const STATUS_WIDTH: f32 = 330.0;
 /// Height cap: 30k rows, and at most ~300 MB of pixels.
@@ -37,11 +41,20 @@ fn hsla(c: Color) -> Hsla {
     rgb(c.to_hex()).into()
 }
 
-/// Dims the screen around the captured region (the "hole", in logical pixels)
-/// and outlines it, like the capture overlay. The platform makes the hole
-/// click-through, so the app underneath can be scrolled.
+/// Dims the screen around the captured region (the "hole", in logical pixels),
+/// outlines it, and renders the live stitched preview beside it. The platform
+/// makes the hole click-through, so the app underneath can be scrolled.
 struct Dim {
     hole: Bounds<gpui::Pixels>,
+    preview: Option<(PxRect, Arc<RenderImage>)>,
+}
+
+impl Dim {
+    fn set_preview(&mut self, next: Option<(PxRect, Arc<RenderImage>)>, window: &mut Window) {
+        if let Some((_, old)) = std::mem::replace(&mut self.preview, next) {
+            window.drop_image(old).ok();
+        }
+    }
 }
 
 impl Render for Dim {
@@ -65,6 +78,20 @@ impl Render for Dim {
                     .border(px(BORDER))
                     .border_color(hsla(THEME_BLUE)),
             )
+            .when_some(self.preview.clone(), |el, (r, image)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(r.x - 1.0))
+                        .top(px(r.y - 1.0))
+                        .w(px(r.w + 2.0))
+                        .h(px(r.h + 2.0))
+                        .border_1()
+                        .border_color(rgba(0xFFFF_FF4D))
+                        .shadow_lg()
+                        .child(gpui::img(image).w(px(r.w)).h(px(r.h)).object_fit(ObjectFit::Fill)),
+                )
+            })
     }
 }
 
@@ -75,7 +102,7 @@ pub struct ScrollingCapture {
     status: SharedString,
     warning: bool,
     height: u32,
-    frame: AnyWindowHandle,
+    frame: WindowHandle<Dim>,
     bar: Option<AnyWindowHandle>,
     /// Annotations made before the capture started, relative to the region's
     /// top-left: the stitched image starts with the region, so they keep
@@ -153,7 +180,7 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
     );
     let frame = cx.open_window(
         helper_window_options(logical_bounds(origin, screen_rect, scale), gpui_display.id(), true),
-        |_, cx| cx.new(|_| Dim { hole }),
+        |_, cx| cx.new(|_| Dim { hole, preview: None }),
     )?;
     frame.update(cx, |_, window, _| {
         if let Err(e) = platform.place_floating_window(window, &display, screen_rect, Some(rect)) {
@@ -161,10 +188,9 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
         }
     })?;
 
-    let frame_handle: AnyWindowHandle = frame.into();
     let bar = cx.open_window(
         helper_window_options(logical_bounds(origin, bar_rect, scale), gpui_display.id(), false),
-        |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), rect, frame_handle, shapes, cx)),
+        |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), screen, rect, frame, shapes, cx)),
     )?;
     bar.update(cx, |this, window, _| {
         if let Err(e) = platform.place_floating_window(window, &this.display, bar_rect, None) {
@@ -178,8 +204,21 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
     Ok(())
 }
 
+struct Step {
+    progress: Progress,
+    height: u32,
+    preview: Option<(PxRect, Arc<RenderImage>)>,
+}
+
 impl ScrollingCapture {
-    fn new(display: DisplayInfo, rect: PixelRect, frame: AnyWindowHandle, shapes: Vec<Shape>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        display: DisplayInfo,
+        screen: (i32, i32),
+        rect: PixelRect,
+        frame: WindowHandle<Dim>,
+        shapes: Vec<Shape>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let stitcher = Arc::new(Mutex::new(None));
         let task = cx.spawn({
             let (display, stitcher) = (display.clone(), stitcher.clone());
@@ -188,11 +227,11 @@ impl ScrollingCapture {
                 cx.background_executor().timer(Duration::from_millis(200)).await;
                 loop {
                     let (display, stitcher) = (display.clone(), stitcher.clone());
-                    let progress = cx
+                    let step = cx
                         .background_executor()
-                        .spawn(async move { capture_and_stitch(&display, rect, &stitcher) })
+                        .spawn(async move { capture_and_stitch(&display, screen, rect, &stitcher) })
                         .await;
-                    if this.update(cx, |this, cx| this.on_progress(progress, cx)).is_err() {
+                    if this.update(cx, |this, cx| this.on_progress(step, cx)).is_err() {
                         break; // the bar was closed
                     }
                     cx.background_executor().timer(INTERVAL).await;
@@ -213,10 +252,22 @@ impl ScrollingCapture {
         }
     }
 
-    fn on_progress(&mut self, progress: anyhow::Result<(Progress, u32)>, cx: &mut Context<Self>) {
-        let (status, warning) = match progress {
-            Ok((progress, height)) => {
-                self.height = height;
+    fn on_progress(&mut self, step: anyhow::Result<Step>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        let (status, warning) = match step {
+            Ok(Step { progress, height, preview }) => {
+                if self.height != height {
+                    self.height = height;
+                    changed = true;
+                }
+                if let Some(preview) = preview {
+                    self.frame
+                        .update(cx, |dim, window, cx| {
+                            dim.set_preview(Some(preview), window);
+                            cx.notify();
+                        })
+                        .ok();
+                }
                 match progress {
                     Progress::Started | Progress::Unchanged | Progress::Appended(_) => {
                         ("Scroll down slowly to capture more", false)
@@ -233,8 +284,11 @@ impl ScrollingCapture {
         };
         if self.status.as_ref() != status || self.warning != warning {
             (self.status, self.warning) = (status.into(), warning);
+            changed = true;
         }
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Stops capturing and closes the dim layer and bar; returns the stitched image.
@@ -242,11 +296,17 @@ impl ScrollingCapture {
         self._task = None;
         let image = self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Stitcher::finish);
         cx.global_mut::<AppState>().scrolling = None;
-        let windows = [Some(self.frame), self.bar];
+        let (frame, bar) = (self.frame, self.bar);
         // Close after this update returns: the bar's own window is borrowed now.
         cx.defer(move |cx| {
-            for handle in windows.into_iter().flatten() {
-                handle.update(cx, |_, window, _| window.remove_window()).ok();
+            frame
+                .update(cx, |dim, window, _| {
+                    dim.set_preview(None, window);
+                    window.remove_window();
+                })
+                .ok();
+            if let Some(bar) = bar {
+                bar.update(cx, |_, window, _| window.remove_window()).ok();
             }
         });
         log::info!("scrolling capture of {}x{} finished", self.rect.width, self.height);
@@ -301,12 +361,43 @@ impl ScrollingCapture {
     }
 }
 
+/// Builds the live preview frame for the current stitched image, snapped to
+/// whole device pixels so its bottom edge and scaling stay rock-steady.
+fn preview_frame(
+    stitcher: &Stitcher,
+    screen: (i32, i32),
+    rect: PixelRect,
+    scale: f32,
+) -> Option<(PxRect, Arc<RenderImage>)> {
+    let dims = stitcher.dimensions()?;
+    let sel = PxRect::new(
+        rect.x as f32 / scale,
+        rect.y as f32 / scale,
+        rect.width as f32 / scale,
+        rect.height as f32 / scale,
+    );
+    let screen_rect = PxRect::new(0.0, 0.0, screen.0 as f32 / scale, screen.1 as f32 / scale);
+    let bounds = place_scrolling_preview(sel, screen_rect, dims, BORDER + GAP, PREVIEW_MARGIN)?;
+    let tw = (bounds.w * scale).round().max(1.0) as u32;
+    let th = (bounds.h * scale).round().max(1.0) as u32;
+    let snapped = PxRect::new(
+        (bounds.x * scale).round() / scale,
+        ((rect.y + rect.height) as f32 - th as f32) / scale,
+        tw as f32 / scale,
+        th as f32 / scale,
+    );
+    let bgra = stitcher.thumbnail_bgra(tw, th)?;
+    let image = crate::gpu_image::render_image(tw, th, bgra)?;
+    Some((snapped, image))
+}
+
 /// One capture-and-stitch step, off the UI thread.
 fn capture_and_stitch(
     display: &DisplayInfo,
+    screen: (i32, i32),
     rect: PixelRect,
     stitcher: &Mutex<Option<Stitcher>>,
-) -> anyhow::Result<(Progress, u32)> {
+) -> anyhow::Result<Step> {
     let image = bluesnap_platform::native().capture_region(display, rect)?;
     let mut bgrx = image.bgrx;
     let rgba = split_bgrx(&mut bgrx);
@@ -330,7 +421,12 @@ fn capture_and_stitch(
             pixmap.save_png(&path).ok();
         }
     }
-    Ok((progress, stitcher.height()))
+    let preview = if matches!(progress, Progress::Started | Progress::Appended(_) | Progress::Full) {
+        preview_frame(stitcher, screen, rect, display.scale_factor)
+    } else {
+        None
+    };
+    Ok(Step { progress, height: stitcher.height(), preview })
 }
 
 impl Render for ScrollingCapture {
