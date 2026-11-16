@@ -19,6 +19,6 @@ pub mod text;
 pub use editor::{BrushRing, Editor, RightClick, SelectionMode, TextKey};
 pub use geom::{CursorKind, Point, Rect};
 pub use render::Document;
-pub use style::{Color, CounterFormat, PALETTE, TextStyle, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, Tool};
+pub use style::{ArrowStyle, Color, CounterFormat, PALETTE, TextStyle, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, Tool};
 pub use text::{FontFamily, FontSet, FontSource, Fonts};
 pub use tiny_skia::Pixmap;

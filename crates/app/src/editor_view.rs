@@ -968,10 +968,14 @@ impl Render for EditorView {
                 root = root.child(match self.editor.current_redaction() {
                     Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, at.x, at.y, cx),
                     None => {
-                        let extra = match (self.editor.current_counter_format(), self.editor.current_text_style()) {
-                            (Some(numbering), _) => toolbar::Extra::Numbering(numbering),
-                            (_, Some(text)) => toolbar::Extra::TextStyle(text, self.text_menu),
-                            _ => toolbar::Extra::None,
+                        let extra = if let Some(numbering) = self.editor.current_counter_format() {
+                            toolbar::Extra::Numbering(numbering)
+                        } else if let Some(text) = self.editor.current_text_style() {
+                            toolbar::Extra::TextStyle(text, self.text_menu)
+                        } else if let Some(arrow) = self.editor.current_arrow_style() {
+                            toolbar::Extra::ArrowStyle(arrow)
+                        } else {
+                            toolbar::Extra::None
                         };
                         toolbar::style_bar(tool, style.size, style.color, extra, at.x, at.y, cx)
                     }

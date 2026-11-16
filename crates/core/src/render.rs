@@ -13,8 +13,8 @@ use tiny_skia::{
 use crate::geom::{Point, Rect};
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
 use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
-use crate::shape::{Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size, text_box};
-use crate::style::{COUNTER_DARK_TEXT, Color, HIGHLIGHT_ALPHA, REDACT_GRAY, RedactEffect, TextBackdrop, TextStyle};
+use crate::shape::{ArrowPath, Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size, text_box};
+use crate::style::{ArrowStyle, COUNTER_DARK_TEXT, Color, HIGHLIGHT_ALPHA, REDACT_GRAY, RedactEffect, TextBackdrop, TextStyle};
 use crate::text::{FontSet, Fonts};
 
 /// The frozen screenshot an editing session works on.
@@ -217,7 +217,7 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
             }
         }
-        Geometry::Arrow { from, to } => draw_arrow(pixmap, *from, *to, w, &paint, ts),
+        Geometry::Arrow { from, to, style } => draw_arrow(pixmap, *from, *to, *style, w, &paint, ts),
         Geometry::Pen(pts) => {
             if let Some(path) = smooth_path(pts) {
                 pixmap.stroke_path(&path, &paint, &stroke(w, LineJoin::Round), ts, None);
@@ -271,26 +271,36 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
     }
 }
 
-fn draw_arrow(pixmap: &mut Pixmap, from: Point, to: Point, w: f32, paint: &Paint, ts: Transform) {
-    let v = to - from;
-    let len = v.length();
+fn draw_arrow(pixmap: &mut Pixmap, from: Point, to: Point, style: ArrowStyle, w: f32, paint: &Paint, ts: Transform) {
+    let len = from.distance(to);
     if len < 1.0 {
         return;
     }
-    let dir = Point::new(v.x / len, v.y / len);
-    let perp = Point::new(-dir.y, dir.x);
     let head = arrow_head_len(w).min(len);
+    // The line stops inside the head so its round cap doesn't poke out of the tip.
+    let (dir, line) = ArrowPath::new(from, to, style, w).split_tip(head, head * 0.6);
+    let perp = Point::new(-dir.y, dir.x);
     let half = head * 0.45;
-    let base = Point::new(to.x - dir.x * head, to.y - dir.y * head);
+    let base = to - dir * head;
 
-    // The shaft stops inside the head so its round cap doesn't poke out of the tip.
-    let shaft_end = Point::new(to.x - dir.x * head * 0.6, to.y - dir.y * head * 0.6);
     let mut pb = PathBuilder::new();
     pb.move_to(from.x, from.y);
-    pb.line_to(shaft_end.x, shaft_end.y);
+    match &line {
+        ArrowPath::Segments { points, radius } => {
+            for corner in points.windows(3) {
+                let (a, p, b) = (corner[0], corner[1], corner[2]);
+                let r = radius.min(a.distance(p) / 2.0).min(p.distance(b) / 2.0);
+                let (into, out) = (p - (p - a).normalized() * r, p + (b - p).normalized() * r);
+                pb.line_to(into.x, into.y);
+                pb.quad_to(p.x, p.y, out.x, out.y);
+            }
+            let end = points[points.len() - 1];
+            pb.line_to(end.x, end.y);
+        }
+        ArrowPath::Cubic([_, c1, c2, end]) => pb.cubic_to(c1.x, c1.y, c2.x, c2.y, end.x, end.y),
+    }
     if let Some(path) = pb.finish() {
-        let s = Stroke { width: w, line_cap: LineCap::Round, ..Stroke::default() };
-        pixmap.stroke_path(&path, paint, &s, ts, None);
+        pixmap.stroke_path(&path, paint, &stroke(w, LineJoin::Round), ts, None);
     }
 
     let mut pb = PathBuilder::new();

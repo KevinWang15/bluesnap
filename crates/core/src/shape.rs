@@ -1,14 +1,14 @@
 //! Annotation shapes: geometry, hit testing and editing handles.
 
 use crate::geom::{Handle, Point, Rect, distance_to_segment};
-use crate::style::{CounterFormat, RedactEffect, Style, TextBackdrop, TextStyle, Tool};
+use crate::style::{ArrowStyle, CounterFormat, RedactEffect, Style, TextBackdrop, TextStyle, Tool};
 use crate::text::{FontSet, Fonts, TextLayout};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Geometry {
     Rect(Rect),
     Ellipse(Rect),
-    Arrow { from: Point, to: Point },
+    Arrow { from: Point, to: Point, style: ArrowStyle },
     Pen(Vec<Point>),
     /// A translucent stroke through the points.
     Highlight(Vec<Point>),
@@ -75,7 +75,7 @@ impl Shape {
         let geometry = match &self.geometry {
             Geometry::Rect(r) => Geometry::Rect(r.translate(d)),
             Geometry::Ellipse(r) => Geometry::Ellipse(r.translate(d)),
-            Geometry::Arrow { from, to } => Geometry::Arrow { from: *from + d, to: *to + d },
+            Geometry::Arrow { from, to, style } => Geometry::Arrow { from: *from + d, to: *to + d, style: *style },
             Geometry::Pen(pts) => Geometry::Pen(pts.iter().map(|p| *p + d).collect()),
             Geometry::Highlight(pts) => Geometry::Highlight(pts.iter().map(|p| *p + d).collect()),
             Geometry::Counter { center, number, format } => {
@@ -101,7 +101,9 @@ impl Shape {
         let w = self.size_px(m.scale);
         match &self.geometry {
             Geometry::Rect(r) | Geometry::Ellipse(r) => r.inflate(w / 2.0 + 1.0),
-            Geometry::Arrow { from, to } => Rect::from_points(*from, *to).inflate(arrow_head_len(w) + 1.0),
+            Geometry::Arrow { from, to, style } => {
+                points_bounds(&ArrowPath::new(*from, *to, *style, w).flatten()).inflate(arrow_head_len(w) + 1.0)
+            }
             Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 points_bounds(pts).inflate(w / 2.0 + 1.0)
             }
@@ -135,7 +137,10 @@ impl Shape {
                 let d = Point::new((p.x - c.x) / a, (p.y - c.y) / b).length();
                 (d - 1.0).abs() * a.min(b) <= tol
             }
-            Geometry::Arrow { from, to } => distance_to_segment(p, *from, *to) <= tol.max(arrow_head_len(w) / 2.0),
+            Geometry::Arrow { from, to, style } => {
+                let tol = tol.max(arrow_head_len(w) / 2.0);
+                ArrowPath::new(*from, *to, *style, w).flatten().windows(2).any(|s| distance_to_segment(p, s[0], s[1]) <= tol)
+            }
             Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 pts.windows(2).any(|s| distance_to_segment(p, s[0], s[1]) <= tol)
                     || pts.first().is_some_and(|q| q.distance(p) <= tol)
@@ -151,7 +156,7 @@ impl Shape {
             Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
                 Handle::ALL.iter().map(|h| (EditHandle::Bounds(*h), r.handle_point(*h))).collect()
             }
-            Geometry::Arrow { from, to } => vec![(EditHandle::ArrowFrom, *from), (EditHandle::ArrowTo, *to)],
+            Geometry::Arrow { from, to, .. } => vec![(EditHandle::ArrowFrom, *from), (EditHandle::ArrowTo, *to)],
             _ => Vec::new(),
         }
     }
@@ -164,8 +169,12 @@ impl Shape {
             (Geometry::Redact { area: RedactShape::Rect(r), effect, strength }, EditHandle::Bounds(h)) => {
                 Geometry::Redact { area: RedactShape::Rect(r.resized(h, delta)), effect: *effect, strength: *strength }
             }
-            (Geometry::Arrow { from, to }, EditHandle::ArrowFrom) => Geometry::Arrow { from: *from + delta, to: *to },
-            (Geometry::Arrow { from, to }, EditHandle::ArrowTo) => Geometry::Arrow { from: *from, to: *to + delta },
+            (Geometry::Arrow { from, to, style }, EditHandle::ArrowFrom) => {
+                Geometry::Arrow { from: *from + delta, to: *to, style: *style }
+            }
+            (Geometry::Arrow { from, to, style }, EditHandle::ArrowTo) => {
+                Geometry::Arrow { from: *from, to: *to + delta, style: *style }
+            }
             (g, _) => g.clone(),
         };
         Shape { geometry, style: self.style }
@@ -177,7 +186,7 @@ impl Shape {
             Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
                 r.w < 2.0 || r.h < 2.0
             }
-            Geometry::Arrow { from, to } => from.distance(*to) < 4.0,
+            Geometry::Arrow { from, to, .. } => from.distance(*to) < 4.0,
             Geometry::Pen(pts) | Geometry::Highlight(pts) | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
                 pts.len() < 2
             }
@@ -222,6 +231,102 @@ pub fn arrow_head_len(stroke: f32) -> f32 {
     10.0 + stroke * 3.0
 }
 
+/// The line an arrow is drawn along, from its start to its tip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArrowPath {
+    /// Straight segments through the points (two points for a straight
+    /// arrow, four for an elbow), with corners rounded to `radius`.
+    Segments { points: Vec<Point>, radius: f32 },
+    /// A cubic Bézier curve: start, two control points, tip.
+    Cubic([Point; 4]),
+}
+
+impl ArrowPath {
+    /// The path of an arrow in `style` with lines `stroke` wide.
+    pub fn new(from: Point, to: Point, style: ArrowStyle, stroke: f32) -> ArrowPath {
+        let d = to - from;
+        // Elbows and curves leave the start and reach the tip along the longer
+        // axis, turning halfway: right, down, right for a wide arrow.
+        let horizontal = d.x.abs() >= d.y.abs();
+        let (major, minor) = if horizontal { (d.x.abs(), d.y.abs()) } else { (d.y.abs(), d.x.abs()) };
+        let turns = if horizontal {
+            let x = from.x + d.x / 2.0;
+            [Point::new(x, from.y), Point::new(x, to.y)]
+        } else {
+            let y = from.y + d.y / 2.0;
+            [Point::new(from.x, y), Point::new(to.x, y)]
+        };
+        let straight = ArrowPath::Segments { points: vec![from, to], radius: 0.0 };
+        match style {
+            ArrowStyle::Straight => straight,
+            ArrowStyle::Elbow => {
+                // A jog shorter than this looks like a slip of the hand, and the end
+                // legs must hold the head with some line before it; arrows too
+                // small for either are drawn straight.
+                let min_jog = 3.0 * stroke + 10.0;
+                let min_leg = arrow_head_len(stroke) + 3.0 * stroke + 6.0;
+                if minor < min_jog || major / 2.0 < min_leg {
+                    return straight;
+                }
+                let radius = (2.0 * stroke + 8.0).min(minor / 2.0);
+                ArrowPath::Segments { points: vec![from, turns[0], turns[1], to], radius }
+            }
+            ArrowStyle::Curved => ArrowPath::Cubic([from, turns[0], turns[1], to]),
+        }
+    }
+
+    /// Points along the path, close enough together for hit testing and bounds.
+    pub fn flatten(&self) -> Vec<Point> {
+        match self {
+            ArrowPath::Segments { points, .. } => points.clone(),
+            ArrowPath::Cubic(c) => (0..=32).map(|i| cubic_point(c, i as f32 / 32.0)).collect(),
+        }
+    }
+
+    /// Where the tip points (a unit vector), judged over the last `head`
+    /// pixels so a head on a curve lines up with the curve under it, and the
+    /// path cut short by `cut` pixels so the line ends inside the head.
+    pub fn split_tip(&self, head: f32, cut: f32) -> (Point, ArrowPath) {
+        match self {
+            ArrowPath::Segments { points, radius } => {
+                let n = points.len();
+                let (prev, tip) = (points[n - 2], points[n - 1]);
+                let dir = (tip - prev).normalized();
+                let mut points = points.clone();
+                points[n - 1] = tip - dir * cut.min(prev.distance(tip));
+                (dir, ArrowPath::Segments { points, radius: *radius })
+            }
+            ArrowPath::Cubic(c) => {
+                let base = cubic_point(c, cubic_t_back(c, head));
+                let dir = (c[3] - base).normalized();
+                (dir, ArrowPath::Cubic(cubic_until(c, cubic_t_back(c, cut))))
+            }
+        }
+    }
+}
+
+fn cubic_point(c: &[Point; 4], t: f32) -> Point {
+    let [p01, p12, p23] = [c[0].lerp(c[1], t), c[1].lerp(c[2], t), c[2].lerp(c[3], t)];
+    p01.lerp(p12, t).lerp(p12.lerp(p23, t), t)
+}
+
+/// The part of the curve from t = 0 to `t` (de Casteljau).
+fn cubic_until(c: &[Point; 4], t: f32) -> [Point; 4] {
+    let [p01, p12, p23] = [c[0].lerp(c[1], t), c[1].lerp(c[2], t), c[2].lerp(c[3], t)];
+    let (p012, p123) = (p01.lerp(p12, t), p12.lerp(p23, t));
+    [c[0], p01, p012, p012.lerp(p123, t)]
+}
+
+/// The last t at which the curve is `distance` pixels from its tip.
+fn cubic_t_back(c: &[Point; 4], distance: f32) -> f32 {
+    const STEPS: u32 = 256;
+    (0..=STEPS)
+        .rev()
+        .map(|i| i as f32 / STEPS as f32)
+        .find(|&t| cubic_point(c, t).distance(c[3]) >= distance)
+        .unwrap_or(0.0)
+}
+
 fn points_bounds(pts: &[Point]) -> Rect {
     let first = pts.first().copied().unwrap_or_default();
     pts.iter().fold(Rect::from_points(first, first), |r, p| r.union(&Rect::from_points(*p, *p)))
@@ -254,11 +359,51 @@ mod tests {
     #[test]
     fn arrow_handles_move_independently() {
         let s = Shape {
-            geometry: Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(10.0, 10.0) },
+            geometry: Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(10.0, 10.0), style: ArrowStyle::Elbow },
             style: Style::default(),
         };
         let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0));
-        assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0) });
+        let style = ArrowStyle::Elbow;
+        assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0), style });
+    }
+
+    #[test]
+    fn elbow_arrows_turn_twice_along_the_longer_axis() {
+        let path = |to: (f32, f32)| ArrowPath::new(Point::new(0.0, 0.0), Point::new(to.0, to.1), ArrowStyle::Elbow, 4.0);
+        let points = |to| match path(to) {
+            ArrowPath::Segments { points, .. } => points,
+            other => panic!("{other:?}"),
+        };
+        // Wide: right, down, right, turning halfway across.
+        assert_eq!(points((-200.0, 80.0)), [(0.0, 0.0), (-100.0, 0.0), (-100.0, 80.0), (-200.0, 80.0)].map(|(x, y)| Point::new(x, y)));
+        // Tall: down, across, down.
+        assert_eq!(points((60.0, 300.0)), [(0.0, 0.0), (0.0, 150.0), (60.0, 150.0), (60.0, 300.0)].map(|(x, y)| Point::new(x, y)));
+        // A jog of a few pixels, or legs too short for the head, are drawn straight.
+        assert_eq!(points((300.0, 15.0)).len(), 2);
+        assert_eq!(points((60.0, 40.0)).len(), 2);
+        let ArrowPath::Segments { radius, .. } = path((-200.0, 80.0)) else { unreachable!() };
+        assert_eq!(radius, 16.0);
+    }
+
+    #[test]
+    fn curved_arrows_reach_the_tip_along_the_longer_axis() {
+        let path = ArrowPath::new(Point::new(0.0, 0.0), Point::new(300.0, 120.0), ArrowStyle::Curved, 4.0);
+        let pts = path.flatten();
+        assert_eq!((pts[0], pts[pts.len() - 1]), (Point::new(0.0, 0.0), Point::new(300.0, 120.0)));
+        // An S: flat at both ends, through the middle halfway.
+        assert!((pts[16].x - 150.0).abs() < 0.01 && (pts[16].y - 60.0).abs() < 0.01);
+        let (dir, line) = path.split_tip(22.0, 13.0);
+        assert!(dir.x > 0.99, "{dir:?}");
+        let ArrowPath::Cubic(c) = line else { panic!() };
+        assert!((c[3].distance(Point::new(300.0, 120.0)) - 13.0).abs() < 1.0);
+        // Hit along the curve, not along the straight line between the ends.
+        let fonts = Fonts::empty();
+        let s = Shape {
+            geometry: Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(300.0, 120.0), style: ArrowStyle::Curved },
+            style: Style::default(),
+        };
+        assert!(s.hit(pts[4], metrics(&fonts)));
+        assert!(!s.hit(Point::new(75.0, 30.0), metrics(&fonts)));
     }
 
     #[test]

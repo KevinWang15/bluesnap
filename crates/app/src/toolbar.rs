@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use bluesnap_core::{Color, CounterFormat, PALETTE, TextStyle, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
+use bluesnap_core::{ArrowStyle, Color, CounterFormat, PALETTE, TextStyle, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
 use gpui::{
     AnyElement, AnyView, App, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
@@ -212,6 +212,10 @@ pub fn style_slots(tool: Tool) -> Vec<Slot> {
             slots.extend(CounterFormat::ALL.map(|f| item(format!("numbering:{f:?}"), STYLE_BUTTON)));
         }
         Tool::Text => slots.extend([Slot::Sep, item("text-style".into(), TEXT_STYLE)]),
+        Tool::Arrow => {
+            slots.push(Slot::Sep);
+            slots.extend(ArrowStyle::ALL.map(|s| item(format!("arrow-style:{s:?}"), STYLE_BUTTON)));
+        }
         _ => {}
     }
     slots
@@ -409,6 +413,8 @@ pub enum Extra {
     Numbering(CounterFormat),
     /// The text style, and whether its menu is open.
     TextStyle(TextStyle, bool),
+    /// The line arrows take.
+    ArrowStyle(ArrowStyle),
 }
 
 /// The style bar of a tool with a color.
@@ -458,6 +464,20 @@ pub fn style_bar(
                 .child(div().text_size(px(9.)).child(if open { "▲" } else { "▼" }))
                 .on_mouse_down(MouseButton::Left, on_press(cx, |this, _, _| this.toggle_text_styles())),
         );
+    }
+    if let Extra::ArrowStyle(current) = extra {
+        bar = bar.child(separator());
+        for style in ArrowStyle::ALL {
+            let (label, icon) = match style {
+                ArrowStyle::Straight => ("Straight arrow", "icons/arrow.svg"),
+                ArrowStyle::Elbow => ("Elbow arrow: right-angle turns", "icons/arrow-elbow.svg"),
+                ArrowStyle::Curved => ("Curved arrow", "icons/arrow-curved.svg"),
+            };
+            bar = bar.child(
+                segment(label, icon, style == current)
+                    .on_mouse_down(MouseButton::Left, on_press(cx, move |this, _, _| this.editor_mut().set_arrow_style(style))),
+            );
+        }
     }
     if let Extra::Numbering(current) = extra {
         bar = bar.child(separator());

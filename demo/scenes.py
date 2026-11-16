@@ -101,9 +101,19 @@ def shapes(layout):
     rec.drag((card[0] - 14, card[1] - 10), (card[0] + card[2] + 14, card[1] + 80), 700)
     rec.press("Tool(Ellipse)")
     rec.drag((time_[0] + 80, time_[1] - 12), (time_[0] + 330, time_[1] + 50), 700)
-    rec.caption("Arrows")
+    rec.caption("Arrows: straight, elbow or curved")
     rec.press("Tool(Arrow)")
     rec.drag((card[0] + card[2] + 120, card[1] - 90), (card[0] + card[2] + 24, card[1] + 6), 700)
+    # A new arrow stays selected and a style applies to it, so deselect first.
+    empty = (desktop.CHAT[0] + 160, desktop.CHAT[1] + desktop.CHAT[3] - 60)
+    rec.click(empty, 300)
+    rec.press("style:arrow-style:Elbow")
+    phone = layout.spots["line:anything breaks: (415) 555-0198"]
+    rec.drag((phone[0] + 676, phone[1] - 118), (phone[0] + phone[2] + 16, phone[1] + 16), 800)
+    rec.click(empty, 300)
+    rec.press("style:arrow-style:Curved")
+    invoice = layout.spots["line:Can someone pay the hosting invoice?"]
+    rec.drag((invoice[0] + 706, invoice[1] - 84), (invoice[0] + invoice[2] + 16, invoice[1] + 16), 800)
     rec.caption("The pen, in any color")
     rec.press("Tool(Pen)")
     rec.press("style:color:3")

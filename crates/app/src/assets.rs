@@ -18,6 +18,8 @@ icons![
     "rect", "ellipse", "arrow", "pen", "highlighter", "counter", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
     // The redact style bar.
     "brush", "area", "blur", "gray", "auto",
+    // The arrow style bar ("arrow" is the straight one).
+    "arrow-elbow", "arrow-curved",
     // Toasts.
     "spinner", "warning", "info",
 ];

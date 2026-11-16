@@ -10,7 +10,7 @@ use tiny_skia::Pixmap;
 use crate::geom::{CursorKind, Handle, Point, Rect};
 use crate::render::{self, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
-use crate::style::{Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, TextStyle, Tool};
+use crate::style::{ArrowStyle, Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, TextStyle, Tool};
 use crate::text::{Fonts, TextLayout};
 
 /// Movement (in logical pixels) before a press turns into a drag.
@@ -105,6 +105,7 @@ pub struct Editor {
     counter_format: CounterFormat,
     /// The text tool's style for new text.
     text_style: TextStyle,
+    arrow_style: ArrowStyle,
     /// Inside `begin_continuous_edit` .. `end_continuous_edit`; `true` once an
     /// undo snapshot was taken for it.
     continuous: Option<bool>,
@@ -140,6 +141,7 @@ impl Editor {
             redaction: Redaction::default(),
             counter_format: CounterFormat::default(),
             text_style: TextStyle::default(),
+            arrow_style: ArrowStyle::default(),
             continuous: None,
             text: None,
             revision: 0,
@@ -381,6 +383,33 @@ impl Editor {
         self.touch_shapes();
     }
 
+    /// The arrow style the style bar should show: the selected arrow's, else
+    /// the arrow tool's when it is active.
+    pub fn current_arrow_style(&self) -> Option<ArrowStyle> {
+        match self.selected.and_then(|i| self.shapes.get(i)) {
+            Some(shape) => match &shape.geometry {
+                Geometry::Arrow { style, .. } => Some(*style),
+                _ => None,
+            },
+            None => (self.tool == Some(Tool::Arrow)).then_some(self.arrow_style),
+        }
+    }
+
+    /// Applies to the selected arrow if there is one (one undo step), and to
+    /// new arrows.
+    pub fn set_arrow_style(&mut self, new: ArrowStyle) {
+        self.arrow_style = new;
+        let Some(idx) = self.selected.filter(|&i| matches!(self.shapes[i].geometry, Geometry::Arrow { .. })) else {
+            return self.touch();
+        };
+        self.begin_change();
+        if let Geometry::Arrow { style, .. } = &mut self.shapes[idx].geometry {
+            *style = new;
+        }
+        self.end_change();
+        self.touch_shapes();
+    }
+
     /// Renumbers every counter with `format`, and new ones (one undo step).
     pub fn set_counter_format(&mut self, format: CounterFormat) {
         self.counter_format = format;
@@ -609,7 +638,7 @@ impl Editor {
         let geometry = match tool {
             Tool::Rect => Geometry::Rect(Rect::from_points(p, p)),
             Tool::Ellipse => Geometry::Ellipse(Rect::from_points(p, p)),
-            Tool::Arrow => Geometry::Arrow { from: p, to: p },
+            Tool::Arrow => Geometry::Arrow { from: p, to: p, style: self.arrow_style },
             Tool::Pen => Geometry::Pen(vec![p]),
             Tool::Highlighter => Geometry::Highlight(vec![p]),
             Tool::Counter => Geometry::Counter {
@@ -1439,8 +1468,8 @@ mod tests {
         };
         // Nearly diagonal: onto the diagonal, at the point nearest the pointer.
         let diagonal = Point::new(150.0, 150.0);
-        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), true), Geometry::Arrow { from: start, to: diagonal });
-        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), false), Geometry::Arrow { from: start, to: Point::new(148.0, 152.0) });
+        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), true), Geometry::Arrow { from: start, to: diagonal, style: ArrowStyle::Straight });
+        assert_eq!(draw(Tool::Arrow, (148.0, 152.0), false), Geometry::Arrow { from: start, to: Point::new(148.0, 152.0), style: ArrowStyle::Straight });
         // Brush strokes become one straight segment, dropping the wiggle.
         assert_eq!(draw(Tool::Pen, (148.0, 152.0), true), Geometry::Pen(vec![start, diagonal]));
         assert_eq!(draw(Tool::Pen, (100.0, 40.0), true), Geometry::Pen(vec![start, Point::new(100.0, 40.0)]));
@@ -1459,10 +1488,28 @@ mod tests {
         e.pointer_move(Point::new(148.0, 152.0), false);
         let revision = e.revision();
         e.constrain_changed(true);
-        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: diagonal });
+        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: diagonal, style: ArrowStyle::Straight });
         assert_ne!(e.revision(), revision);
         e.constrain_changed(false);
-        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: Point::new(148.0, 152.0) });
+        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: Point::new(148.0, 152.0), style: ArrowStyle::Straight });
+    }
+
+    #[test]
+    fn arrow_style_applies_to_new_and_selected_arrows_in_one_undo_step() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        assert_eq!(e.current_arrow_style(), None);
+        e.toggle_tool(Tool::Arrow);
+        assert_eq!(e.current_arrow_style(), Some(ArrowStyle::Straight));
+        e.set_arrow_style(ArrowStyle::Elbow);
+        assert!(!e.can_undo());
+        drag(&mut e, (50.0, 50.0), (250.0, 150.0));
+        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
+        e.selected = Some(0);
+        e.set_arrow_style(ArrowStyle::Curved);
+        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Curved, .. }));
+        e.undo();
+        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
     }
 
     #[test]
@@ -1597,6 +1644,7 @@ mod tests {
                     21 => {
                         e.set_text_style(TextStyle::ALL[next(7) as usize]);
                         e.set_counter_format(CounterFormat::ALL[next(4) as usize]);
+                        e.set_arrow_style(ArrowStyle::ALL[next(3) as usize]);
                     }
                     22 => {
                         e.add_redactions(&[Rect::new(p.x, p.y, 30.0, 12.0)]);

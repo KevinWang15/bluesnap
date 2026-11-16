@@ -5,7 +5,7 @@ A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https:
 | | |
 |---|---|
 | **Pick a window** under the cursor<br>![Picking a window](docs/demo/pick-window.gif) | **Drag a region**, then resize or move it<br>![Selecting a region](docs/demo/select-region.gif) |
-| **Loupe**: magnified pixels, position, size and color<br>![The loupe](docs/demo/loupe.gif) | **Shapes**: rectangle, ellipse, arrow, pen<br>![Drawing shapes](docs/demo/shapes.gif) |
+| **Loupe**: magnified pixels, position, size and color<br>![The loupe](docs/demo/loupe.gif) | **Shapes**: rectangle, ellipse, arrows (straight, elbow, curved), pen<br>![Drawing shapes](docs/demo/shapes.gif) |
 | **Text** in seven styles<br>![Text styles](docs/demo/text-styles.gif) | **Highlighter** with a chisel nib<br>![The highlighter](docs/demo/highlighter.gif) |
 | **Counter**: numbered markers<br>![Counter markers](docs/demo/counter.gif) | **Redact** with mosaic, blur or gray<br>![Redacting](docs/demo/redact.gif) |
 | **Auto redact** with AI<br>![Auto redaction](docs/demo/auto-redact.gif) | **Scrolling screenshots**<br>![A scrolling screenshot](docs/demo/scrolling.gif) |
@@ -29,6 +29,13 @@ Press the hotkey, then:
   text. Click an existing
   annotation to select it, then drag it, drag its handles, change its size/color in
   the style bar, or press Delete. Ctrl/Cmd+Z undoes.
+- **arrows** come in three styles, picked in the arrow style bar: **straight**,
+  **elbow** (horizontal and vertical segments with rounded corners, like an elbow
+  connector in a diagram: three segments along the longer side, such as left, up,
+  left, turning halfway; an arrow whose jog or end segments would be too short to
+  look right is drawn straight) and **curved** (an S curve that leaves the start
+  and reaches the tip along the same axis). Changing the style of a selected arrow
+  is one undo step.
 - hold **Shift** while drawing, as in Paint: arrows and pen, highlighter and redact
   brush strokes become straight lines locked to one of eight directions (every
   45°), and rectangles, ellipses and redact areas become squares and circles.

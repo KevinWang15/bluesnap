@@ -212,6 +212,23 @@ impl TextStyle {
     }
 }
 
+/// The line an arrow takes from its start to its tip, named like the
+/// connectors of diagramming tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ArrowStyle {
+    #[default]
+    Straight,
+    /// Horizontal and vertical segments with rounded corners (an elbow or
+    /// orthogonal connector): usually three, like right, down, right.
+    Elbow,
+    /// An S curve, leaving the start and reaching the tip along the same axis.
+    Curved,
+}
+
+impl ArrowStyle {
+    pub const ALL: [ArrowStyle; 3] = [ArrowStyle::Straight, ArrowStyle::Elbow, ArrowStyle::Curved];
+}
+
 /// How counters are numbered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CounterFormat {

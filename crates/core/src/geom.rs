@@ -1,6 +1,6 @@
 //! Geometry in screenshot pixel space (physical pixels, origin top-left).
 
-use std::ops::{Add, Sub};
+use std::ops::{Add, Mul, Sub};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
@@ -19,6 +19,24 @@ impl Point {
 
     pub fn length(self) -> f32 {
         self.x.hypot(self.y)
+    }
+
+    /// This vector scaled to length 1 (zero stays zero).
+    pub fn normalized(self) -> Point {
+        let len = self.length();
+        if len == 0.0 { self } else { self * (1.0 / len) }
+    }
+
+    /// The point a fraction `t` of the way from `self` to `other`.
+    pub fn lerp(self, other: Point, t: f32) -> Point {
+        self + (other - self) * t
+    }
+}
+
+impl Mul<f32> for Point {
+    type Output = Point;
+    fn mul(self, k: f32) -> Point {
+        Point::new(self.x * k, self.y * k)
     }
 }
 
