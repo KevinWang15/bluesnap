@@ -36,6 +36,16 @@ pub fn place_panels(sel: Rect, screen: Rect, toolbar: (f32, f32), style_bar: Opt
     PanelLayout { toolbar, style_bar }
 }
 
+/// Top-left corner of the loupe (a tooltip of `size` beside the cursor):
+/// below and right of it, each axis flipping to the other side when there's
+/// no room on `screen`, then kept on screen.
+pub fn place_loupe(cursor: Point, size: (f32, f32), screen: Rect, gap: f32) -> Point {
+    let (w, h) = size;
+    let x = if cursor.x + gap + w <= screen.right() { cursor.x + gap } else { cursor.x - gap - w };
+    let y = if cursor.y + gap + h <= screen.bottom() { cursor.y + gap } else { cursor.y - gap - h };
+    Point::new(x.min(screen.right() - w).max(screen.x), y.min(screen.bottom() - h).max(screen.y))
+}
+
 /// Top-left corner for the "W × H" label: above the selection, or inside it at the top.
 pub fn place_size_label(sel: Rect, screen: Rect, size: (f32, f32), gap: f32) -> Point {
     let x = sel.x.min(screen.right() - size.0).max(screen.x);
@@ -49,6 +59,18 @@ mod tests {
     use super::*;
 
     const SCREEN: Rect = Rect { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 };
+
+    #[test]
+    fn loupe_flips_to_whichever_sides_have_room() {
+        let size = (150.0, 220.0);
+        let at = |x, y| place_loupe(Point::new(x, y), size, SCREEN, 20.0);
+        assert_eq!(at(100.0, 100.0), Point::new(120.0, 120.0)); // below right
+        assert_eq!(at(950.0, 100.0), Point::new(780.0, 120.0)); // below left
+        assert_eq!(at(100.0, 700.0), Point::new(120.0, 460.0)); // above right
+        assert_eq!(at(950.0, 700.0), Point::new(780.0, 460.0)); // above left
+        // Too big for either side: kept on screen.
+        assert_eq!(place_loupe(Point::new(10.0, 10.0), (990.0, 790.0), SCREEN, 20.0), Point::new(0.0, 0.0));
+    }
 
     #[test]
     fn toolbar_goes_below_when_room() {

@@ -78,6 +78,8 @@ pub struct EditorView {
     ocr: Option<Task<()>>,
     /// Running AI redaction, if any. Dropping it cancels the UI update.
     auto: Option<Task<()>>,
+    /// The magnifier beside the cursor while picking a region.
+    loupe: crate::loupe::Loupe,
     /// The text style menu is open.
     text_menu: bool,
     /// Its previews, for the text color and display scale they were drawn in.
@@ -186,6 +188,7 @@ impl EditorView {
             toast: None,
             ocr: None,
             auto: None,
+            loupe: Default::default(),
             text_menu: false,
             text_previews: None,
             slider: None,
@@ -385,6 +388,33 @@ impl EditorView {
             }
         };
         self.show_toast(toast, window, cx);
+    }
+
+    /// Where the loupe goes, and the image pixel under the cursor: shown while
+    /// picking a region on the capture overlay, gone once it's selected.
+    fn loupe_target(&self, window: &Window) -> Option<(Point<Pixels>, (i32, i32))> {
+        if !matches!(self.surface, Surface::Capture { .. }) || !self.editor.is_picking() {
+            return None;
+        }
+        let cursor = window.mouse_position();
+        let p = self.viewport.to_image(cursor);
+        Some((cursor, (p.x.floor() as i32, p.y.floor() as i32)))
+    }
+
+    /// Copies the color under the cursor as `#RRGGBB` (the I key while picking).
+    fn copy_color(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some((_, (x, y))) = self.loupe_target(window) else { return };
+        let Some(color) = self.editor.document().color_at(x, y) else { return };
+        let hex = crate::loupe::hex(color);
+        log::info!("copied color {hex}");
+        cx.write_to_clipboard(ClipboardItem::new_string(hex));
+        self.loupe.copied();
+        // Back to the hint once "Copied" has shown.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(crate::loupe::COPIED_FOR).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 
     pub fn toggle_text_styles(&mut self) {
@@ -626,6 +656,9 @@ impl EditorView {
     }
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.editor.is_picking() && matches!(self.surface, Surface::Capture { .. }) {
+            cx.notify(); // the loupe follows the cursor
+        }
         if self.slider.is_some() {
             self.drag_slider(ev.position.x);
             return cx.notify();
@@ -663,6 +696,7 @@ impl EditorView {
         }
         match ks.key.as_str() {
             "escape" if self.text_menu => self.text_menu = false,
+            "i" if !editing && self.loupe_target(window).is_some() => self.copy_color(window, cx),
             "escape" if editing => self.editor.finish_text(),
             "escape" => return self.finish(Finish::Cancel, window, cx),
             "enter" if editing => self.editor.text_key(TextKey::Newline),
@@ -828,6 +862,12 @@ impl Render for EditorView {
             if let Some(url) = permission_url {
                 root = root.child(permission_banner(url, cx));
             }
+        }
+
+        if let Some((cursor, pixel)) = self.loupe_target(window) {
+            let (doc, selection) = (self.editor.document(), self.editor.active_rect());
+            let loupe = self.loupe.element(doc, pixel, cursor, selection, window.viewport_size(), window);
+            root = root.child(loupe);
         }
 
         if let Some(toast) = &self.toast {

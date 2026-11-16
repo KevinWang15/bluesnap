@@ -10,6 +10,7 @@ mod config;
 mod document;
 mod editor_view;
 mod gpu_image;
+mod loupe;
 mod output;
 mod scrolling;
 mod text_field;

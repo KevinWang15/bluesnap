@@ -310,9 +310,59 @@ pub fn pixmap_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Pixmap
     Pixmap::from_vec(rgba, IntSize::from_wh(width, height)?)
 }
 
+/// The pixels around `center` magnified for a loupe: (2·`radius` + 1)² pixels,
+/// each drawn as a `cell`-sized square (nearest neighbor, so pixels stay
+/// sharp), with a faint grid between them. Pixels outside the image are dark.
+pub fn magnify(image: &Pixmap, center: (i32, i32), radius: u32, cell: u32) -> Option<Pixmap> {
+    let n = 2 * radius + 1;
+    let size = n * cell;
+    let mut out = vec![0u8; (size * size * 4) as usize];
+    for gy in 0..n {
+        for gx in 0..n {
+            let (x, y) = (center.0 + gx as i32 - radius as i32, center.1 + gy as i32 - radius as i32);
+            let rgb = (x >= 0 && y >= 0)
+                .then(|| image.pixel(x as u32, y as u32))
+                .flatten()
+                .map_or([0x26, 0x26, 0x2B], |p| [p.red(), p.green(), p.blue()]);
+            for cy in 0..cell {
+                let row = ((gy * cell + cy) * size + gx * cell) as usize * 4;
+                for cx in 0..cell {
+                    // The grid: each cell's last row and column, darkened a little.
+                    let edge = cell >= 4 && (cx == cell - 1 || cy == cell - 1);
+                    let px = &mut out[row + cx as usize * 4..row + cx as usize * 4 + 4];
+                    for (o, c) in px.iter_mut().zip(rgb) {
+                        *o = if edge { (c as u16 * 7 / 8) as u8 } else { c };
+                    }
+                    px[3] = 255;
+                }
+            }
+        }
+    }
+    pixmap_from_rgba(size, size, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magnify_scales_pixels_up_sharp_and_darkens_outside() {
+        // 2x2 image: red, green / blue, white.
+        let image = pixmap_from_rgba(2, 2, [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255; 4]].concat()).unwrap();
+        let zoomed = magnify(&image, (0, 0), 1, 4).unwrap();
+        assert_eq!((zoomed.width(), zoomed.height()), (12, 12));
+        let px = |x, y| {
+            let p = zoomed.pixel(x, y).unwrap();
+            (p.red(), p.green(), p.blue())
+        };
+        // The center cell is (0, 0), red; right of it green, below it blue.
+        assert_eq!(px(5, 5), (255, 0, 0));
+        assert_eq!(px(9, 5), (0, 255, 0));
+        assert_eq!(px(5, 9), (0, 0, 255));
+        // Cell edges are the grid, a little darker; left and above is outside the image.
+        assert_eq!(px(7, 5), (223, 0, 0));
+        assert_eq!(px(1, 1), (0x26, 0x26, 0x2B));
+    }
 
     fn noise(w: u32, h: u32) -> Pixmap {
         let mut seed = 7u32;

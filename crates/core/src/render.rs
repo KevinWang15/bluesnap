@@ -50,6 +50,13 @@ impl Document {
         &self.image
     }
 
+    /// The color at pixel (`x`, `y`), if it's in the image.
+    pub fn color_at(&self, x: i32, y: i32) -> Option<Color> {
+        let p = self.image.pixel(u32::try_from(x).ok()?, u32::try_from(y).ok()?)?;
+        // Screenshots are opaque, so premultiplied and straight are the same.
+        Some(Color { r: p.red(), g: p.green(), b: p.blue(), a: 255 })
+    }
+
     /// The screenshot under `area` with `effect` applied at `amount` (see
     /// [`RedactEffect::amount`]), and the image position of its top-left corner
     /// (the area is rounded out to whole tiles).

@@ -5,6 +5,12 @@ A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https:
 Press the hotkey, then:
 
 - move the mouse: the window under the cursor is highlighted (blue border, size label)
+- a loupe beside the crosshair magnifies the pixels under it (17 × 17, each
+  8 px wide, the center one outlined) and shows the position in screen pixels, the
+  size of what would be selected (the window under the cursor, or the region being
+  dragged) and the color under the cursor. Press **I** to copy that color as
+  `#RRGGBB`. The loupe stays on screen, flipping to the other side of the cursor
+  near an edge, and goes away once a selection is made.
 - click: select that window, or drag: select a region
 - drag the 8 handles to resize the selection, or drag inside it to move it
 - annotate with rectangle, ellipse, arrow, pen, highlighter, counter, redact and
