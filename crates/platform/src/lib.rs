@@ -76,11 +76,37 @@ pub struct Capture {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCommand {
     Capture,
+    OpenEditor,
+    OpenBsFile,
     EditSettings,
     AiSettings,
     /// The start-at-login item was clicked (see [`Platform::set_start_at_login`]).
     ToggleStartAtLogin,
     Quit,
+}
+
+/// Output format chosen in the Save dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveFormat {
+    Png,
+    Bs,
+}
+
+impl SaveFormat {
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "bs" => Some(SaveFormat::Bs),
+            "png" => Some(SaveFormat::Png),
+            _ => None,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            SaveFormat::Png => "png",
+            SaveFormat::Bs => "bs",
+        }
+    }
 }
 
 /// Keeps the tray / menu bar icon alive; dropping it removes the icon.
@@ -152,6 +178,28 @@ pub trait Platform {
         hole: Option<PixelRect>,
         above: Option<WindowRef>,
     ) -> anyhow::Result<()>;
+
+    /// Hides (`false`) or restores and focuses (`true`) a normal window (used
+    /// while capturing a new screenshot from inside the Editor).
+    fn set_window_visible(&self, _window: WindowRef, _visible: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Native Save dialog offering `PNG Image (.png)` and `BlueSnap Editable (.bs)`.
+    /// Returns `Ok(None)` when delegating to gpui's fallback file dialog.
+    fn save_dialog(
+        &self,
+        _dir: &std::path::Path,
+        _stem: &str,
+    ) -> anyhow::Result<Option<Option<(std::path::PathBuf, SaveFormat)>>> {
+        Ok(None)
+    }
+
+    /// Native Open dialog for `.bs` files (or `.bs` + common images when `bs_only` is `false`).
+    /// Returns `Ok(None)` when delegating to gpui's fallback file dialog.
+    fn open_dialog(&self, _dir: &std::path::Path, _bs_only: bool) -> anyhow::Result<Option<Option<std::path::PathBuf>>> {
+        Ok(None)
+    }
 
     /// Whether the physical Escape key is currently held down, used as a fallback
     /// cancel check when global hotkey registration is unavailable or blocked.

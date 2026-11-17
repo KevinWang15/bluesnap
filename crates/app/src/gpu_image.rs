@@ -1,12 +1,12 @@
-//! Getting images onto the GPU: the (possibly very tall) screenshot as tiles, and
-//! cached annotation layers.
+//! Getting images onto the GPU: (possibly very tall) screenshots and placed
+//! composition images as tiles, and cached annotation layers.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use bluesnap_core::Rect as PxRect;
 use bluesnap_core::render::to_bgra_straight;
-use bluesnap_core::Pixmap;
+use bluesnap_core::{ImageAsset, ImageId, Pixmap, Rect as PxRect};
 use gpui::{Bounds, Corners, Pixels, RenderImage, Window};
 
 use crate::viewport::Viewport;
@@ -33,13 +33,15 @@ fn tile_rows(height: u32) -> Vec<Range<u32>> {
 
 /// An opaque image split into horizontal tiles.
 pub struct ImageTiles {
+    width: u32,
+    height: u32,
     tiles: Vec<(PxRect, Arc<RenderImage>)>,
 }
 
 impl ImageTiles {
     /// From opaque BGRA pixels (gpui's layout). A single tile takes the buffer as is.
     pub fn from_bgra(width: u32, height: u32, bgra: Vec<u8>) -> Option<Self> {
-        if bgra.len() != width as usize * height as usize * 4 {
+        if width == 0 || height == 0 || bgra.len() != width as usize * height as usize * 4 {
             return None;
         }
         let rows = tile_rows(height);
@@ -55,14 +57,32 @@ impl ImageTiles {
                 })
                 .collect::<Option<_>>()?
         };
-        Some(Self { tiles })
+        Some(Self { width, height, tiles })
     }
 
-    /// The tiles overlapping `visible` (window coordinates), in window coordinates.
+    pub fn from_pixmap(pixmap: &Pixmap) -> Option<Self> {
+        Self::from_bgra(pixmap.width(), pixmap.height(), to_bgra_straight(pixmap))
+    }
+
+    /// Tiles overlapping `visible` when the image sits at `(0, 0, width, height)`.
     pub fn visible(&self, viewport: &Viewport, visible: Bounds<Pixels>) -> Vec<(Bounds<Pixels>, Arc<RenderImage>)> {
+        self.visible_in(PxRect::new(0.0, 0.0, self.width as f32, self.height as f32), viewport, visible)
+    }
+
+    /// Tiles overlapping `visible` when the image is placed/scaled into `placed`.
+    pub fn visible_in(
+        &self,
+        placed: PxRect,
+        viewport: &Viewport,
+        visible: Bounds<Pixels>,
+    ) -> Vec<(Bounds<Pixels>, Arc<RenderImage>)> {
+        let sy = placed.h / (self.height.max(1) as f32);
         self.tiles
             .iter()
-            .map(|(rect, image)| (viewport.to_window(*rect), image.clone()))
+            .map(|(rect, image)| {
+                let mapped = PxRect::new(placed.x, placed.y + rect.y * sy, placed.w, rect.h * sy);
+                (viewport.to_window(mapped), image.clone())
+            })
             .filter(|(b, _)| b.intersects(&visible))
             .collect()
     }
@@ -75,31 +95,69 @@ impl ImageTiles {
     }
 }
 
-/// Paints `tiles` (from [`ImageTiles::visible`]).
+/// Per-window GPU cache of [`ImageAsset`]s in a multi-image composition.
+#[derive(Default)]
+pub struct ImageAtlasCache {
+    entries: HashMap<ImageId, ImageTiles>,
+}
+
+impl ImageAtlasCache {
+    pub fn ensure(&mut self, asset: &ImageAsset) -> Option<&ImageTiles> {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.entries.entry(asset.id) {
+            let tiles = ImageTiles::from_pixmap(asset.pixmap())?;
+            e.insert(tiles);
+        }
+        self.entries.get(&asset.id)
+    }
+
+    pub fn prune(&mut self, live: &HashSet<ImageId>, window: &mut Window) {
+        self.entries.retain(|id, tiles| {
+            if live.contains(id) {
+                true
+            } else {
+                tiles.drop_images(window);
+                false
+            }
+        });
+    }
+
+    pub fn clear(&mut self, window: &mut Window) {
+        for (_, mut tiles) in self.entries.drain() {
+            tiles.drop_images(window);
+        }
+    }
+}
+
+/// Paints `tiles` (from [`ImageTiles::visible`] or [`ImageTiles::visible_in`]).
 pub fn paint_tiles(tiles: Vec<(Bounds<Pixels>, Arc<RenderImage>)>, window: &mut Window) {
     for (bounds, image) in tiles {
         window.paint_image(bounds, Corners::default(), image, 0, false).ok();
     }
 }
 
-/// One annotation layer on the GPU, tagged with what it shows: the editor
-/// revision and the clip region it was rendered for.
+/// One annotation layer band on the GPU, tagged with `(revision, start, end, clip)`.
 #[derive(Default)]
 pub struct LayerCache {
-    key: Option<(u64, [i32; 4])>,
+    key: Option<(u64, usize, usize, [i32; 4])>,
     image: Option<(PxRect, Arc<RenderImage>)>,
 }
 
 impl LayerCache {
-    pub fn sync(&mut self, revision: u64, clip: PxRect, render: impl FnOnce() -> Option<(PxRect, Pixmap)>, window: &mut Window) {
-        let key = (revision, [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32]);
+    pub fn sync(
+        &mut self,
+        revision: u64,
+        range: Range<usize>,
+        clip: PxRect,
+        render: impl FnOnce() -> Option<(PxRect, Pixmap)>,
+        window: &mut Window,
+    ) {
+        let key = (revision, range.start, range.end, [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32]);
         if self.key == Some(key) {
             return;
         }
         self.key = Some(key);
         let new = render().and_then(|(rect, pixmap)| Some((rect, pixmap_image(&pixmap)?)));
         if let Some((_, old)) = std::mem::replace(&mut self.image, new) {
-            // Each version is a new texture; free the previous one from the atlas.
             window.drop_image(old).ok();
         }
     }
@@ -113,6 +171,33 @@ impl LayerCache {
         if let Some((_, old)) = self.image.take() {
             window.drop_image(old).ok();
         }
+    }
+}
+
+/// Pool of [`LayerCache`]s sized dynamically to the current `VisualBand::Shapes` count.
+#[derive(Default)]
+pub struct LayerBandPool {
+    bands: Vec<LayerCache>,
+}
+
+impl LayerBandPool {
+    pub fn resize(&mut self, count: usize, window: &mut Window) {
+        while self.bands.len() > count {
+            if let Some(mut extra) = self.bands.pop() {
+                extra.drop_image(window);
+            }
+        }
+        while self.bands.len() < count {
+            self.bands.push(LayerCache::default());
+        }
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> &mut LayerCache {
+        &mut self.bands[index]
+    }
+
+    pub fn clear(&mut self, window: &mut Window) {
+        self.resize(0, window);
     }
 }
 

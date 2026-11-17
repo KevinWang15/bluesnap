@@ -1,52 +1,85 @@
-//! Taking a screenshot: capture the display under the cursor and open the
-//! editing overlay on it.
+//! Taking a screenshot: reusable capture entry point supporting both standalone
+//! captures (`CaptureMode::Standard`) and in-editor `"Add image"` captures
+//! (`CaptureMode::ForEditor`).
 
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use bluesnap_core::{Document, Editor, Rect};
+use bluesnap_core::shape::Shape;
+use bluesnap_core::{Document, Editor, Pixmap, Rect};
 use bluesnap_platform::{Native, Platform};
-use gpui::{App, AppContext, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions};
+use gpui::{App, AppContext, DisplayId, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions};
 
 use crate::AppState;
-use crate::editor_view::{EditorView, Surface};
+use crate::canvas_view::{CanvasView, Surface};
 use crate::gpu_image::ImageTiles;
 use crate::output::Finish;
 
-/// The hotkey / tray action: capture the display under the cursor and open the
-/// overlay, or finish a running scrolling capture.
+/// Caller-configurable behavior for a screenshot capture session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CaptureMode {
+    /// Standalone capture (hotkey / tray): shows `Add to editor`, `Save`,
+    /// `Cancel`, and `Done` (copy to clipboard).
+    #[default]
+    Standard,
+    /// Triggered by the Editor's `"Add image"` button: hides `Add to editor`,
+    /// overrides `Done` ("Tick") to append the captured slice to the Editor,
+    /// and restores the hidden Editor window when finished or cancelled.
+    ForEditor,
+}
+
+/// Unflattened result of a capture (raw cropped pixels + live annotation shapes).
+pub struct CapturedSlice {
+    pub image: Pixmap,
+    pub scale: f32,
+    pub shapes: Vec<Shape>,
+    pub display: Option<DisplayId>,
+}
+
+/// Default hotkey / tray action: start a standalone capture, or finish a
+/// running scrolling capture.
 pub fn start_capture(cx: &mut App) {
-    // During a scrolling capture the hotkey means "done".
     if let Some(session) = cx.global_mut::<AppState>().scrolling.take() {
         session.update(cx, |s, cx| s.finish(Finish::Copy, cx)).ok();
         return;
     }
+    start_with_mode(CaptureMode::Standard, cx);
+}
+
+/// Starts a screenshot capture in `mode`.
+pub fn start_with_mode(mode: CaptureMode, cx: &mut App) {
     if cx.global::<AppState>().overlay.is_some() {
-        log::debug!("hotkey ignored: a capture is already open");
+        log::debug!("capture ignored: an overlay is already open");
+        if mode == CaptureMode::ForEditor {
+            crate::editor_window::restore_if_hidden(cx);
+        }
         return;
     }
     if crate::toast::dismiss_startup(cx) {
-        // Let the OS unmap the startup toast before capturing the screen.
+        // Let the OS unmap the startup toast before grabbing desktop pixels.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_millis(40)).await;
-            cx.update(|cx| {
-                if cx.global::<AppState>().overlay.is_none()
-                    && let Err(e) = open_overlay(cx)
-                {
-                    log::error!("capture failed: {e:#}");
-                }
-            })
-            .ok();
+            cx.update(|cx| launch_overlay(mode, cx)).ok();
         })
         .detach();
         return;
     }
-    if let Err(e) = open_overlay(cx) {
+    launch_overlay(mode, cx);
+}
+
+fn launch_overlay(mode: CaptureMode, cx: &mut App) {
+    if cx.global::<AppState>().overlay.is_some() {
+        return;
+    }
+    if let Err(e) = open_overlay(mode, cx) {
         log::error!("capture failed: {e:#}");
+        if mode == CaptureMode::ForEditor {
+            crate::editor_window::restore_if_hidden(cx);
+        }
     }
 }
 
-fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
+fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut stages = Vec::new();
     let platform = bluesnap_platform::native();
@@ -63,7 +96,7 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
     let mut bgra = capture.image.bgrx;
     anyhow::ensure!(bgra.len() == width as usize * height as usize * 4, "bad capture buffer");
     let rgba = bluesnap_core::pixels::split_bgrx(&mut bgra);
-    let image = ImageTiles::from_bgra(width, height, bgra).context("bad capture buffer")?;
+    let screenshot = ImageTiles::from_bgra(width, height, bgra).context("bad capture buffer")?;
     stages.push(("gpu image", started.elapsed()));
     let scale = capture.display.scale_factor;
     let windows = capture
@@ -75,7 +108,13 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
     let fonts = cx.global::<AppState>().fonts.clone();
     let editor = Editor::new(doc, fonts, windows, scale);
     let permission_url = capture.permission_missing.then(|| platform.permission_settings_url()).flatten();
-    let surface = Surface::Capture { display: capture.display.clone(), permission_url };
+    let surface = Surface::Capture {
+        display: capture.display.clone(),
+        gpui_display: display.id(),
+        permission_url,
+        mode,
+        screenshot,
+    };
     stages.push(("editor", started.elapsed()));
 
     let options = WindowOptions {
@@ -95,7 +134,7 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
         window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     };
-    let handle = cx.open_window(options, |_, cx| cx.new(|cx| EditorView::new(editor, image, surface, cx)))?;
+    let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new(editor, surface, cx)))?;
     stages.push(("open window", started.elapsed()));
     handle.update(cx, |view, window, _| {
         if let Err(e) = platform.configure_overlay(window, &capture.display) {
@@ -105,8 +144,6 @@ fn open_overlay(cx: &mut App) -> anyhow::Result<()> {
         window.activate_window();
         stages.push(("configure", started.elapsed()));
         let stages = std::mem::take(&mut stages);
-        // Frame callbacks run before drawing, so the nested one runs once the
-        // first frame (including the screenshot texture upload) is presented.
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |_, _| {
                 let timeline: Vec<String> = stages.iter().map(|(name, t)| format!("{name} {t:.1?}")).collect();

@@ -33,6 +33,8 @@ fn decode_png(data: &[u8]) -> anyhow::Result<Icon> {
 
 pub(crate) fn create(style: Style, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
     let capture = MenuItem::with_id("capture", format!("Take Screenshot ({hotkey})"), true, None);
+    let open_editor = MenuItem::with_id("open_editor", "Open Editor", true, None);
+    let open_bs = MenuItem::with_id("open_bs", "Open .bs File…", true, None);
     let settings = MenuItem::with_id("settings", "Edit Settings…", true, None);
     let ai = MenuItem::with_id("ai", "AI Settings…", true, None);
     let (login_label, login_on) = style.start_at_login;
@@ -41,6 +43,8 @@ pub(crate) fn create(style: Style, hotkey: &str, on_command: Box<dyn Fn(TrayComm
     let menu = Menu::new();
     menu.append_items(&[
         &capture,
+        &open_editor,
+        &open_bs,
         &PredefinedMenuItem::separator(),
         &settings,
         &ai,
@@ -54,6 +58,8 @@ pub(crate) fn create(style: Style, hotkey: &str, on_command: Box<dyn Fn(TrayComm
         let on_command = on_command.clone();
         move |event: MenuEvent| match event.id.0.as_str() {
             "capture" => on_command(TrayCommand::Capture),
+            "open_editor" => on_command(TrayCommand::OpenEditor),
+            "open_bs" => on_command(TrayCommand::OpenBsFile),
             "settings" => on_command(TrayCommand::EditSettings),
             "ai" => on_command(TrayCommand::AiSettings),
             "login" => on_command(TrayCommand::ToggleStartAtLogin),

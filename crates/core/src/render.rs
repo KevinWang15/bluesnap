@@ -10,6 +10,7 @@ use tiny_skia::{
     FillRule, FilterQuality, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform,
 };
 
+use crate::composition::{Composition, Element, PlacedImage};
 use crate::geom::{Point, Rect};
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
 use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
@@ -48,6 +49,10 @@ impl Document {
 
     pub fn image(&self) -> &Pixmap {
         &self.image
+    }
+
+    pub fn into_pixmap(self) -> Pixmap {
+        self.image
     }
 
     /// The color at pixel (`x`, `y`), if it's in the image.
@@ -179,6 +184,81 @@ pub fn export(doc: &Document, region: Rect, shapes: &[Shape], m: Metrics) -> Opt
     Some(pixmap)
 }
 
+/// Composites `background` and all placed images in `elements` onto a canvas
+/// [`Document`], used for sampling live Mosaic/Blur redactions over placed images.
+pub fn render_canvas_backdrop(width: u32, height: u32, background: Color, elements: &[Element]) -> Option<Document> {
+    let mut pixmap = Pixmap::new(width.max(1), height.max(1))?;
+    pixmap.fill(tiny_skia::Color::from_rgba8(background.r, background.g, background.b, background.a));
+    for el in elements {
+        if let Element::Image(placed) = el {
+            draw_placed_image(&mut pixmap, placed, Point::default());
+        }
+    }
+    Some(Document::from_pixmap(pixmap))
+}
+
+/// Renders an entire multi-image [`Composition`] in exact Z-order onto an
+/// opaque [`Pixmap`] of `(comp.width, comp.height)`.
+pub fn render_composition(comp: &Composition, fonts: &Fonts) -> Option<Pixmap> {
+    let mut pixmap = Pixmap::new(comp.width.max(1), comp.height.max(1))?;
+    pixmap.fill(tiny_skia::Color::from_rgba8(
+        comp.background.r,
+        comp.background.g,
+        comp.background.b,
+        comp.background.a,
+    ));
+    let m = Metrics { scale: comp.scale, fonts };
+    let canvas_bounds = comp.bounds();
+    for el in &comp.elements {
+        match el {
+            Element::Image(placed) => draw_placed_image(&mut pixmap, placed, Point::default()),
+            Element::Shape(shape) => {
+                let region = match &shape.geometry {
+                    Geometry::Redact { effect, strength, .. } if *effect != RedactEffect::Gray => {
+                        let amount = effect.amount(*strength, m.scale);
+                        shape
+                            .bounds(m)
+                            .round_out()
+                            .intersect(&canvas_bounds)
+                            .and_then(|area| {
+                                let tile = effect_tile(&pixmap, *effect, amount, area)?;
+                                Some((tile, (area.x as u32, area.y as u32)))
+                            })
+                    }
+                    _ => None,
+                };
+                draw_shape_with(&mut pixmap, shape, m, Transform::identity(), |_, _, _| region);
+            }
+        }
+    }
+    Some(pixmap)
+}
+
+/// Draws a placed image onto `pixmap` (whose top-left is at canvas `origin`).
+pub fn draw_placed_image(pixmap: &mut Pixmap, placed: &PlacedImage, origin: Point) {
+    let src = placed.asset.pixmap();
+    let (sw, sh) = (src.width() as f32, src.height() as f32);
+    if sw <= 0.0 || sh <= 0.0 || placed.bounds.w <= 0.0 || placed.bounds.h <= 0.0 {
+        return;
+    }
+    let Some(rect) = tiny_skia::Rect::from_xywh(placed.bounds.x, placed.bounds.y, placed.bounds.w, placed.bounds.h) else {
+        return;
+    };
+    let (sx, sy) = (placed.bounds.w / sw, placed.bounds.h / sh);
+    let quality = if (sx - 1.0).abs() < 1e-4 && (sy - 1.0).abs() < 1e-4 {
+        FilterQuality::Nearest
+    } else {
+        FilterQuality::Bilinear
+    };
+    let shader_ts = Transform::from_scale(sx, sy).post_translate(placed.bounds.x, placed.bounds.y);
+    let paint = Paint {
+        shader: Pattern::new(src.as_ref(), SpreadMode::Pad, quality, 1.0, shader_ts),
+        anti_alias: true,
+        ..Paint::default()
+    };
+    pixmap.fill_rect(rect, &paint, Transform::from_translate(-origin.x, -origin.y), None);
+}
+
 fn draw_shapes(pixmap: &mut Pixmap, doc: &Document, shapes: &[&Shape], m: Metrics, origin: Point, underline: Option<Underline>) {
     let ts = Transform::from_translate(-origin.x, -origin.y);
     for (i, shape) in shapes.iter().enumerate() {
@@ -203,6 +283,16 @@ fn stroke(width: f32, join: LineJoin) -> Stroke {
 }
 
 fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts: Transform) {
+    draw_shape_with(pixmap, shape, m, ts, |effect, amount, bounds| doc.effect_region(effect, amount, bounds));
+}
+
+fn draw_shape_with(
+    pixmap: &mut Pixmap,
+    shape: &Shape,
+    m: Metrics,
+    ts: Transform,
+    effect_region: impl FnOnce(RedactEffect, u32, Rect) -> Option<(Pixmap, (u32, u32))>,
+) {
     let w = shape.size_px(m.scale);
     let paint = solid(shape.style.color);
     match &shape.geometry {
@@ -234,7 +324,7 @@ fn draw_shape(pixmap: &mut Pixmap, doc: &Document, shape: &Shape, m: Metrics, ts
                 _ => {
                     // The effect over just the area this shape covers.
                     let amount = effect.amount(*strength, m.scale);
-                    let Some((pixels, (x0, y0))) = doc.effect_region(*effect, amount, shape.bounds(m)) else {
+                    let Some((pixels, (x0, y0))) = effect_region(*effect, amount, shape.bounds(m)) else {
                         return;
                     };
                     region = pixels;

@@ -96,6 +96,36 @@ impl Shape {
         Shape { geometry, style: self.style }
     }
 
+    /// Scales coordinates by `k` (e.g. when combining captures from displays
+    /// with different scale factors into one composition).
+    pub fn scaled(&self, k: f32) -> Shape {
+        if (k - 1.0).abs() <= f32::EPSILON {
+            return self.clone();
+        }
+        let geometry = match &self.geometry {
+            Geometry::Rect(r) => Geometry::Rect(r.scale(k)),
+            Geometry::Ellipse(r) => Geometry::Ellipse(r.scale(k)),
+            Geometry::Arrow { from, to, style } => Geometry::Arrow { from: *from * k, to: *to * k, style: *style },
+            Geometry::Pen(pts) => Geometry::Pen(pts.iter().map(|p| *p * k).collect()),
+            Geometry::Highlight(pts) => Geometry::Highlight(pts.iter().map(|p| *p * k).collect()),
+            Geometry::Counter { center, number, format } => {
+                Geometry::Counter { center: *center * k, number: *number, format: *format }
+            }
+            Geometry::Redact { area, effect, strength } => Geometry::Redact {
+                area: match area {
+                    RedactShape::Brush(pts) => RedactShape::Brush(pts.iter().map(|p| *p * k).collect()),
+                    RedactShape::Rect(r) => RedactShape::Rect(r.scale(k)),
+                },
+                effect: *effect,
+                strength: *strength,
+            },
+            Geometry::Text { origin, content, style } => {
+                Geometry::Text { origin: *origin * k, content: content.clone(), style: *style }
+            }
+        };
+        Shape { geometry, style: self.style }
+    }
+
     /// Area covered when rendered (including stroke width and arrow heads).
     pub fn bounds(&self, m: Metrics) -> Rect {
         let w = self.size_px(m.scale);

@@ -260,11 +260,11 @@ def scrolling(layout):
         app.scroll_file.write_text(str(offset))
         rec.pause(120)
     rec.pause(600)
-    rec.caption("Edit opens it in a window with the same tools")
+    rec.caption("Add to editor opens it in a window with the same tools")
     bar_win = app.wait_window(lambda win: (win.w, win.h) != (desktop.W, desktop.H) and win.h < 200 and win.w > 400)
     rec.win = bar_win
-    rec.press("Edit", window="scrolling-bar")
-    editor = app.wait_window(lambda win: "scrolling screenshot" in win.name)
+    rec.press("AddToEditor", window="scrolling-bar")
+    editor = app.wait_window(lambda win: "bluesnap editor" in win.name)
     rec.win = editor
     rec.pause(800)
     for _ in range(6):

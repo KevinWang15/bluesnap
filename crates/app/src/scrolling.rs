@@ -12,7 +12,7 @@ use bluesnap_core::layout::place_scrolling_preview;
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::shape::Shape;
 use bluesnap_core::stitch::{Progress, Stitcher};
-use bluesnap_core::{Color, Rect as PxRect, THEME_BLUE};
+use bluesnap_core::{Color, Composition, Rect as PxRect, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
 use global_hotkey::GlobalHotKeyManager;
 use gpui::{
@@ -22,9 +22,10 @@ use gpui::{
     point, prelude::FluentBuilder, px, rgba, size, svg,
 };
 
+use crate::AppState;
+use crate::capture::{CaptureMode, CapturedSlice};
 use crate::output::{self, Finish};
 use crate::toolbar::{self, Action, hsla};
-use crate::{AppState, document};
 
 /// Time between captures. Fast enough that normal wheel/trackpad scrolling keeps an overlap.
 const INTERVAL: Duration = Duration::from_millis(60);
@@ -152,6 +153,7 @@ impl Render for Dim {
 pub struct ScrollingCapture {
     display: DisplayInfo,
     rect: PixelRect,
+    mode: CaptureMode,
     stitcher: Arc<Mutex<Option<Stitcher>>>,
     status: SharedString,
     warning: bool,
@@ -166,6 +168,13 @@ pub struct ScrollingCapture {
     shapes: Vec<Shape>,
     _escape: Option<EscapeGuard>,
     _task: Option<Task<()>>,
+}
+
+fn bar_groups(mode: CaptureMode) -> &'static [&'static [Action]] {
+    match mode {
+        CaptureMode::Standard => toolbar::SCROLLING_BAR,
+        CaptureMode::ForEditor => toolbar::SCROLLING_FOR_EDITOR_BAR,
+    }
 }
 
 /// Device-pixel rectangle -> gpui bounds (logical, in gpui's coordinate space
@@ -200,7 +209,14 @@ fn helper_window_options(bounds: Bounds<gpui::Pixels>, display: gpui::DisplayId,
 /// Starts a scrolling capture of `rect` (image pixels of `display`, whose full
 /// size in image pixels is `screen`), keeping `shapes` (annotations relative
 /// to `rect`) on the result.
-pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: Vec<Shape>, cx: &mut App) -> anyhow::Result<()> {
+pub fn start(
+    display: DisplayInfo,
+    screen: (i32, i32),
+    rect: PixelRect,
+    shapes: Vec<Shape>,
+    mode: CaptureMode,
+    cx: &mut App,
+) -> anyhow::Result<()> {
     cancel_active(cx);
     let platform = bluesnap_platform::native();
     let gpui_display = cx
@@ -214,7 +230,7 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
     let scale = display.scale_factor;
     let (screen_w, screen_h) = screen;
     let border = (BORDER * scale).round() as i32;
-    let bar_size = toolbar::panel_size(toolbar::SCROLLING_BAR, STATUS_WIDTH);
+    let bar_size = toolbar::panel_size(bar_groups(mode), STATUS_WIDTH);
     let (bar_w, bar_h) = ((bar_size.0 * scale).round() as i32, (bar_size.1 * scale).round() as i32);
     let gap = (GAP * scale).round() as i32;
 
@@ -260,7 +276,7 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
         let frame_ref = frame.update(cx, |_, window, _| bluesnap_platform::window_ref(window))??;
         let bar = cx.open_window(
             helper_window_options(logical_bounds(origin, bar_rect, scale), gpui_display.id(), false),
-            |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), screen, rect, frame, shapes, cx)),
+            |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), screen, rect, frame, shapes, mode, cx)),
         )?;
         let (bar_ref, entity) = bar.update(cx, |this, window, cx| -> anyhow::Result<_> {
             this.bar = Some(window.window_handle());
@@ -314,6 +330,7 @@ impl ScrollingCapture {
         rect: PixelRect,
         frame: WindowHandle<Dim>,
         shapes: Vec<Shape>,
+        mode: CaptureMode,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
@@ -327,6 +344,7 @@ impl ScrollingCapture {
                     cx.global_mut::<AppState>().scrolling = None;
                 }
                 let frame = this.frame;
+                let was_for_editor = this.mode == CaptureMode::ForEditor;
                 cx.defer(move |cx| {
                     frame
                         .update(cx, |dim, window, _| {
@@ -335,6 +353,9 @@ impl ScrollingCapture {
                             window.remove_window();
                         })
                         .ok();
+                    if was_for_editor {
+                        crate::editor_window::restore_if_hidden(cx);
+                    }
                 });
             }
         })
@@ -378,6 +399,7 @@ impl ScrollingCapture {
         Self {
             display,
             rect,
+            mode,
             stitcher,
             status: "Scroll down slowly to capture more".into(),
             warning: false,
@@ -462,18 +484,53 @@ impl ScrollingCapture {
         image
     }
 
-    /// Ends the session; `Copy` and `Save` deliver the stitched image, with
-    /// the annotations drawn on it.
+    /// Ends the session; in `Standard` mode `Copy` and `Save` deliver the
+    /// stitched image, while in `ForEditor` mode `Copy` ("Tick") appends the
+    /// unflattened stitched slice into the Editor and restores it.
     pub fn finish(&mut self, how: Finish, cx: &mut Context<Self>) {
         if self.stopped {
             return;
         }
-        let image = self.stop(cx);
-        let image = match how {
-            Finish::Cancel => None,
-            _ => image.map(|image| self.annotate(image, cx)),
-        };
-        output::deliver(how, image, cx);
+        if self.mode == CaptureMode::ForEditor {
+            match how {
+                Finish::Copy => return self.send_to_editor(cx),
+                Finish::Cancel => {
+                    self.stop(cx);
+                    cx.defer(crate::editor_window::restore_if_hidden);
+                    return;
+                }
+                Finish::Save => {
+                    let raw = self.stop(cx);
+                    cx.defer(crate::editor_window::restore_if_hidden);
+                    if let Some(raw) = raw {
+                        let annotated = self.annotate(raw.clone(), cx);
+                        let shapes = std::mem::take(&mut self.shapes);
+                        let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
+                        output::save_with_dialog(annotated, comp, false, None, cx);
+                    }
+                    return;
+                }
+            }
+        }
+        match how {
+            Finish::Cancel => {
+                self.stop(cx);
+            }
+            Finish::Copy => {
+                if let Some(raw) = self.stop(cx) {
+                    let annotated = self.annotate(raw, cx);
+                    output::copy_to_clipboard(annotated, cx);
+                }
+            }
+            Finish::Save => {
+                if let Some(raw) = self.stop(cx) {
+                    let annotated = self.annotate(raw.clone(), cx);
+                    let shapes = std::mem::take(&mut self.shapes);
+                    let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
+                    output::save_with_dialog(annotated, comp, true, None, cx);
+                }
+            }
+        }
     }
 
     /// `image` with the carried-over annotations drawn on it.
@@ -487,26 +544,29 @@ impl ScrollingCapture {
         bluesnap_core::render::export(&doc, doc.bounds(), &self.shapes, m).unwrap_or_else(|| doc.image().clone())
     }
 
-    /// Ends the session and opens the stitched image in an editor window.
-    fn edit(&mut self, cx: &mut Context<Self>) {
+    /// Ends the session and adds the unflattened stitched image + shapes to the Editor.
+    fn send_to_editor(&mut self, cx: &mut Context<Self>) {
         if self.stopped {
             return;
         }
-        let Some(image) = self.stop(cx) else { return log::warn!("scrolling capture produced no image") };
+        let Some(image) = self.stop(cx) else {
+            log::warn!("scrolling capture produced no image");
+            if self.mode == CaptureMode::ForEditor {
+                cx.defer(crate::editor_window::restore_if_hidden);
+            }
+            return;
+        };
         let (scale, id) = (self.display.scale_factor, self.display.id);
         let display = cx.displays().into_iter().find(|d| u32::from(d.id()) == id).map(|d| d.id());
-        // Still editable there.
         let shapes = std::mem::take(&mut self.shapes);
         cx.defer(move |cx| {
-            if let Err(e) = document::open(image, scale, display, shapes, cx) {
-                log::error!("could not open the editor: {e:#}");
-            }
+            crate::editor_window::add_slice(CapturedSlice { image, scale, shapes, display }, cx);
         });
     }
 
     fn perform(&mut self, action: Action, cx: &mut Context<Self>) {
         match action {
-            Action::Edit => self.edit(cx),
+            Action::AddToEditor => self.send_to_editor(cx),
             other => {
                 if let Some(how) = other.finish() {
                     self.finish(how, cx);
@@ -586,8 +646,10 @@ fn capture_and_stitch(
 
 impl Render for ScrollingCapture {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = bar_groups(self.mode);
+        let done_adds_to_editor = self.mode == CaptureMode::ForEditor;
         if crate::demo::enabled() {
-            let items = toolbar::row_items(&toolbar::toolbar_slots(toolbar::SCROLLING_BAR, STATUS_WIDTH), 32.0, (0.0, 0.0));
+            let items = toolbar::row_items(&toolbar::toolbar_slots(groups, STATUS_WIDTH), 32.0, (0.0, 0.0));
             crate::demo::report("scrolling-bar", window.scale_factor(), items);
         }
         let status_color = if self.warning { hsla(Color::rgb(0xD4380D)) } else { hsla(Color::rgb(0x333333)) };
@@ -617,10 +679,10 @@ impl Render for ScrollingCapture {
                 .child(div().flex_1().overflow_hidden().text_color(status_color).child(self.status.clone()))
                 .child(div().flex_none().text_color(hsla(Color::rgb(0x888888))).child(format!("{} px", self.height))),
         );
-        for group in toolbar::SCROLLING_BAR {
+        for group in groups {
             bar = bar.child(toolbar::separator());
             for &action in *group {
-                bar = bar.child(toolbar::action_button(action, false, true).on_mouse_down(
+                bar = bar.child(toolbar::action_button(action, false, true, done_adds_to_editor).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this: &mut Self, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();

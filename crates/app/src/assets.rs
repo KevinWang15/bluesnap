@@ -15,11 +15,14 @@ macro_rules! icons {
 }
 
 icons![
+    "add-image", "open",
     "rect", "ellipse", "arrow", "pen", "highlighter", "counter", "mosaic", "text", "undo", "scroll", "ocr", "edit", "save", "cancel", "done",
     // The redact style bar.
     "brush", "area", "blur", "gray", "auto",
     // The arrow style bar ("arrow" is the straight one).
     "arrow-elbow", "arrow-curved",
+    // Editor layer ordering & delete.
+    "bring-forward", "send-backward", "trash",
     // Toasts.
     "app", "spinner", "warning", "info",
 ];

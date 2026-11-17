@@ -21,20 +21,24 @@ use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TRANSPARENT,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
 };
 
 use crate::{
-    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand,
-    WindowRef,
+    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat, TextLine, Tray,
+    TrayCommand, WindowRef,
 };
 
 pub struct Native;
@@ -190,6 +194,83 @@ impl Platform for Native {
             }
             Ok(())
         })
+    }
+
+    fn set_window_visible(&self, window: WindowRef, visible: bool) -> anyhow::Result<()> {
+        let hwnd = raw_win32_hwnd(window.0)?;
+        unsafe {
+            ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
+            if visible {
+                SetForegroundWindow(hwnd);
+            }
+        }
+        Ok(())
+    }
+
+    fn save_dialog(
+        &self,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> anyhow::Result<Option<Option<(PathBuf, SaveFormat)>>> {
+        let filter: Vec<u16> = "PNG Image (*.png)\0*.png\0BlueSnap Editable (*.bs)\0*.bs\0\0".encode_utf16().collect();
+        let def_ext = wide("png");
+        let init_dir: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut file_buf = vec![0u16; 32768];
+        for (dst, ch) in file_buf.iter_mut().zip(format!("{stem}.png").encode_utf16()) {
+            *dst = ch;
+        }
+        let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
+        ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = file_buf.as_mut_ptr();
+        ofn.nMaxFile = file_buf.len() as u32;
+        ofn.lpstrInitialDir = init_dir.as_ptr();
+        ofn.lpstrDefExt = def_ext.as_ptr();
+        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+        if ok == FALSE {
+            return Ok(Some(None));
+        }
+        let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let raw_path = PathBuf::from( <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&file_buf[..len]) );
+        let format = match SaveFormat::from_path(&raw_path) {
+            Some(fmt) => fmt,
+            None if ofn.nFilterIndex == 2 => SaveFormat::Bs,
+            None => SaveFormat::Png,
+        };
+        let final_path = if SaveFormat::from_path(&raw_path) == Some(format) {
+            raw_path
+        } else {
+            raw_path.with_extension(format.extension())
+        };
+        Ok(Some(Some((final_path, format))))
+    }
+
+    fn open_dialog(&self, dir: &std::path::Path, bs_only: bool) -> anyhow::Result<Option<Option<PathBuf>>> {
+        let filter_str = if bs_only {
+            "BlueSnap Editable (*.bs)\0*.bs\0All Files (*.*)\0*.*\0\0"
+        } else {
+            "BlueSnap & Image Files (*.bs;*.png;*.jpg;*.jpeg;*.webp)\0*.bs;*.png;*.jpg;*.jpeg;*.webp\0BlueSnap Editable (*.bs)\0*.bs\0Image Files (*.png;*.jpg;*.jpeg;*.webp)\0*.png;*.jpg;*.jpeg;*.webp\0\0"
+        };
+        let filter: Vec<u16> = filter_str.encode_utf16().collect();
+        let init_dir: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+        let mut file_buf = vec![0u16; 32768];
+        let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
+        ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = file_buf.as_mut_ptr();
+        ofn.nMaxFile = file_buf.len() as u32;
+        ofn.lpstrInitialDir = init_dir.as_ptr();
+        ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+        if ok == FALSE {
+            return Ok(Some(None));
+        }
+        let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+        let path = PathBuf::from( <std::ffi::OsString as std::os::windows::ffi::OsStringExt>::from_wide(&file_buf[..len]) );
+        Ok(Some(Some(path)))
     }
 
     fn escape_pressed(&self) -> bool {

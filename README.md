@@ -72,6 +72,19 @@ Press the hotkey, then:
 - the "To text" button (left of Save; text lines inside scan corners) recognizes the text in the selection,
   copies it to the clipboard as plain text and closes. Redacted areas stay unreadable
   because recognition runs on the image as shown.
+- **Add to editor** (next to Save) sends the captured image and its unflattened
+  annotations into the **Composition Editor** — opening a new editor window sized to
+  the first image if none is open, or appending into the existing editor session. In
+  the editor:
+  - every placed screenshot and every annotation from earlier steps stays live: click
+    any image or shape to move it, resize it with its 8 handles (hold **Shift** on a
+    corner handle to lock an image's aspect ratio), restyle it, reorder it forward or
+    backward, or delete it
+  - drag any edge or corner of the canvas itself to grow or crop the composition
+    workspace (with full undo across canvas resizes, image moves/resizes and shapes)
+  - click **Add image** on the far left of the toolbar to hide the editor temporarily
+    and capture another screenshot; **✓** adds that capture straight into the editor
+  - click **Open** (next to Add image) to load a saved `.bs` composition or image file
 - the scrolling-screenshot button (a page with a down arrow) captures more than fits
   on screen: the overlay closes, a blue frame marks the selection, a live preview
   beside its bottom edge grows upward (shrinking in width once it nears the top of
@@ -79,11 +92,10 @@ Press the hotkey, then:
   the window under the frame (mouse wheel or trackpad; input passes
   through the frame) and bluesnap captures it about 16 times a second, stitching the
   frames into one tall image. Sticky headers and footers appear once. The bar
-  next to the region has Edit, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
-  image, Save writes a PNG, ✕ cancels, and Edit opens it in a window with the
-  same tools as the capture toolbar (shapes, pen, highlighter, counter, redact,
-  text, undo, To text,
-  Save, ✕, ✓), scrolled with the mouse wheel. Scroll at a moderate
+  next to the region has Add to editor, Save, ✕ and ✓: ✓ (or the hotkey again) copies the
+  image, Save writes a `.png` or `.bs` file, ✕ cancels, and Add to editor sends the
+  stitched image and annotations into the Composition Editor, scrolled with the mouse
+  wheel (Ctrl/Cmd+wheel zooms). Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
   scrolling back a little picks it up again. Content redrawn at fractional pixel
   offsets (display scaling, trackpads) is matched with sub-pixel accuracy. Only
@@ -91,13 +103,16 @@ Press the hotkey, then:
   the image: fixed side panels and scrollbars (including macOS overlay scrollbars)
   are left out. Annotations made before starting come along: the image starts with
   the selection, so they stay on the content they were drawn on (and remain
-  editable after Edit). The image stops at 30,000 px.
-- ✓ (or Enter, Ctrl/Cmd+C, double-click) copies to the clipboard, the download icon
-  (or Ctrl/Cmd+S) saves a PNG, ✕ (or Esc) cancels. Right-click goes back to window
-  picking, or exits when nothing is selected.
+  editable in the editor). The image stops at 30,000 px.
+- ✓ (or Enter, Ctrl/Cmd+C, double-click) always copies a plain raster image to the
+  clipboard; the download icon (or Ctrl/Cmd+S) saves either a `.png` image or an
+  editable BSON-based **`.bs`** file (storing lossless raw image data, canvas size and
+  all live elements so it can be reopened and edited later); ✕ (or Esc) cancels.
+  Right-click goes back to window picking, or exits when nothing is selected.
 
 bluesnap lives in the system tray (Windows) or menu bar (macOS). Its menu has
-Take Screenshot, Edit Settings…, AI Settings…, a start-at-login check item and Quit;
+Take Screenshot, Open Editor, Open .bs File…, Edit Settings…, AI Settings…, a
+start-at-login check item and Quit;
 on Windows, left-clicking the tray icon also takes a screenshot. The check item,
 **Start with Windows** (a `bluesnap` value in
 `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`) or **Open at
@@ -158,26 +173,28 @@ short label, so it works best next to an LLM.
 
 ```
 crates/
-  core/       bluesnap-core: no OS or UI code. Editor state machine (picking, selection,
-              annotations, undo, text editing), shapes and hit testing, panel placement,
-              tiny-skia rasterizer used for both the live preview and the export,
-              scrolling-screenshot stitcher.
+  core/       bluesnap-core: no OS or UI code. Unified Editor & Composition engine
+              (window picking, resizable canvas, placed images, annotations, Z-order,
+              undo, text editing), BSON 1.1 `.bs` file format, tiny-skia rasterizer
+              and scrolling-screenshot stitcher.
   platform/   bluesnap-platform: every OS API call, behind the `Platform` trait.
-              windows.rs  GDI capture, EnumWindows + DWM window bounds, topmost overlay
-              macos.rs    CoreGraphics capture and window list, AppKit overlay setup
+              windows.rs  GDI capture, EnumWindows + DWM window bounds, topmost overlay,
+                          Win32 `.png` / `.bs` save & open dialogs
+              macos.rs    CoreGraphics capture and window list, AppKit overlay & panels
               linux.rs    stub (builds, capture returns an error) plus demo mode
   ocr/        bluesnap-ocr: embedded PP-OCRv6 models (small det + medium rec) run by tract.
   ai/         bluesnap-ai: optional AI endpoints (settings, Responses / Decisions API
               calls) and finding sensitive text in OCR lines for Auto redaction.
   app/        bluesnap: the GPUI frontend.
-              editor_view.rs  the editing view, on two surfaces: the full-screen capture
-                              overlay and a document window (scrolling screenshots)
-              capture.rs      hotkey -> capture -> overlay; document.rs opens a document
-              scrolling.rs    scrolling capture session (dim layer, bar, stitching loop)
-              toolbar.rs      one table of toolbar actions; toolbars are lists of them
-              viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU images
-              output.rs       copy / save / cancel
-              ai_settings.rs  the AI Settings window; text_field.rs  its text inputs
+              canvas_view.rs    first-class canvas view shared by the capture overlay
+                                and the multi-image Composition Editor
+              capture.rs        configurable capture entry point (Standard / ForEditor)
+              editor_window.rs  Composition Editor session & `.bs` / image file loader
+              scrolling.rs      scrolling capture session (dim layer, bar, stitching loop)
+              toolbar.rs        reusable toolbars, style bars, and layer-order controls
+              viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU atlases
+              output.rs         clipboard copy and `.png` / `.bs` save dialog
+              ai_settings.rs    the AI Settings window; text_field.rs  its text inputs
 packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
 crates/platform/assets/fonts  Nunito (SIL Open Font License, Nunito-OFL.txt), the
                     rounded text face on Windows and Linux

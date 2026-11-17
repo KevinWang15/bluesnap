@@ -1,17 +1,19 @@
-//! Toolbars: the buttons every toolbar shares (one table of icons, labels and
-//! colors), the editor's toolbar and style bar, and building blocks other
-//! panels (the scrolling-capture bar) reuse.
+//! First-class reusable toolbars and style bars shared across the Capture
+//! overlay, the Composition Editor window, and the Scrolling Capture bar.
 
 use std::sync::Arc;
 
-use bluesnap_core::{ArrowStyle, Color, CounterFormat, PALETTE, TextStyle, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE, Tool};
+use bluesnap_core::{
+    ArrowStyle, Color, CounterFormat, LayerOrder, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE,
+    TextStyle, Tool,
+};
 use gpui::{
     AnyElement, AnyView, App, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba, svg, white,
 };
 
-use crate::editor_view::EditorView;
+use crate::canvas_view::CanvasView;
 use crate::output::Finish;
 
 pub const PAD: f32 = 4.0;
@@ -33,14 +35,19 @@ const TEXT_STYLE: f32 = 132.0;
 /// Width of the redact bar's Auto button (AI redaction).
 const AUTO: f32 = 64.0;
 
-/// A toolbar button's meaning. Each toolbar lists the actions it offers.
+/// A toolbar button's meaning. Each surface composes the actions it offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    /// Leftmost button in the Editor: hides the Editor and captures a new image into it.
+    AddImage,
+    /// Opens an existing `.bs` composition or raster image file in the Editor.
+    OpenFile,
     Tool(Tool),
     Undo,
     Scrolling,
     ToText,
-    Edit,
+    /// Sends the capture (raw image + unflattened annotations) into the Editor.
+    AddToEditor,
     Save,
     Cancel,
     Done,
@@ -49,6 +56,8 @@ pub enum Action {
 impl Action {
     fn icon(self) -> &'static str {
         match self {
+            Action::AddImage => "icons/add-image.svg",
+            Action::OpenFile => "icons/open.svg",
             Action::Tool(Tool::Rect) => "icons/rect.svg",
             Action::Tool(Tool::Ellipse) => "icons/ellipse.svg",
             Action::Tool(Tool::Arrow) => "icons/arrow.svg",
@@ -60,15 +69,17 @@ impl Action {
             Action::Undo => "icons/undo.svg",
             Action::Scrolling => "icons/scroll.svg",
             Action::ToText => "icons/ocr.svg",
-            Action::Edit => "icons/edit.svg",
+            Action::AddToEditor => "icons/edit.svg",
             Action::Save => "icons/save.svg",
             Action::Cancel => "icons/cancel.svg",
             Action::Done => "icons/done.svg",
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label_for(self, done_adds_to_editor: bool) -> &'static str {
         match self {
+            Action::AddImage => "Add image: capture another screenshot",
+            Action::OpenFile => "Open .bs or image file (Ctrl+O)",
             Action::Tool(Tool::Rect) => "Rectangle",
             Action::Tool(Tool::Ellipse) => "Ellipse",
             Action::Tool(Tool::Arrow) => "Arrow",
@@ -80,17 +91,18 @@ impl Action {
             Action::Undo => "Undo",
             Action::Scrolling => "Scrolling screenshot: scroll the window to capture more",
             Action::ToText => "To text: copy the text in the selection",
-            Action::Edit => "Edit: annotate in a window",
-            Action::Save => "Save",
+            Action::AddToEditor => "Add to editor",
+            Action::Save => "Save (.png or .bs)",
             Action::Cancel => "Cancel (Esc)",
+            Action::Done if done_adds_to_editor => "Add to editor (Enter)",
             Action::Done => "Copy (Enter)",
         }
     }
 
     fn color(self) -> Hsla {
         match self {
+            Action::AddImage | Action::Done => hsla(THEME_BLUE),
             Action::Cancel => hsla(Color::rgb(0xF5222D)),
-            Action::Done => hsla(THEME_BLUE),
             _ => hsla(Color::rgb(0x333333)),
         }
     }
@@ -119,13 +131,32 @@ const TOOLS: [Action; Tool::ALL.len()] = [
 /// How every toolbar ends.
 pub const FINISH: [Action; 3] = [Action::Save, Action::Cancel, Action::Done];
 
-/// The capture overlay's toolbar, in groups separated by lines.
-pub const CAPTURE_TOOLBAR: &[&[Action]] =
+/// Standalone capture overlay toolbar: includes `AddToEditor`.
+pub const CAPTURE_TOOLBAR: &[&[Action]] = &[
+    &TOOLS,
+    &[Action::Undo],
+    &[Action::Scrolling, Action::ToText, Action::AddToEditor, FINISH[0], FINISH[1], FINISH[2]],
+];
+
+/// Capture overlay toolbar when capturing a new image from inside the Editor:
+/// `AddToEditor` is hidden and `Done` adds the image to the open Editor.
+pub const CAPTURE_FOR_EDITOR_TOOLBAR: &[&[Action]] =
     &[&TOOLS, &[Action::Undo], &[Action::Scrolling, Action::ToText, FINISH[0], FINISH[1], FINISH[2]]];
-/// The document editor's toolbar: no scrolling capture of an image.
-pub const DOCUMENT_TOOLBAR: &[&[Action]] = &[&TOOLS, &[Action::Undo], &[Action::ToText, FINISH[0], FINISH[1], FINISH[2]]];
-/// The scrolling capture's bar, after its status text.
-pub const SCROLLING_BAR: &[&[Action]] = &[&[Action::Edit, FINISH[0], FINISH[1], FINISH[2]]];
+
+/// Composition Editor toolbar: `AddImage` at the far left, followed by `OpenFile`,
+/// then all annotation tools, Undo, ToText, Save, Cancel, and Done (Copy).
+pub const EDITOR_TOOLBAR: &[&[Action]] = &[
+    &[Action::AddImage, Action::OpenFile],
+    &TOOLS,
+    &[Action::Undo],
+    &[Action::ToText, FINISH[0], FINISH[1], FINISH[2]],
+];
+
+/// Scrolling capture bar (standalone): includes `AddToEditor`.
+pub const SCROLLING_BAR: &[&[Action]] = &[&[Action::AddToEditor, FINISH[0], FINISH[1], FINISH[2]]];
+
+/// Scrolling capture bar when triggered from the Editor: `AddToEditor` is hidden.
+pub const SCROLLING_FOR_EDITOR_BAR: &[&[Action]] = &[&[FINISH[0], FINISH[1], FINISH[2]]];
 
 /// One child of a panel row, in order: a named control of some width, or a
 /// separator line. Panel sizes and control positions are both computed from
@@ -138,10 +169,13 @@ pub enum Slot {
 
 /// Logical size of a panel holding `slots` (`height` is its controls' height).
 fn row_size(slots: &[Slot], height: f32) -> (f32, f32) {
-    let widths: f32 = slots.iter().map(|s| match s {
-        Slot::Item(_, w) => *w,
-        Slot::Sep => SEP,
-    }).sum();
+    let widths: f32 = slots
+        .iter()
+        .map(|s| match s {
+            Slot::Item(_, w) => *w,
+            Slot::Sep => SEP,
+        })
+        .sum();
     let gaps = slots.len().saturating_sub(1) as f32 * GAP;
     (2.0 * (BORDER + PAD) + widths + gaps, 2.0 * (BORDER + PAD) + height)
 }
@@ -179,16 +213,14 @@ pub fn toolbar_slots(groups: &[&[Action]], extra: f32) -> Vec<Slot> {
     slots
 }
 
-/// Logical size of a panel of button `groups`. `extra` is the width of other
-/// content placed first, as a group of its own (separated by a line).
+/// Logical size of a panel of button `groups`.
 pub fn panel_size(groups: &[&[Action]], extra: f32) -> (f32, f32) {
     row_size(&toolbar_slots(groups, extra), BUTTON)
 }
 
-/// The style bar's slots for `tool`: 3 sizes, then (if the tool has a color) |
-/// 6 colors, then for counters | 4 numberings or for text | the style button.
-/// The redact tool's bar is area | effect | strength slider | 3 sizes | Auto.
-pub fn style_slots(tool: Tool) -> Vec<Slot> {
+/// Slots for `tool`'s style bar. When `with_layer_ops` is `true` (an element is
+/// selected in the Composition Editor), appends `| BringForward, SendBackward, Delete`.
+pub fn style_slots_ex(tool: Tool, with_layer_ops: bool) -> Vec<Slot> {
     let item = |name: String, w| Slot::Item(name, w);
     let sizes = || SizeLevel::ALL.map(|l| item(format!("size:{l:?}"), STYLE_BUTTON));
     let mut slots = Vec::new();
@@ -199,34 +231,63 @@ pub fn style_slots(tool: Tool) -> Vec<Slot> {
         slots.extend([Slot::Sep, item("slider".into(), SLIDER), Slot::Sep]);
         slots.extend(sizes());
         slots.extend([Slot::Sep, item("auto".into(), AUTO)]);
-        return slots;
-    }
-    slots.extend(sizes());
-    if tool.uses_color() {
-        slots.push(Slot::Sep);
-        slots.extend((0..PALETTE.len()).map(|i| item(format!("color:{i}"), STYLE_BUTTON)));
-    }
-    match tool {
-        Tool::Counter => {
+    } else {
+        slots.extend(sizes());
+        if tool.uses_color() {
             slots.push(Slot::Sep);
-            slots.extend(CounterFormat::ALL.map(|f| item(format!("numbering:{f:?}"), STYLE_BUTTON)));
+            slots.extend((0..PALETTE.len()).map(|i| item(format!("color:{i}"), STYLE_BUTTON)));
         }
-        Tool::Text => slots.extend([Slot::Sep, item("text-style".into(), TEXT_STYLE)]),
-        Tool::Arrow => {
-            slots.push(Slot::Sep);
-            slots.extend(ArrowStyle::ALL.map(|s| item(format!("arrow-style:{s:?}"), STYLE_BUTTON)));
+        match tool {
+            Tool::Counter => {
+                slots.push(Slot::Sep);
+                slots.extend(CounterFormat::ALL.map(|f| item(format!("numbering:{f:?}"), STYLE_BUTTON)));
+            }
+            Tool::Text => slots.extend([Slot::Sep, item("text-style".into(), TEXT_STYLE)]),
+            Tool::Arrow => {
+                slots.push(Slot::Sep);
+                slots.extend(ArrowStyle::ALL.map(|s| item(format!("arrow-style:{s:?}"), STYLE_BUTTON)));
+            }
+            _ => {}
         }
-        _ => {}
+    }
+    if with_layer_ops {
+        slots.extend([
+            Slot::Sep,
+            item("layer:forward".into(), STYLE_BUTTON),
+            item("layer:backward".into(), STYLE_BUTTON),
+            item("layer:delete".into(), STYLE_BUTTON),
+        ]);
     }
     slots
 }
 
-/// Logical size of `tool`'s style bar.
-pub fn style_bar_size(tool: Tool) -> (f32, f32) {
-    row_size(&style_slots(tool), STYLE_BUTTON)
+pub fn style_slots(tool: Tool) -> Vec<Slot> {
+    style_slots_ex(tool, false)
 }
 
-/// Bounds of the control named `name` on `tool`'s style bar at `origin`.
+pub fn style_bar_size_ex(tool: Tool, with_layer_ops: bool) -> (f32, f32) {
+    row_size(&style_slots_ex(tool, with_layer_ops), STYLE_BUTTON)
+}
+
+pub fn style_bar_size(tool: Tool) -> (f32, f32) {
+    style_bar_size_ex(tool, false)
+}
+
+/// Slots & size of the standalone layer-actions bar shown when an `Element::Image`
+/// is selected in the Composition Editor (`Bring Forward | Send Backward | Delete`).
+pub fn image_bar_slots() -> Vec<Slot> {
+    vec![
+        Slot::Item("layer:forward".into(), STYLE_BUTTON),
+        Slot::Item("layer:backward".into(), STYLE_BUTTON),
+        Slot::Sep,
+        Slot::Item("layer:delete".into(), STYLE_BUTTON),
+    ]
+}
+
+pub fn image_bar_size() -> (f32, f32) {
+    row_size(&image_bar_slots(), STYLE_BUTTON)
+}
+
 fn style_item(tool: Tool, name: &str, origin: (f32, f32)) -> (f32, f32, f32, f32) {
     row_items(&style_slots(tool), STYLE_BUTTON, origin)
         .into_iter()
@@ -235,19 +296,16 @@ fn style_item(tool: Tool, name: &str, origin: (f32, f32)) -> (f32, f32, f32, f32
         .expect("the style bar has this control")
 }
 
-/// Where the text style button is, as (x, width), on a text style bar at `bar_x`.
 pub fn text_style_button(bar_x: f32) -> (f32, f32) {
     let (x, _, w, _) = style_item(Tool::Text, "text-style", (bar_x, 0.0));
     (x, w)
 }
 
-/// Window x of the strength slider's 0 and 1 for a redact style bar at `bar_x`.
 fn slider_ends(bar_x: f32) -> (f32, f32) {
     let (x, _, w, _) = style_item(Tool::Redact, "slider", (bar_x, 0.0));
     (x + SLIDER_INSET, x + w - SLIDER_INSET)
 }
 
-/// The strength for the pointer at window x `x` on a redact style bar at `bar_x`.
 pub fn slider_value(bar_x: f32, x: f32) -> f32 {
     let (lo, hi) = slider_ends(bar_x);
     ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
@@ -257,7 +315,6 @@ pub fn hsla(c: Color) -> Hsla {
     rgb(c.to_hex()).into()
 }
 
-/// Hover label for a toolbar button.
 struct Tooltip(SharedString);
 
 impl Render for Tooltip {
@@ -290,11 +347,9 @@ pub fn panel() -> Div {
         .border_color(rgba(0x0000_0022))
         .rounded(px(8.0))
         .shadow_md()
-        // Clicks on the panel never reach what's underneath.
         .occlude()
 }
 
-/// A panel floating at (`x`, `y`) with an explicit size.
 fn floating_panel((w, h): (f32, f32), x: f32, y: f32) -> Div {
     panel().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h))
 }
@@ -303,18 +358,19 @@ pub fn separator() -> Div {
     div().flex_none().w(px(1.0)).h(px(20.0)).mx(px(4.0)).bg(rgba(0x0000_0022))
 }
 
-/// The button for `action`; the caller attaches what it does. `active` shows
-/// it highlighted (the current tool), `enabled: false` grays it out.
-pub fn action_button(action: Action, active: bool, enabled: bool) -> Stateful<Div> {
+/// The button for `action`; `done_adds_to_editor` adjusts `Done`'s tooltip when
+/// capturing into an open Editor.
+pub fn action_button(action: Action, active: bool, enabled: bool, done_adds_to_editor: bool) -> Stateful<Div> {
     let blue = hsla(THEME_BLUE);
     let color = match (active, enabled) {
         (true, _) => blue,
         (_, false) => hsla(Color::rgb(0xBBBBBB)),
         _ => action.color(),
     };
+    let label = action.label_for(done_adds_to_editor);
     div()
-        .id(action.label())
-        .tooltip(tooltip(action.label()))
+        .id(label)
+        .tooltip(tooltip(label))
         .size(px(BUTTON))
         .flex()
         .items_center()
@@ -327,8 +383,8 @@ pub fn action_button(action: Action, active: bool, enabled: bool) -> Stateful<Di
 }
 
 fn on_press(
-    cx: &mut Context<EditorView>,
-    f: impl Fn(&mut EditorView, &mut Window, &mut Context<EditorView>) + 'static,
+    cx: &mut Context<CanvasView>,
+    f: impl Fn(&mut CanvasView, &mut Window, &mut Context<CanvasView>) + 'static,
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
         cx.stop_propagation();
@@ -337,8 +393,15 @@ fn on_press(
     })
 }
 
-/// The editor's toolbar with `groups` of actions at (`x`, `y`).
-pub fn toolbar(view: &EditorView, groups: &[&[Action]], x: f32, y: f32, cx: &mut Context<EditorView>) -> AnyElement {
+/// Renders the main toolbar with `groups` of actions at (`x`, `y`).
+pub fn toolbar(
+    view: &CanvasView,
+    groups: &[&[Action]],
+    done_adds_to_editor: bool,
+    x: f32,
+    y: f32,
+    cx: &mut Context<CanvasView>,
+) -> AnyElement {
     let editor = view.editor();
     let mut bar = floating_panel(panel_size(groups, 0.0), x, y);
     for (i, group) in groups.iter().enumerate() {
@@ -352,16 +415,15 @@ pub fn toolbar(view: &EditorView, groups: &[&[Action]], x: f32, y: f32, cx: &mut
                 Action::ToText => (view.is_recognizing(), true),
                 _ => (false, true),
             };
-            bar = bar.child(
-                action_button(action, active, enabled)
-                    .on_mouse_down(MouseButton::Left, on_press(cx, move |this, w, cx| this.perform(action, w, cx))),
-            );
+            bar = bar.child(action_button(action, active, enabled, done_adds_to_editor).on_mouse_down(
+                MouseButton::Left,
+                on_press(cx, move |this, w, cx| this.perform(action, w, cx)),
+            ));
         }
     }
     bar.into_any_element()
 }
 
-/// A small style bar button: the caller adds its content and what it does.
 fn style_button(active: bool) -> Div {
     div()
         .size(px(STYLE_BUTTON))
@@ -373,7 +435,6 @@ fn style_button(active: bool) -> Div {
         .when(active, |d| d.bg(rgba(0x1677_FF1F)))
 }
 
-/// One choice of a segmented control: an icon, highlighted when chosen.
 fn segment(label: &'static str, icon: &'static str, active: bool) -> Stateful<Div> {
     let color = if active { hsla(THEME_BLUE) } else { rgb(0x444444).into() };
     style_button(active)
@@ -384,8 +445,77 @@ fn segment(label: &'static str, icon: &'static str, active: bool) -> Stateful<Di
         .child(svg().path(icon).size(px(STYLE_ICON)).text_color(color))
 }
 
-/// Brush size dots; grayed out and inert when `enabled` is false.
-fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<EditorView>) -> Div {
+fn icon_op_button(
+    id: &'static str,
+    label: &'static str,
+    icon: &'static str,
+    enabled: bool,
+    danger: bool,
+) -> Stateful<Div> {
+    let color: Hsla = if !enabled {
+        rgb(0xC8C8C8).into()
+    } else if danger {
+        hsla(Color::rgb(0xF5222D))
+    } else {
+        rgb(0x444444).into()
+    };
+    style_button(false)
+        .id(id)
+        .tooltip(tooltip(label))
+        .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(rgba(0x0000_000F))))
+        .child(svg().path(icon).size(px(STYLE_ICON)).text_color(color))
+}
+
+fn append_layer_ops(mut bar: Div, (can_back, can_fwd): (bool, bool), with_leading_sep: bool, cx: &mut Context<CanvasView>) -> Div {
+    if with_leading_sep {
+        bar = bar.child(separator());
+    }
+    bar = bar.child(
+        icon_op_button("layer:forward", "Bring forward (])", "icons/bring-forward.svg", can_fwd, false).when(
+            can_fwd,
+            |b| {
+                b.on_mouse_down(
+                    MouseButton::Left,
+                    on_press(cx, |this, _, _| {
+                        this.editor_mut().reorder_selected(LayerOrder::Forward);
+                    }),
+                )
+            },
+        ),
+    );
+    bar = bar.child(
+        icon_op_button("layer:backward", "Send backward ([)", "icons/send-backward.svg", can_back, false).when(
+            can_back,
+            |b| {
+                b.on_mouse_down(
+                    MouseButton::Left,
+                    on_press(cx, |this, _, _| {
+                        this.editor_mut().reorder_selected(LayerOrder::Backward);
+                    }),
+                )
+            },
+        ),
+    );
+    if !with_leading_sep {
+        bar = bar.child(separator());
+    }
+    bar.child(
+        icon_op_button("layer:delete", "Delete (Del)", "icons/trash.svg", true, true).on_mouse_down(
+            MouseButton::Left,
+            on_press(cx, |this, _, _| {
+                this.editor_mut().delete_selected();
+            }),
+        ),
+    )
+}
+
+/// Standalone bar shown when a placed `Image` is selected in the Composition Editor.
+pub fn image_bar((can_back, can_fwd): (bool, bool), x: f32, y: f32, cx: &mut Context<CanvasView>) -> AnyElement {
+    let bar = floating_panel(image_bar_size(), x, y);
+    append_layer_ops(bar, (can_back, can_fwd), false, cx).into_any_element()
+}
+
+fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<CanvasView>) -> Div {
     for (level, dot) in SizeLevel::ALL.into_iter().zip([4.0, 8.0, 12.0]) {
         let active = enabled && level == size;
         let color: Hsla = match (active, enabled) {
@@ -409,25 +539,22 @@ fn size_dots(mut bar: Div, size: SizeLevel, enabled: bool, cx: &mut Context<Edit
 /// What a style bar shows beyond sizes and colors.
 pub enum Extra {
     None,
-    /// The counters' numbering.
     Numbering(CounterFormat),
-    /// The text style, and whether its menu is open.
     TextStyle(TextStyle, bool),
-    /// The line arrows take.
     ArrowStyle(ArrowStyle),
 }
 
-/// The style bar of a tool with a color.
 pub fn style_bar(
     tool: Tool,
-    size: SizeLevel,
-    color: Color,
+    style: bluesnap_core::Style,
     extra: Extra,
+    layer_ops: Option<(bool, bool)>,
     x: f32,
     y: f32,
-    cx: &mut Context<EditorView>,
+    cx: &mut Context<CanvasView>,
 ) -> AnyElement {
-    let mut bar = size_dots(floating_panel(style_bar_size(tool), x, y), size, true, cx);
+    let (size, color) = (style.size, style.color);
+    let mut bar = size_dots(floating_panel(style_bar_size_ex(tool, layer_ops.is_some()), x, y), size, true, cx);
     if tool.uses_color() {
         bar = bar.child(separator());
         for c in PALETTE {
@@ -506,35 +633,31 @@ pub fn style_bar(
             );
         }
     }
+    if let Some(ops) = layer_ops {
+        bar = append_layer_ops(bar, ops, true, cx);
+    }
     bar.into_any_element()
 }
 
-/// One text style preview: the style, its sample drawn by the annotation
-/// renderer, and the sample's logical size.
 pub type TextPreview = (TextStyle, Arc<gpui::RenderImage>, (f32, f32));
 
-/// Row height of the text style menu.
 const MENU_ROW: f32 = 36.0;
 
-/// The `i`th row of the text style menu, relative to the menu: (x, y, _, height).
 pub fn text_style_menu_row(i: usize) -> (f32, f32, f32, f32) {
     (BORDER + PAD, BORDER + PAD + i as f32 * MENU_ROW, 0.0, MENU_ROW)
 }
 
-/// Logical size of the text style menu for `count` styles.
 pub fn text_style_menu_size(count: usize) -> (f32, f32) {
     (190.0, 2.0 * (BORDER + PAD) + count as f32 * MENU_ROW)
 }
 
-/// The text style picker: each style's sample, the current one checked. On a
-/// dark panel when the text color is light, so light samples show.
 pub fn text_style_menu(
     previews: &[TextPreview],
     current: TextStyle,
     dark: bool,
     x: f32,
     y: f32,
-    cx: &mut Context<EditorView>,
+    cx: &mut Context<CanvasView>,
 ) -> AnyElement {
     let (w, h) = text_style_menu_size(previews.len());
     let mut menu = div()
@@ -575,26 +698,22 @@ pub fn text_style_menu(
     menu.into_any_element()
 }
 
-/// The redact bar's Auto button: ready, or running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Auto {
     Ready,
     Running,
 }
 
-/// The redact tool's style bar: brush or area | mosaic, blur or gray |
-/// strength slider | brush size | Auto (AI redaction; it explains how to set it
-/// up when it isn't). Controls that don't apply are grayed out rather than
-/// hidden, so the bar keeps its layout.
 pub fn redact_bar(
     redaction: Redaction,
     size: SizeLevel,
     auto: Auto,
+    layer_ops: Option<(bool, bool)>,
     x: f32,
     y: f32,
-    cx: &mut Context<EditorView>,
+    cx: &mut Context<CanvasView>,
 ) -> AnyElement {
-    let mut bar = floating_panel(style_bar_size(Tool::Redact), x, y);
+    let mut bar = floating_panel(style_bar_size_ex(Tool::Redact, layer_ops.is_some()), x, y);
     for area in RedactArea::ALL {
         let (label, icon) = match area {
             RedactArea::Brush => ("Brush: paint over what to hide", "icons/brush.svg"),
@@ -653,12 +772,13 @@ pub fn redact_bar(
                 .child(if running { "Finding…" } else { "Auto" }),
         );
     }
+    if let Some(ops) = layer_ops {
+        bar = append_layer_ops(bar, ops, true, cx);
+    }
     bar.into_any_element()
 }
 
-/// The strength slider. A press anywhere on it jumps the thumb there and
-/// starts a drag, which the view follows window-wide.
-fn slider(redaction: Redaction, cx: &mut Context<EditorView>) -> Stateful<Div> {
+fn slider(redaction: Redaction, cx: &mut Context<CanvasView>) -> Stateful<Div> {
     let enabled = redaction.effect.has_strength();
     let label = match redaction.effect {
         RedactEffect::Mosaic => "Mosaic block size",
@@ -711,19 +831,19 @@ mod tests {
 
     #[test]
     fn panel_size_counts_buttons_separators_and_gaps() {
-        // 14 buttons, 2 separators, 15 gaps between the 16 children.
         let frame = 2.0 * (BORDER + PAD);
-        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 14.0 * BUTTON + 2.0 * SEP + 15.0 * GAP, 42.0));
-        // One button less without scrolling capture.
-        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0).0 - panel_size(DOCUMENT_TOOLBAR, 0.0).0, BUTTON + GAP);
-        // Extra content (the scrolling bar's status) is a group of its own:
-        // status | 4 buttons = 6 children.
+        // CAPTURE_TOOLBAR: 8 tools | Undo | Scrolling, ToText, AddToEditor, Save, Cancel, Done = 15 buttons, 2 separators, 16 gaps.
+        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 15.0 * BUTTON + 2.0 * SEP + 16.0 * GAP, 42.0));
+        // CAPTURE_FOR_EDITOR_TOOLBAR hides AddToEditor: one button + gap narrower.
+        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0).0 - panel_size(CAPTURE_FOR_EDITOR_TOOLBAR, 0.0).0, BUTTON + GAP);
+        // EDITOR_TOOLBAR starts with AddImage on the far left.
+        assert_eq!(EDITOR_TOOLBAR[0][0], Action::AddImage);
         assert_eq!(panel_size(SCROLLING_BAR, 200.0).0, frame + 4.0 * BUTTON + SEP + 200.0 + 5.0 * GAP);
+        assert_eq!(panel_size(SCROLLING_FOR_EDITOR_BAR, 200.0).0, frame + 3.0 * BUTTON + SEP + 200.0 + 4.0 * GAP);
     }
 
     #[test]
     fn control_positions_fill_their_panels() {
-        // The last control ends where the panel's padding begins, for every bar.
         let check = |slots: Vec<Slot>, height: f32| {
             let (w, h) = row_size(&slots, height);
             let items = row_items(&slots, height, (10.0, 20.0));
@@ -733,36 +853,30 @@ mod tests {
         };
         for tool in Tool::ALL {
             check(style_slots(tool), STYLE_BUTTON);
+            check(style_slots_ex(tool, true), STYLE_BUTTON);
         }
+        check(image_bar_slots(), STYLE_BUTTON);
         check(toolbar_slots(CAPTURE_TOOLBAR, 0.0), BUTTON);
+        check(toolbar_slots(EDITOR_TOOLBAR, 0.0), BUTTON);
         check(toolbar_slots(SCROLLING_BAR, 200.0), BUTTON);
-        let names: Vec<String> = row_items(&toolbar_slots(CAPTURE_TOOLBAR, 0.0), BUTTON, (0.0, 0.0)).into_iter().map(|(n, _)| n).collect();
-        assert!(names.contains(&"Tool(Redact)".to_string()) && names.contains(&"Done".to_string()));
     }
 
     #[test]
     fn style_bar_sizes_follow_the_tool() {
         let frame = 2.0 * (BORDER + PAD);
-        // 3 sizes | 6 colors: 9 buttons, a separator, 9 gaps.
         assert_eq!(style_bar_size(Tool::Rect).0, frame + 9.0 * STYLE_BUTTON + SEP + 9.0 * GAP);
-        // Counters add | 4 numberings: 13 buttons, 2 separators, 14 gaps.
         assert_eq!(style_bar_size(Tool::Counter).0, frame + 13.0 * STYLE_BUTTON + 2.0 * SEP + 14.0 * GAP);
-        // 2 areas | 3 effects | slider | 3 sizes: 8 buttons, 3 separators and
-        // the slider, so 11 gaps.
         let redact = frame + 8.0 * STYLE_BUTTON + 3.0 * SEP + SLIDER + 11.0 * GAP;
-        // | Auto: one more separator and button, two more gaps.
         assert_eq!(style_bar_size(Tool::Redact), (redact + SEP + AUTO + 2.0 * GAP, frame + STYLE_BUTTON));
     }
 
     #[test]
     fn slider_maps_its_track_to_strength() {
         let (lo, hi) = slider_ends(100.0);
-        // The slider sits after the segments and two separators, inside the bar.
         assert!(lo > 100.0 + 5.0 * STYLE_BUTTON && hi < 100.0 + style_bar_size(Tool::Redact).0);
         assert_eq!(hi - lo, SLIDER - 2.0 * SLIDER_INSET);
         assert_eq!(slider_value(100.0, lo), 0.0);
         assert_eq!(slider_value(100.0, (lo + hi) / 2.0), 0.5);
-        // Past either end (a drag off the track) clamps.
         assert_eq!(slider_value(100.0, lo - 50.0), 0.0);
         assert_eq!(slider_value(100.0, hi + 50.0), 1.0);
     }

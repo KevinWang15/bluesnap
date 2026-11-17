@@ -102,6 +102,10 @@ impl Rect {
         Rect { x: self.x + d.x, y: self.y + d.y, ..*self }
     }
 
+    pub fn scale(&self, k: f32) -> Rect {
+        Rect::new(self.x * k, self.y * k, self.w * k, self.h * k)
+    }
+
     pub fn intersect(&self, o: &Rect) -> Option<Rect> {
         let l = self.x.max(o.x);
         let t = self.y.max(o.y);

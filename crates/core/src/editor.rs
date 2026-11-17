@@ -1,24 +1,41 @@
-//! The capture session state machine: window picking, selection editing and
-//! annotation editing. Frontends feed it pointer/keyboard input in screenshot
-//! pixel coordinates and draw what it reports.
+//! Unified editing and annotation engine (`Editor`): powers both the full-screen
+//! capture overlay (`SelectionMode::Pick`) and the multi-image resizable-canvas
+//! composition editor (`SelectionMode::Canvas`).
+//!
+//! Frontends feed it pointer/keyboard input in canvas/screenshot pixel
+//! coordinates and render what it reports.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
 
 use tiny_skia::Pixmap;
 
+use crate::composition::{
+    Composition, Element, LayerOrder, PlacedImage, clamp_resized_rect, renumber_counters_in,
+    reorder_element,
+};
 use crate::geom::{CursorKind, Handle, Point, Rect};
+use crate::pixels::crop;
 use crate::render::{self, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
-use crate::style::{ArrowStyle, Color, CounterFormat, RedactArea, Redaction, SizeLevel, Style, TextStyle, Tool};
+use crate::style::{ArrowStyle, Color, CounterFormat, RedactArea, RedactEffect, Redaction, SizeLevel, Style, TextStyle, Tool};
 use crate::text::{Fonts, TextLayout};
 
 /// Movement (in logical pixels) before a press turns into a drag.
 const DRAG_THRESHOLD: f32 = 3.0;
-/// Hit radius (in logical pixels) of the selection's and shapes' resize handles.
+/// Hit radius (in logical pixels) of resize handles.
 const HANDLE_HIT_RADIUS: f32 = 8.0;
 /// Pointer samples closer than this (in logical pixels) are dropped from strokes.
 const MIN_STROKE_STEP: f32 = 1.5;
+/// Canvas mode: distance (in logical pixels) outside the canvas border where
+/// the 8 canvas resize handles sit so they never collide with interior elements.
+pub const CANVAS_HANDLE_OFFSET: f32 = 6.0;
+/// Canvas mode: outer/inner grab tolerance (in logical pixels) along any canvas edge.
+const CANVAS_EDGE_OUTER: f32 = 14.0;
+const CANVAS_EDGE_INNER: f32 = 4.0;
+/// Minimum canvas width/height in logical pixels.
+const MIN_CANVAS_LOGICAL: f32 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextKey {
@@ -31,14 +48,15 @@ pub enum TextKey {
     Newline,
 }
 
-/// How the selection behaves.
+/// How the workspace bounds behave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionMode {
-    /// Capture: starts empty, the user picks a window or drags a region, then can
-    /// move and resize it.
+    /// Capture overlay: starts empty, the user picks a window or drags a region,
+    /// then can move and resize that selection.
     Pick,
-    /// Document editing: the whole image is selected and stays that way.
-    Fixed,
+    /// Composition editor: resizable multi-image canvas where images and shapes
+    /// are first-class movable, resizable, rearrangable elements.
+    Canvas,
 }
 
 /// A brush's outline under the pointer: a rounded rectangle (a circle for
@@ -53,9 +71,16 @@ pub struct BrushRing {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightClick {
-    /// Nothing selected yet: the frontend should end the capture.
+    /// Nothing selected yet in capture mode: the frontend should exit capture.
     Exit,
     Handled,
+}
+
+/// One GPU rendering slice of the scene in Z-order (bottom to top).
+#[derive(Clone, Debug, PartialEq)]
+pub enum VisualBand {
+    Image(PlacedImage),
+    Shapes { range: Range<usize>, revision: u64, active: bool },
 }
 
 #[derive(Clone, Debug)]
@@ -64,9 +89,10 @@ enum Drag {
     Pick { start: Point, moved: bool },
     SelResize { handle: Handle, orig: Rect, start: Point },
     SelMove { orig: Rect, start: Point },
+    CanvasResize { handle: Handle, orig: Rect, current: Rect, start: Point },
     Create { idx: usize, start: Point },
-    ShapeMove { idx: usize, orig: Shape, start: Point, moved: bool },
-    ShapeHandle { idx: usize, handle: EditHandle, orig: Shape, start: Point },
+    ElementMove { idx: usize, orig: Element, start: Point, moved: bool },
+    ElementHandle { idx: usize, handle: EditHandle, orig: Element, start: Point },
 }
 
 #[derive(Clone, Debug)]
@@ -76,64 +102,123 @@ struct TextEdit {
     marked: Option<Range<usize>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct Snapshot {
+    canvas: (u32, u32),
+    elements: Vec<Element>,
+}
+
+enum Workspace {
+    Capture {
+        doc: Document,
+        /// Candidate window rectangles, topmost first.
+        windows: Vec<Rect>,
+        hover: Option<Rect>,
+        selection: Option<Rect>,
+    },
+    Canvas {
+        width: u32,
+        height: u32,
+        background: Color,
+        /// Lazily composited `(background + placed images)` for Mosaic/Blur tiles.
+        backdrop: RefCell<Option<Document>>,
+    },
+}
+
 pub struct Editor {
-    doc: Document,
+    workspace: Workspace,
     fonts: Arc<Fonts>,
-    /// Content scale: screenshot pixels per logical pixel, for stroke widths and
-    /// font sizes.
+    /// Content scale: canvas/screenshot pixels per logical pixel.
     scale: f32,
-    /// Interaction scale: screenshot pixels per logical pixel *on screen right
-    /// now*, for hit radii and drag thresholds. Differs from `scale` when the
-    /// image is shown zoomed.
+    /// Interaction scale: canvas pixels per logical pixel *on screen right now*,
+    /// for hit radii and drag thresholds when zoomed.
     ui_scale: f32,
-    mode: SelectionMode,
-    /// Candidate window rectangles, topmost first.
-    windows: Vec<Rect>,
     pointer: Point,
-    hover: Option<Rect>,
-    selection: Option<Rect>,
+    constrain: bool,
     drag: Option<Drag>,
-    shapes: Vec<Shape>,
-    /// Snapshots of `shapes` taken before each change, for undo.
-    history: Vec<Vec<Shape>>,
+    elements: Vec<Element>,
+    /// Snapshots taken before each undoable change.
+    history: Vec<Snapshot>,
     selected: Option<usize>,
     tool: Option<Tool>,
     styles: [Style; Tool::ALL.len()],
-    /// The redact tool's settings for new redactions.
     redaction: Redaction,
-    /// Numbering for counters while there are none (existing ones set it otherwise).
     counter_format: CounterFormat,
-    /// The text tool's style for new text.
     text_style: TextStyle,
     arrow_style: ArrowStyle,
-    /// Inside `begin_continuous_edit` .. `end_continuous_edit`; `true` once an
-    /// undo snapshot was taken for it.
     continuous: Option<bool>,
     text: Option<TextEdit>,
+    /// Accumulated canvas-origin shift from normalizing a Left/Top canvas resize.
+    pending_origin_shift: Point,
     revision: u64,
-    /// Bumped when shapes other than the active one change (see [`Self::render_static_layer`]).
     static_revision: u64,
-    /// Bumped when the active shape changes (see [`Self::render_active_layer`]).
     active_revision: u64,
 }
 
 impl Editor {
-    /// `scale` is screenshot pixels per logical pixel (the display's scale factor).
+    /// Full-screen capture session over `doc`. `scale` is screenshot pixels per
+    /// logical pixel (the display's scale factor).
     pub fn new(doc: Document, fonts: Arc<Fonts>, windows: Vec<Rect>, scale: f32) -> Self {
         let bounds = doc.bounds();
         let windows = windows.iter().filter_map(|w| w.intersect(&bounds)).collect();
-        let mut editor = Self {
-            doc,
+        let mut editor = Self::with_workspace(
+            Workspace::Capture { doc, windows, hover: None, selection: None },
+            Vec::new(),
+            fonts,
+            scale,
+        );
+        editor.update_hover();
+        editor
+    }
+
+    /// Multi-image composition editor over `comp`.
+    pub fn from_composition(comp: Composition, fonts: Arc<Fonts>) -> Self {
+        let scale = comp.scale;
+        let selected = comp.elements.iter().rposition(|e| matches!(e, Element::Image(_)));
+        let mut editor = Self::with_workspace(
+            Workspace::Canvas {
+                width: comp.width.max(1),
+                height: comp.height.max(1),
+                background: comp.background,
+                backdrop: RefCell::new(None),
+            },
+            comp.elements,
+            fonts,
+            scale,
+        );
+        // Start unselected when opening a single-image composition so all 4
+        // canvas edges are immediately uncluttered; select when multiple exist.
+        if editor.elements.iter().filter(|e| matches!(e, Element::Image(_))).count() > 1 {
+            editor.selected = selected;
+        }
+        editor.touch_shapes();
+        editor
+    }
+
+    /// Convenience constructor wrapping a single `Document` in a composition.
+    pub fn for_document(doc: Document, fonts: Arc<Fonts>, scale: f32) -> Self {
+        Self::from_composition(Composition::from_slice(doc.into_pixmap(), scale, Vec::new()), fonts)
+    }
+
+    /// Appends initial `shapes` without recording an undo step.
+    pub fn with_shapes(mut self, shapes: Vec<Shape>) -> Self {
+        self.elements.extend(shapes.into_iter().map(Element::Shape));
+        renumber_counters_in(&mut self.elements);
+        self.touch_shapes();
+        self
+    }
+
+    fn with_workspace(workspace: Workspace, elements: Vec<Element>, fonts: Arc<Fonts>, scale: f32) -> Self {
+        let scale = if scale > 0.0 && scale.is_finite() { scale } else { 1.0 };
+        Self {
+            workspace,
             fonts,
             scale,
             ui_scale: scale,
-            mode: SelectionMode::Pick,
-            windows,
             pointer: Point::default(),
-            hover: None,
-            selection: None,
+            constrain: false,
             drag: None,
-            shapes: Vec::new(),
+            elements,
             history: Vec::new(),
             selected: None,
             tool: None,
@@ -144,121 +229,249 @@ impl Editor {
             arrow_style: ArrowStyle::default(),
             continuous: None,
             text: None,
+            pending_origin_shift: Point::default(),
             revision: 0,
             static_revision: 0,
             active_revision: 0,
+        }
+    }
+
+    /// Replaces the entire canvas composition (e.g. when opening a `.bs` file).
+    pub fn replace_composition(&mut self, comp: Composition) {
+        let fonts = self.fonts.clone();
+        *self = Self::from_composition(comp, fonts);
+    }
+
+    /// Appends a captured `image` and its unflattened `shapes` into a canvas
+    /// editor as one undoable step, selecting the newly added image.
+    pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> Option<usize> {
+        self.finish_text();
+        self.drag = None;
+        let Workspace::Canvas { width, height, background, backdrop } = &mut self.workspace else {
+            return None;
         };
-        editor.update_hover();
-        editor
-    }
-
-    /// An editor for a whole image (e.g. a stitched scrolling screenshot): the
-    /// selection is the image and can't be changed, only annotated.
-    pub fn for_document(doc: Document, fonts: Arc<Fonts>, scale: f32) -> Self {
-        let mut editor = Self::new(doc, fonts, Vec::new(), scale);
-        editor.mode = SelectionMode::Fixed;
-        editor.selection = Some(editor.screen());
-        editor.hover = None;
-        editor
-    }
-
-    /// Starts with `shapes` in place, carried over from another editor (see
-    /// [`Self::shapes_in_selection`]). They're part of the document, not an
-    /// undoable change.
-    pub fn with_shapes(mut self, shapes: Vec<Shape>) -> Self {
-        self.shapes = shapes;
+        let prev = Snapshot { canvas: (*width, *height), elements: self.elements.clone() };
+        let mut comp = Composition {
+            width: *width,
+            height: *height,
+            scale: self.scale,
+            background: *background,
+            elements: std::mem::take(&mut self.elements),
+        };
+        let img_idx = comp.append_slice(image, slice_scale, shapes);
+        *width = comp.width;
+        *height = comp.height;
+        self.elements = comp.elements;
+        *backdrop.borrow_mut() = None;
+        self.history.push(prev);
+        self.end_change();
+        self.tool = None;
+        self.selected = Some(img_idx);
         self.touch_shapes();
-        self
+        Some(img_idx)
     }
 
-    /// The annotations relative to the selection's top-left corner, with any
-    /// text being typed committed: for carrying them onto an image of the
-    /// selection, like a scrolling screenshot (which starts with it).
+    /// Annotations inside the selection, translated relative to the selection's
+    /// top-left corner, with any active text committed.
     pub fn shapes_in_selection(&mut self) -> Vec<Shape> {
         self.finish_text();
-        let Some(sel) = self.selection else { return Vec::new() };
+        let Some(sel) = self.selection() else { return Vec::new() };
         let to_origin = Point::new(-sel.x, -sel.y);
-        self.shapes.iter().map(|s| s.translated(to_origin)).collect()
+        self.elements
+            .iter()
+            .filter_map(Element::as_shape)
+            .map(|s| s.translated(to_origin))
+            .collect()
+    }
+
+    /// Extracts `(raw_cropped_image, scale, unflattened_shapes)` from a capture
+    /// selection so annotations stay editable when sent to the Editor or `.bs`.
+    pub fn extract_slice(&mut self) -> Option<(Pixmap, f32, Vec<Shape>)> {
+        self.finish_text();
+        match &self.workspace {
+            Workspace::Capture { doc, selection, .. } => {
+                let sel = (*selection)?.round().intersect(&doc.bounds())?;
+                let raw = crop(doc.image(), sel.x as u32, sel.y as u32, sel.w as u32, sel.h as u32)?;
+                let to_origin = Point::new(-sel.x, -sel.y);
+                let shapes = self
+                    .elements
+                    .iter()
+                    .filter_map(Element::as_shape)
+                    .map(|s| s.translated(to_origin))
+                    .collect();
+                Some((raw, self.scale, shapes))
+            }
+            Workspace::Canvas { .. } => {
+                let rendered = self.export()?;
+                Some((rendered, self.scale, Vec::new()))
+            }
+        }
+    }
+
+    /// Builds a lossless editable [`Composition`] from either Capture mode (raw
+    /// cropped selection + unflattened annotations) or Canvas mode (full scene).
+    pub fn to_composition(&mut self) -> Option<Composition> {
+        self.finish_text();
+        match &self.workspace {
+            Workspace::Capture { .. } => {
+                let (raw, scale, shapes) = self.extract_slice()?;
+                Some(Composition::from_slice(raw, scale, shapes))
+            }
+            Workspace::Canvas { width, height, background, .. } => Some(Composition {
+                width: *width,
+                height: *height,
+                scale: self.scale,
+                background: *background,
+                elements: self.elements.clone(),
+            }),
+        }
     }
 
     pub fn selection_mode(&self) -> SelectionMode {
-        self.mode
+        match self.workspace {
+            Workspace::Capture { .. } => SelectionMode::Pick,
+            Workspace::Canvas { .. } => SelectionMode::Canvas,
+        }
     }
 
-    /// Screenshot pixels per on-screen logical pixel, when the frontend shows the
-    /// image zoomed. Keeps handles and thresholds the same size on screen.
     pub fn set_ui_scale(&mut self, ui_scale: f32) {
-        self.ui_scale = ui_scale;
+        self.ui_scale = ui_scale.max(0.01);
     }
 
     fn metrics(&self) -> Metrics<'_> {
         Metrics { scale: self.scale, fonts: &self.fonts }
     }
 
+    fn canvas_dims(&self) -> (u32, u32) {
+        match &self.workspace {
+            Workspace::Capture { doc, .. } => (doc.width(), doc.height()),
+            Workspace::Canvas { width, height, .. } => (*width, *height),
+        }
+    }
+
+    fn invalidate_backdrop(&mut self) {
+        if let Workspace::Canvas { backdrop, .. } = &mut self.workspace {
+            *backdrop.borrow_mut() = None;
+        }
+    }
+
+    fn has_image_effect_redactions(&self) -> bool {
+        self.elements.iter().any(|el| {
+            matches!(
+                el,
+                Element::Shape(Shape {
+                    geometry: Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. },
+                    ..
+                })
+            )
+        })
+    }
+
     fn touch(&mut self) {
         self.revision += 1;
     }
 
-    /// Any shape, or which shape is active, may have changed.
     fn touch_shapes(&mut self) {
         self.touch();
         self.static_revision += 1;
         self.active_revision += 1;
     }
 
-    /// Only the active shape changed: the hot path while dragging or typing.
     fn touch_active(&mut self) {
         self.touch();
         self.active_revision += 1;
     }
 
-    /// The shape being dragged, created or typed into right now.
     fn active_index(&self) -> Option<usize> {
         match &self.drag {
-            Some(Drag::Create { idx, .. } | Drag::ShapeMove { idx, .. } | Drag::ShapeHandle { idx, .. }) => Some(*idx),
+            Some(Drag::Create { idx, .. } | Drag::ElementMove { idx, .. } | Drag::ElementHandle { idx, .. }) => {
+                self.elements.get(*idx).and_then(|e| e.as_shape().map(|_| *idx))
+            }
             _ => self.text.as_ref().map(|t| t.idx),
         }
     }
 
     // ----- queries --------------------------------------------------------
 
-    pub fn document(&self) -> &Document {
-        &self.doc
+    /// Capture mode's frozen screenshot, if in Capture mode.
+    pub fn capture_document(&self) -> Option<&Document> {
+        match &self.workspace {
+            Workspace::Capture { doc, .. } => Some(doc),
+            Workspace::Canvas { .. } => None,
+        }
+    }
+
+    pub fn background_color(&self) -> Option<Color> {
+        match &self.workspace {
+            Workspace::Capture { .. } => None,
+            Workspace::Canvas { background, .. } => Some(*background),
+        }
     }
 
     pub fn screen(&self) -> Rect {
-        self.doc.bounds()
+        let (w, h) = self.canvas_dims();
+        Rect::new(0.0, 0.0, w as f32, h as f32)
+    }
+
+    /// Live canvas bounds (reflecting an in-progress edge drag before release).
+    pub fn active_canvas_rect(&self) -> Rect {
+        if let Some(Drag::CanvasResize { current, .. }) = &self.drag {
+            return *current;
+        }
+        self.screen()
+    }
+
+    pub fn is_resizing_canvas(&self) -> bool {
+        matches!(self.drag, Some(Drag::CanvasResize { .. }))
+    }
+
+    /// Outer resize handle positions of the canvas in `SelectionMode::Canvas`.
+    pub fn canvas_handles(&self) -> Vec<Point> {
+        if self.selection_mode() != SelectionMode::Canvas {
+            return Vec::new();
+        }
+        let r = self.active_canvas_rect().inflate(CANVAS_HANDLE_OFFSET * self.ui_scale);
+        Handle::ALL.into_iter().map(|h| r.handle_point(h)).collect()
+    }
+
+    /// Returns and clears any coordinate shift applied when a Left/Top canvas
+    /// resize was normalized back to `(0, 0)` on release.
+    pub fn take_canvas_origin_shift(&mut self) -> Point {
+        std::mem::take(&mut self.pending_origin_shift)
     }
 
     pub fn scale(&self) -> f32 {
         self.scale
     }
 
-    /// Changes whenever anything visible changes; frontends cache on it.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
     pub fn is_picking(&self) -> bool {
-        self.selection.is_none()
+        matches!(&self.workspace, Workspace::Capture { selection: None, .. })
     }
 
-    /// The highlighted region: hovered window, in-progress drag, or the selection.
     pub fn active_rect(&self) -> Option<Rect> {
-        match (&self.drag, self.selection) {
-            (Some(Drag::Pick { start, moved: true }), _) => Some(Rect::from_points(*start, self.pointer)),
-            (_, Some(sel)) => Some(sel),
-            _ => self.hover,
+        match &self.workspace {
+            Workspace::Capture { selection, hover, .. } => match (&self.drag, *selection) {
+                (Some(Drag::Pick { start, moved: true }), _) => Some(Rect::from_points(*start, self.pointer)),
+                (_, Some(sel)) => Some(sel),
+                _ => *hover,
+            },
+            Workspace::Canvas { .. } => Some(self.active_canvas_rect()),
         }
     }
 
     pub fn selection(&self) -> Option<Rect> {
-        self.selection
+        match &self.workspace {
+            Workspace::Capture { selection, .. } => *selection,
+            Workspace::Canvas { .. } => Some(self.active_canvas_rect()),
+        }
     }
 
-    /// The toolbar is hidden while the selection itself is being dragged.
     pub fn toolbar_visible(&self) -> bool {
-        self.selection.is_some()
+        self.selection().is_some()
             && !matches!(self.drag, Some(Drag::Pick { .. } | Drag::SelResize { .. } | Drag::SelMove { .. }))
     }
 
@@ -266,18 +479,56 @@ impl Editor {
         self.tool
     }
 
-    /// Tool and style the style bar should show: the selected shape's, else the active tool's.
+    pub fn elements(&self) -> &[Element] {
+        &self.elements
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    pub fn selected_is_image(&self) -> bool {
+        self.selected.and_then(|i| self.elements.get(i)).is_some_and(|e| matches!(e, Element::Image(_)))
+    }
+
+    /// `(can_send_backward, can_bring_forward)` for the currently selected element.
+    pub fn can_reorder_selected(&self) -> Option<(bool, bool)> {
+        let idx = self.selected?;
+        if idx >= self.elements.len() || self.text.is_some() {
+            return None;
+        }
+        let n = self.elements.len();
+        Some((idx > 0, idx + 1 < n))
+    }
+
+    /// Moves the selected element in Z-order (`Backward`, `Forward`, `ToBack`, `ToFront`).
+    pub fn reorder_selected(&mut self, order: LayerOrder) -> bool {
+        if self.text.is_some() || self.drag.is_some() {
+            return false;
+        }
+        let Some(idx) = self.selected else { return false };
+        self.begin_change();
+        let Some(new_idx) = reorder_element(&mut self.elements, idx, order) else {
+            self.end_change();
+            return false;
+        };
+        self.selected = Some(new_idx);
+        renumber_counters_in(&mut self.elements);
+        self.invalidate_backdrop();
+        self.end_change();
+        self.touch_shapes();
+        true
+    }
+
     pub fn current_style(&self) -> Option<(Tool, Style)> {
-        if let Some(shape) = self.selected.and_then(|i| self.shapes.get(i)) {
+        if let Some(shape) = self.selected.and_then(|i| self.elements.get(i)).and_then(Element::as_shape) {
             return Some((shape.tool(), shape.style));
         }
         self.tool.map(|t| (t, self.styles[t.index()]))
     }
 
-    /// The redaction settings the style bar should show: the selected
-    /// redaction's, else the redact tool's when it is active.
     pub fn current_redaction(&self) -> Option<Redaction> {
-        if let Some(shape) = self.selected.and_then(|i| self.shapes.get(i)) {
+        if let Some(shape) = self.selected.and_then(|i| self.elements.get(i)).and_then(Element::as_shape) {
             return match &shape.geometry {
                 Geometry::Redact { area, effect, strength } => Some(Redaction {
                     effect: *effect,
@@ -293,10 +544,6 @@ impl Editor {
         (self.tool == Some(Tool::Redact)).then_some(self.redaction)
     }
 
-    /// Changes the redact settings, and the selected redaction's effect and
-    /// strength. A shape's area kind can't change, so switching the area
-    /// instead leaves the selection to draw new redactions with it. Inside a
-    /// continuous edit, all changes share one undo step.
     pub fn set_redaction(&mut self, f: impl Fn(&mut Redaction)) {
         let area = self.redaction.area;
         f(&mut self.redaction);
@@ -307,7 +554,11 @@ impl Editor {
             return self.touch();
         }
         let Some(idx) = self.selected else { return self.touch() };
-        let Geometry::Redact { effect, strength, .. } = &self.shapes[idx].geometry else { return self.touch() };
+        let Some(Shape { geometry: Geometry::Redact { effect, strength, .. }, .. }) =
+            self.elements.get(idx).and_then(Element::as_shape)
+        else {
+            return self.touch();
+        };
         let mut changed = Redaction { effect: *effect, area: self.redaction.area, strength: *strength };
         f(&mut changed);
         let record = match self.continuous {
@@ -321,7 +572,9 @@ impl Editor {
         if record {
             self.begin_change();
         }
-        if let Geometry::Redact { effect, strength, .. } = &mut self.shapes[idx].geometry {
+        if let Some(Shape { geometry: Geometry::Redact { effect, strength, .. }, .. }) =
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
+        {
             (*effect, *strength) = (changed.effect, changed.strength);
         }
         if self.continuous.is_none() {
@@ -330,20 +583,19 @@ impl Editor {
         self.touch_shapes();
     }
 
-    /// The counters' numbering for the style bar: when the counter tool is active
-    /// or a counter is selected.
     pub fn current_counter_format(&self) -> Option<CounterFormat> {
-        let showing = match self.selected.and_then(|i| self.shapes.get(i)) {
-            Some(shape) => shape.tool() == Tool::Counter,
+        let showing = match self.selected.and_then(|i| self.elements.get(i)) {
+            Some(Element::Shape(shape)) => shape.tool() == Tool::Counter,
+            Some(Element::Image(_)) => false,
             None => self.tool == Some(Tool::Counter),
         };
         showing.then(|| self.counter_format())
     }
 
-    /// All counters share one numbering, so they read as one sequence.
     fn counter_format(&self) -> CounterFormat {
-        self.shapes
+        self.elements
             .iter()
+            .filter_map(Element::as_shape)
             .find_map(|s| match s.geometry {
                 Geometry::Counter { format, .. } => Some(format),
                 _ => None,
@@ -351,30 +603,29 @@ impl Editor {
             .unwrap_or(self.counter_format)
     }
 
-    /// The text style the style bar should show: the selected text's, else
-    /// the text tool's when it is active.
     pub fn current_text_style(&self) -> Option<TextStyle> {
-        match self.selected.and_then(|i| self.shapes.get(i)) {
-            Some(shape) => match &shape.geometry {
+        match self.selected.and_then(|i| self.elements.get(i)) {
+            Some(Element::Shape(shape)) => match &shape.geometry {
                 Geometry::Text { style, .. } => Some(*style),
                 _ => None,
             },
+            Some(Element::Image(_)) => None,
             None => (self.tool == Some(Tool::Text)).then_some(self.text_style),
         }
     }
 
-    /// Applies to the selected text if there is one (one undo step, or part
-    /// of the edit while typing), and to new text.
     pub fn set_text_style(&mut self, new: TextStyle) {
         self.text_style = new;
         let Some(idx) = self.selected else { return self.touch() };
-        if !matches!(self.shapes[idx].geometry, Geometry::Text { .. }) {
+        if !self.elements.get(idx).and_then(Element::as_shape).is_some_and(|s| matches!(s.geometry, Geometry::Text { .. })) {
             return self.touch();
         }
         if self.text.is_none() {
             self.begin_change();
         }
-        if let Geometry::Text { style, .. } = &mut self.shapes[idx].geometry {
+        if let Some(Shape { geometry: Geometry::Text { style, .. }, .. }) =
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
+        {
             *style = new;
         }
         if self.text.is_none() {
@@ -383,39 +634,39 @@ impl Editor {
         self.touch_shapes();
     }
 
-    /// The arrow style the style bar should show: the selected arrow's, else
-    /// the arrow tool's when it is active.
     pub fn current_arrow_style(&self) -> Option<ArrowStyle> {
-        match self.selected.and_then(|i| self.shapes.get(i)) {
-            Some(shape) => match &shape.geometry {
+        match self.selected.and_then(|i| self.elements.get(i)) {
+            Some(Element::Shape(shape)) => match &shape.geometry {
                 Geometry::Arrow { style, .. } => Some(*style),
                 _ => None,
             },
+            Some(Element::Image(_)) => None,
             None => (self.tool == Some(Tool::Arrow)).then_some(self.arrow_style),
         }
     }
 
-    /// Applies to the selected arrow if there is one (one undo step), and to
-    /// new arrows.
     pub fn set_arrow_style(&mut self, new: ArrowStyle) {
         self.arrow_style = new;
-        let Some(idx) = self.selected.filter(|&i| matches!(self.shapes[i].geometry, Geometry::Arrow { .. })) else {
+        let Some(idx) = self.selected.filter(|&i| {
+            self.elements.get(i).and_then(Element::as_shape).is_some_and(|s| matches!(s.geometry, Geometry::Arrow { .. }))
+        }) else {
             return self.touch();
         };
         self.begin_change();
-        if let Geometry::Arrow { style, .. } = &mut self.shapes[idx].geometry {
+        if let Some(Shape { geometry: Geometry::Arrow { style, .. }, .. }) =
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
+        {
             *style = new;
         }
         self.end_change();
         self.touch_shapes();
     }
 
-    /// Renumbers every counter with `format`, and new ones (one undo step).
     pub fn set_counter_format(&mut self, format: CounterFormat) {
         self.counter_format = format;
         self.begin_change();
-        for shape in &mut self.shapes {
-            if let Geometry::Counter { format: f, .. } = &mut shape.geometry {
+        for el in &mut self.elements {
+            if let Element::Shape(Shape { geometry: Geometry::Counter { format: f, .. }, .. }) = el {
                 *f = format;
             }
         }
@@ -423,27 +674,12 @@ impl Editor {
         self.touch_shapes();
     }
 
-    /// Numbers counters 1, 2, 3 … in the order they were placed, so deleting
-    /// one closes the gap.
-    fn renumber_counters(&mut self) {
-        let mut n = 0;
-        for shape in &mut self.shapes {
-            if let Geometry::Counter { number, .. } = &mut shape.geometry {
-                n += 1;
-                *number = n;
-            }
-        }
-    }
-
-    /// Adds area redactions over `rects` (found automatically), with the
-    /// current redaction settings, as one undo step. Parts outside the
-    /// selection are dropped. Returns how many were added.
     pub fn add_redactions(&mut self, rects: &[Rect]) -> usize {
-        let Some(sel) = self.selection else { return 0 };
+        let Some(sel) = self.selection() else { return 0 };
         self.finish_text();
         self.begin_change();
         let style = self.styles[Tool::Redact.index()];
-        let before = self.shapes.len();
+        let before = self.elements.len();
         for r in rects.iter().filter_map(|r| r.intersect(&sel)) {
             let geometry = Geometry::Redact {
                 area: RedactShape::Rect(r),
@@ -452,16 +688,15 @@ impl Editor {
             };
             let shape = Shape { geometry, style };
             if !shape.is_degenerate() {
-                self.shapes.push(shape);
+                self.elements.push(Element::Shape(shape));
             }
         }
         self.end_change();
         self.selected = None;
         self.touch_shapes();
-        self.shapes.len() - before
+        self.elements.len() - before
     }
 
-    /// Starts a run of changes that should undo as one (a slider drag).
     pub fn begin_continuous_edit(&mut self) {
         self.continuous = Some(false);
     }
@@ -472,8 +707,6 @@ impl Editor {
         }
     }
 
-    /// Where to show a wide brush's outline, when the next press would paint
-    /// with it: the redact brush (round) and the highlighter (a chisel tip).
     pub fn brush_ring(&self) -> Option<BrushRing> {
         let painting = matches!(self.drag, None | Some(Drag::Create { .. }));
         let tool = self.tool?;
@@ -482,7 +715,7 @@ impl Editor {
             Tool::Highlighter => true,
             _ => false,
         };
-        let inside = self.selection.is_some_and(|s| s.contains(self.pointer));
+        let inside = self.selection().is_some_and(|s| s.contains(self.pointer));
         let w = self.styles[tool.index()].size.logical_px(tool) * self.scale;
         let (half_width, half_height, corner) = match tool {
             Tool::Highlighter => render::highlighter_nib(w),
@@ -497,25 +730,25 @@ impl Editor {
     }
 
     pub fn has_shapes(&self) -> bool {
-        !self.shapes.is_empty()
+        self.elements.iter().any(|e| matches!(e, Element::Shape(_)))
     }
 
-    /// Bounds and handle positions of the selected shape, for drawing its edit frame.
+    /// Bounds and handle positions of the selected element (image or shape).
     pub fn selected_frame(&self) -> Option<(Rect, Vec<Point>)> {
-        let shape = self.shapes.get(self.selected?)?;
-        if self.text.is_some() || matches!(self.drag, Some(Drag::Create { .. })) {
+        let el = self.elements.get(self.selected?)?;
+        if self.text.is_some() || matches!(self.drag, Some(Drag::Create { .. } | Drag::CanvasResize { .. })) {
             return None;
         }
-        let handles = shape.handles().into_iter().map(|(_, p)| p).collect();
-        Some((shape.bounds(self.metrics()), handles))
+        let handles = el.handles().into_iter().map(|(_, p)| p).collect();
+        Some((el.bounds(self.metrics()), handles))
     }
 
     pub fn cursor(&self) -> CursorKind {
         match &self.drag {
             Some(Drag::Pick { .. } | Drag::Create { .. }) => return CursorKind::Crosshair,
-            Some(Drag::SelResize { handle, .. }) => return handle.cursor(),
-            Some(Drag::SelMove { .. } | Drag::ShapeMove { .. }) => return CursorKind::Move,
-            Some(Drag::ShapeHandle { handle, .. }) => {
+            Some(Drag::SelResize { handle, .. } | Drag::CanvasResize { handle, .. }) => return handle.cursor(),
+            Some(Drag::SelMove { .. } | Drag::ElementMove { .. }) => return CursorKind::Move,
+            Some(Drag::ElementHandle { handle, .. }) => {
                 return match handle {
                     EditHandle::Bounds(h) => h.cursor(),
                     _ => CursorKind::Crosshair,
@@ -524,13 +757,13 @@ impl Editor {
             None => {}
         }
         let p = self.pointer;
-        let Some(sel) = self.selection else { return CursorKind::Crosshair };
+        let Some(sel) = self.selection() else { return CursorKind::Crosshair };
         if let Some(edit) = &self.text
-            && self.shapes[edit.idx].bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)
+            && self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p))
         {
             return CursorKind::Text;
         }
-        if let Some((_, h)) = self.shape_handle_at(p) {
+        if let Some((_, h)) = self.element_handle_at(p) {
             return match h {
                 EditHandle::Bounds(h) => h.cursor(),
                 _ => CursorKind::Crosshair,
@@ -539,35 +772,76 @@ impl Editor {
         if let Some(h) = self.selection_handle_at(sel, p) {
             return h.cursor();
         }
-        if self.shape_at(p).is_some() {
+        if let Some(h) = self.canvas_handle_at(p) {
+            return h.cursor();
+        }
+        if self.element_at(p, self.tool.is_none()).is_some() {
             return CursorKind::Move;
         }
         match self.tool {
             Some(Tool::Text) if sel.contains(p) => CursorKind::Text,
             Some(_) if sel.contains(p) => CursorKind::Crosshair,
-            None if sel.contains(p) && self.mode == SelectionMode::Pick => CursorKind::Move,
+            None if sel.contains(p) && self.selection_mode() == SelectionMode::Pick => CursorKind::Move,
             _ => CursorKind::Default,
         }
     }
 
-    fn shape_at(&self, p: Point) -> Option<usize> {
+    fn element_at(&self, p: Point, allow_images: bool) -> Option<usize> {
         let m = self.metrics();
-        self.shapes.iter().rposition(|s| s.hit(p, m))
+        self.elements.iter().rposition(|e| e.hit(p, m, allow_images))
     }
 
-    /// The selection's resize handle under `p`, if the selection can be resized.
     fn selection_handle_at(&self, sel: Rect, p: Point) -> Option<Handle> {
-        match self.mode {
+        match self.selection_mode() {
             SelectionMode::Pick => sel.handle_at(p, HANDLE_HIT_RADIUS * self.ui_scale),
-            SelectionMode::Fixed => None,
+            SelectionMode::Canvas => None,
         }
     }
 
-    fn shape_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
+    /// Hit-tests the 8 outer canvas resize handles and the canvas edge perimeter
+    /// in `SelectionMode::Canvas`.
+    fn canvas_handle_at(&self, p: Point) -> Option<Handle> {
+        if self.selection_mode() != SelectionMode::Canvas {
+            return None;
+        }
+        let c = self.active_canvas_rect();
+        let outer_ring = c.inflate(CANVAS_HANDLE_OFFSET * self.ui_scale);
+        if let Some(h) = outer_ring.handle_at(p, HANDLE_HIT_RADIUS * self.ui_scale) {
+            return Some(h);
+        }
+        let outer = c.inflate(CANVAS_EDGE_OUTER * self.ui_scale);
+        let inner_inset = if self.tool.is_some() { 0.0 } else { CANVAS_EDGE_INNER * self.ui_scale };
+        let inside_inner = c.w > 2.0 * inner_inset && c.h > 2.0 * inner_inset && c.inflate(-inner_inset).contains(p);
+        if !outer.contains(p) || inside_inner {
+            return None;
+        }
+        let corner_zone = 14.0 * self.ui_scale;
+        let near_l = (p.x - c.x).abs() <= corner_zone;
+        let near_r = (p.x - c.right()).abs() <= corner_zone;
+        let near_t = (p.y - c.y).abs() <= corner_zone;
+        let near_b = (p.y - c.bottom()).abs() <= corner_zone;
+        match (near_l, near_r, near_t, near_b) {
+            (true, _, true, _) => return Some(Handle::TopLeft),
+            (_, true, true, _) => return Some(Handle::TopRight),
+            (_, true, _, true) => return Some(Handle::BottomRight),
+            (true, _, _, true) => return Some(Handle::BottomLeft),
+            _ => {}
+        }
+        let candidates = [
+            (Handle::Left, (p.x - c.x).abs()),
+            (Handle::Right, (p.x - c.right()).abs()),
+            (Handle::Top, (p.y - c.y).abs()),
+            (Handle::Bottom, (p.y - c.bottom()).abs()),
+        ];
+        candidates.into_iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|(h, _)| h)
+    }
+
+    fn element_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
         let idx = self.selected?;
         let radius = HANDLE_HIT_RADIUS * self.ui_scale;
         let is_corner = |h: EditHandle| matches!(h, EditHandle::Bounds(b) if b.is_corner());
-        self.shapes[idx]
+        self.elements
+            .get(idx)?
             .handles()
             .into_iter()
             .filter(|(_, hp)| hp.distance(p) <= radius)
@@ -579,14 +853,15 @@ impl Editor {
 
     fn update_hover(&mut self) {
         let p = self.pointer;
-        self.hover = Some(self.windows.iter().find(|w| w.contains(p)).copied().unwrap_or(self.screen()));
+        if let Workspace::Capture { doc, windows, hover, .. } = &mut self.workspace {
+            let bounds = doc.bounds();
+            *hover = Some(windows.iter().find(|w| w.contains(p)).copied().unwrap_or(bounds));
+        }
     }
 
     // ----- pointer input --------------------------------------------------
 
     pub fn pointer_down(&mut self, p: Point) {
-        // A press while a drag is still open means its release was lost (let
-        // go outside the window): finish that drag first, where it was.
         if self.drag.is_some() {
             self.pointer_up(self.pointer);
         }
@@ -594,8 +869,7 @@ impl Editor {
         self.touch();
 
         if let Some(edit) = self.text.clone() {
-            let shape = &self.shapes[edit.idx];
-            if shape.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p) {
+            if self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
                 self.set_caret_from_point(p);
             } else {
                 self.finish_text();
@@ -603,15 +877,15 @@ impl Editor {
             return;
         }
 
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.selection() else {
             self.update_hover();
             self.drag = Some(Drag::Pick { start: p, moved: false });
             return;
         };
 
-        if let Some((idx, handle)) = self.shape_handle_at(p) {
+        if let Some((idx, handle)) = self.element_handle_at(p) {
             self.begin_change();
-            self.drag = Some(Drag::ShapeHandle { idx, handle, orig: self.shapes[idx].clone(), start: p });
+            self.drag = Some(Drag::ElementHandle { idx, handle, orig: self.elements[idx].clone(), start: p });
             self.touch_shapes();
             return;
         }
@@ -619,10 +893,16 @@ impl Editor {
             self.drag = Some(Drag::SelResize { handle, orig: sel, start: p });
             return;
         }
-        if let Some(idx) = self.shape_at(p) {
+        if let Some(handle) = self.canvas_handle_at(p) {
+            let orig = self.screen();
+            self.begin_change();
+            self.drag = Some(Drag::CanvasResize { handle, orig, current: orig, start: p });
+            return;
+        }
+        if let Some(idx) = self.element_at(p, self.tool.is_none()) {
             self.selected = Some(idx);
             self.begin_change();
-            self.drag = Some(Drag::ShapeMove { idx, orig: self.shapes[idx].clone(), start: p, moved: false });
+            self.drag = Some(Drag::ElementMove { idx, orig: self.elements[idx].clone(), start: p, moved: false });
             self.touch_shapes();
             return;
         }
@@ -632,7 +912,9 @@ impl Editor {
         }
         match self.tool {
             Some(tool) => self.start_shape(tool, p),
-            None if self.mode == SelectionMode::Pick => self.drag = Some(Drag::SelMove { orig: sel, start: p }),
+            None if self.selection_mode() == SelectionMode::Pick => {
+                self.drag = Some(Drag::SelMove { orig: sel, start: p });
+            }
             None => {}
         }
     }
@@ -647,7 +929,7 @@ impl Editor {
             Tool::Highlighter => Geometry::Highlight(vec![p]),
             Tool::Counter => Geometry::Counter {
                 center: p,
-                number: self.shapes.iter().filter(|s| s.tool() == Tool::Counter).count() as u32 + 1,
+                number: self.elements.iter().filter_map(Element::as_shape).filter(|s| s.tool() == Tool::Counter).count() as u32 + 1,
                 format: self.counter_format(),
             },
             Tool::Redact => Geometry::Redact {
@@ -659,15 +941,14 @@ impl Editor {
                 strength: self.redaction.strength,
             },
             Tool::Text => {
-                // Center the first line vertically on the click.
                 let size = style.size.logical_px(Tool::Text) * self.scale;
                 let half_line = self.fonts.get(self.text_style.family()).layout("", size).line_height / 2.0;
                 Geometry::Text { origin: Point::new(p.x, p.y - half_line), content: String::new(), style: self.text_style }
             }
         };
         self.begin_change();
-        self.shapes.push(Shape { geometry, style });
-        let idx = self.shapes.len() - 1;
+        self.elements.push(Element::Shape(Shape { geometry, style }));
+        let idx = self.elements.len() - 1;
         self.selected = Some(idx);
         if tool == Tool::Text {
             self.text = Some(TextEdit { idx, caret: 0, marked: None });
@@ -677,26 +958,27 @@ impl Editor {
         self.touch_shapes();
     }
 
-    /// `constrain` (usually Shift) keeps rectangles square and ellipses
-    /// circular, and makes arrows and brush strokes straight lines at a
-    /// multiple of 45°.
     pub fn pointer_move(&mut self, p: Point, constrain: bool) {
         let prev = self.pointer;
         self.pointer = p;
-        let Some(drag) = &mut self.drag else {
-            if self.selection.is_none() {
-                let before = self.hover;
+        self.constrain = constrain;
+        if self.drag.is_none() {
+            if self.is_picking() {
+                let before = self.active_rect();
                 self.update_hover();
-                if self.hover != before {
+                if self.active_rect() != before {
                     self.touch();
                 }
             }
             return;
-        };
-        let screen = self.doc.bounds();
+        }
+        let screen = self.screen();
         let scale = self.ui_scale;
-        let shape_drag = matches!(drag, Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. });
-        match drag {
+        let content_scale = self.scale;
+        let mut shape_drag = false;
+        let mut image_changed = false;
+
+        match self.drag.as_mut().expect("checked") {
             Drag::Pick { start, moved } => {
                 if !*moved && start.distance(p) > DRAG_THRESHOLD * scale {
                     *moved = true;
@@ -704,60 +986,80 @@ impl Editor {
             }
             Drag::SelResize { handle, orig, start } => {
                 let r = orig.resized(*handle, p - *start);
-                self.selection = Some(r.intersect(&screen).unwrap_or_else(|| Rect::new(r.x, r.y, 1.0, 1.0).clamp_within(&screen)));
+                let clamped = r.intersect(&screen).unwrap_or_else(|| Rect::new(r.x, r.y, 1.0, 1.0).clamp_within(&screen));
+                if let Workspace::Capture { selection, .. } = &mut self.workspace {
+                    *selection = Some(clamped);
+                }
             }
             Drag::SelMove { orig, start } => {
-                self.selection = Some(orig.translate(p - *start).clamp_within(&screen));
+                let moved = orig.translate(p - *start).clamp_within(&screen);
+                if let Workspace::Capture { selection, .. } = &mut self.workspace {
+                    *selection = Some(moved);
+                }
+            }
+            Drag::CanvasResize { handle, orig, current, start } => {
+                let min_side = (MIN_CANVAS_LOGICAL * content_scale).max(8.0);
+                *current = clamp_resized_rect(*orig, *handle, p - *start, min_side).round();
             }
             Drag::Create { idx, start } => {
+                shape_drag = true;
                 let start = *start;
-                let shape = &mut self.shapes[*idx];
-                match &mut shape.geometry {
-                    Geometry::Rect(r)
-                    | Geometry::Ellipse(r)
-                    | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
-                        *r = Rect::from_points(start, constrained(start, p, constrain))
-                    }
-                    Geometry::Arrow { to, .. } => *to = snapped(start, p, constrain),
-                    // Placed where the press ends, so it can be positioned precisely.
-                    Geometry::Counter { center, .. } => *center = p,
-                    // A straight line while constrained (e.g. along a line of text).
-                    Geometry::Pen(pts)
-                    | Geometry::Highlight(pts)
-                    | Geometry::Redact { area: RedactShape::Brush(pts), .. }
-                        if constrain =>
-                    {
-                        *pts = vec![start, snapped(start, p, true)]
-                    }
-                    Geometry::Pen(pts)
-                    | Geometry::Highlight(pts)
-                    | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
-                        if pts.last().is_none_or(|last| last.distance(p) >= MIN_STROKE_STEP * scale) {
-                            pts.push(p);
+                if let Some(Shape { geometry, .. }) = self.elements.get_mut(*idx).and_then(Element::as_shape_mut) {
+                    match geometry {
+                        Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
+                            *r = Rect::from_points(start, constrained(start, p, constrain))
                         }
+                        Geometry::Arrow { to, .. } => *to = snapped(start, p, constrain),
+                        Geometry::Counter { center, .. } => *center = p,
+                        Geometry::Pen(pts)
+                        | Geometry::Highlight(pts)
+                        | Geometry::Redact { area: RedactShape::Brush(pts), .. }
+                            if constrain =>
+                        {
+                            *pts = vec![start, snapped(start, p, true)]
+                        }
+                        Geometry::Pen(pts)
+                        | Geometry::Highlight(pts)
+                        | Geometry::Redact { area: RedactShape::Brush(pts), .. } => {
+                            if pts.last().is_none_or(|last| last.distance(p) >= MIN_STROKE_STEP * scale) {
+                                pts.push(p);
+                            }
+                        }
+                        Geometry::Text { .. } => {}
                     }
-                    Geometry::Text { .. } => {}
                 }
             }
-            Drag::ShapeMove { idx, orig, start, moved } => {
+            Drag::ElementMove { idx, orig, start, moved } => {
                 *moved |= start.distance(p) > DRAG_THRESHOLD * scale;
                 if *moved {
-                    self.shapes[*idx] = orig.translated(p - *start);
+                    let next = orig.translated(p - *start);
+                    image_changed = matches!(next, Element::Image(_));
+                    shape_drag = matches!(next, Element::Shape(_));
+                    self.elements[*idx] = next;
                 }
             }
-            Drag::ShapeHandle { idx, handle, orig, start } => {
-                self.shapes[*idx] = orig.with_handle_moved(*handle, p - *start);
+            Drag::ElementHandle { idx, handle, orig, start } => {
+                let next = orig.with_handle_moved(*handle, p - *start, constrain);
+                image_changed = matches!(next, Element::Image(_));
+                shape_drag = matches!(next, Element::Shape(_));
+                self.elements[*idx] = next;
             }
         }
-        if prev != p {
+        if image_changed {
+            self.invalidate_backdrop();
+            if self.has_image_effect_redactions() {
+                self.touch_shapes();
+            } else {
+                self.touch();
+            }
+        } else if prev != p {
             if shape_drag { self.touch_active() } else { self.touch() }
         }
     }
 
-    /// Shift pressed or released: the shape being drawn follows at once,
-    /// without waiting for the pointer to move.
     pub fn constrain_changed(&mut self, constrain: bool) {
-        if matches!(self.drag, Some(Drag::Create { .. })) {
+        self.constrain = constrain;
+        if matches!(self.drag, Some(Drag::Create { .. } | Drag::ElementHandle { .. })) {
             self.pointer_move(self.pointer, constrain);
             self.touch_active();
         }
@@ -766,46 +1068,81 @@ impl Editor {
     pub fn pointer_up(&mut self, p: Point) {
         self.pointer = p;
         let Some(drag) = self.drag.take() else { return };
-        if matches!(drag, Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. }) {
-            self.touch_shapes();
-        } else {
-            self.touch();
-        }
         match drag {
             Drag::Pick { start, moved } => {
-                let r = Rect::from_points(start, p).intersect(&self.screen());
+                self.touch();
+                let screen = self.screen();
+                let r = Rect::from_points(start, p).intersect(&screen);
                 let min = DRAG_THRESHOLD * self.ui_scale;
-                self.selection = match r {
-                    Some(r) if moved && r.w >= min && r.h >= min => Some(r.round()),
-                    _ => self.hover,
-                };
+                if let Workspace::Capture { selection, hover, .. } = &mut self.workspace {
+                    *selection = match r {
+                        Some(r) if moved && r.w >= min && r.h >= min => Some(r.round()),
+                        _ => *hover,
+                    };
+                }
             }
             Drag::SelResize { .. } | Drag::SelMove { .. } => {
-                self.selection = self.selection.map(|s| s.round());
+                self.touch();
+                if let Workspace::Capture { selection, .. } = &mut self.workspace {
+                    *selection = selection.map(|s| s.round());
+                }
+            }
+            Drag::CanvasResize { current, .. } => {
+                let r = current.round();
+                let new_w = (r.w.round() as u32).max(1);
+                let new_h = (r.h.round() as u32).max(1);
+                let shift = Point::new(-r.x, -r.y);
+                if let Workspace::Canvas { width, height, backdrop, .. } = &mut self.workspace {
+                    *width = new_w;
+                    *height = new_h;
+                    *backdrop.borrow_mut() = None;
+                }
+                if shift != Point::default() {
+                    for el in &mut self.elements {
+                        *el = el.translated(shift);
+                    }
+                    self.pending_origin_shift = self.pending_origin_shift + Point::new(r.x, r.y);
+                }
+                self.end_change();
+                self.touch_shapes();
             }
             Drag::Create { idx, .. } => {
-                if self.shapes[idx].is_degenerate() {
-                    self.shapes.remove(idx);
+                if self.elements[idx].is_degenerate() {
+                    self.elements.remove(idx);
                     self.selected = None;
                 }
                 self.end_change();
+                self.touch_shapes();
             }
-            Drag::ShapeMove { idx, moved, .. } => {
+            Drag::ElementMove { idx, moved, .. } => {
+                if matches!(self.elements[idx], Element::Image(_)) {
+                    self.invalidate_backdrop();
+                }
                 self.end_change();
-                if !moved && matches!(self.shapes[idx].geometry, Geometry::Text { .. }) {
+                self.touch_shapes();
+                if !moved
+                    && self.elements.get(idx).and_then(Element::as_shape).is_some_and(|s| matches!(s.geometry, Geometry::Text { .. }))
+                {
                     self.edit_text(idx, p);
                 }
             }
-            Drag::ShapeHandle { .. } => self.end_change(),
+            Drag::ElementHandle { idx, .. } => {
+                if matches!(self.elements[idx], Element::Image(_)) {
+                    self.invalidate_backdrop();
+                }
+                self.end_change();
+                self.touch_shapes();
+            }
         }
     }
 
-    /// Returns true when the double click should copy the capture (Snipaste-style).
+    /// Returns true when the double click should copy the capture (Capture mode only).
     pub fn double_click(&mut self, p: Point) -> bool {
-        self.text.is_none()
+        self.selection_mode() == SelectionMode::Pick
+            && self.text.is_none()
             && self.tool.is_none()
-            && self.selection.is_some_and(|s| s.contains(p))
-            && self.shape_at(p).is_none()
+            && self.selection().is_some_and(|s| s.contains(p))
+            && self.element_at(p, false).is_none()
     }
 
     pub fn right_click(&mut self) -> RightClick {
@@ -814,14 +1151,23 @@ impl Editor {
             self.finish_text();
             return RightClick::Handled;
         }
-        if self.drag.is_some() || !self.shapes.is_empty() || self.mode == SelectionMode::Fixed {
+        if self.selection_mode() == SelectionMode::Canvas {
+            // In the Editor, right-click exits an active drawing tool back to Select/Move.
+            if self.tool.take().is_some() {
+                self.selected = None;
+            }
             return RightClick::Handled;
         }
-        if self.selection.is_none() {
+        if self.drag.is_some() || !self.elements.is_empty() {
+            return RightClick::Handled;
+        }
+        let Workspace::Capture { selection, .. } = &mut self.workspace else {
+            return RightClick::Handled;
+        };
+        if selection.is_none() {
             return RightClick::Exit;
         }
-        // Back to picking a window.
-        self.selection = None;
+        *selection = None;
         self.tool = None;
         self.selected = None;
         self.update_hover();
@@ -830,12 +1176,25 @@ impl Editor {
 
     // ----- commands -------------------------------------------------------
 
-    /// Selecting the active tool again deselects it.
     pub fn toggle_tool(&mut self, tool: Tool) {
         self.finish_text();
         self.tool = if self.tool == Some(tool) { None } else { Some(tool) };
         self.selected = None;
         self.touch();
+    }
+
+    /// Clears the active tool or selection in Canvas mode (used by `Escape` so
+    /// switching from drawing back to moving/resizing images is instant).
+    pub fn clear_tool_or_selection(&mut self) -> bool {
+        if self.tool.take().is_some() {
+            self.touch();
+            return true;
+        }
+        if self.selected.take().is_some() {
+            self.touch();
+            return true;
+        }
+        false
     }
 
     pub fn set_color(&mut self, color: Color) {
@@ -846,15 +1205,18 @@ impl Editor {
         self.update_style(|s| s.size = size);
     }
 
-    /// Applies to the selected shape if there is one, and to the tool's future shapes.
     fn update_style(&mut self, f: impl Fn(&mut Style)) {
         let Some((tool, _)) = self.current_style() else { return };
         f(&mut self.styles[tool.index()]);
-        if let Some(idx) = self.selected {
+        if let Some(idx) = self.selected
+            && self.elements.get(idx).is_some_and(|e| matches!(e, Element::Shape(_)))
+        {
             if self.text.is_none() {
                 self.begin_change();
             }
-            f(&mut self.shapes[idx].style);
+            if let Some(shape) = self.elements.get_mut(idx).and_then(Element::as_shape_mut) {
+                f(&mut shape.style);
+            }
             if self.text.is_none() {
                 self.end_change();
             }
@@ -866,34 +1228,49 @@ impl Editor {
         self.finish_text();
         self.drag = None;
         let Some(prev) = self.history.pop() else { return false };
-        self.shapes = prev;
+        if let Workspace::Canvas { width, height, backdrop, .. } = &mut self.workspace {
+            let old_dims = (*width, *height);
+            (*width, *height) = prev.canvas;
+            if old_dims != prev.canvas {
+                *backdrop.borrow_mut() = None;
+            }
+        }
+        self.elements = prev.elements;
+        self.invalidate_backdrop();
         self.selected = None;
         self.touch_shapes();
         true
     }
 
-    /// Deletes the selected shape. Not while typing into it, nor while the
-    /// mouse is still drawing or dragging a shape (the drag refers to it).
     pub fn delete_selected(&mut self) -> bool {
-        let shape_drag = matches!(self.drag, Some(Drag::Create { .. } | Drag::ShapeMove { .. } | Drag::ShapeHandle { .. }));
-        if self.text.is_some() || shape_drag {
+        let active_drag = matches!(
+            self.drag,
+            Some(Drag::Create { .. } | Drag::ElementMove { .. } | Drag::ElementHandle { .. } | Drag::CanvasResize { .. })
+        );
+        if self.text.is_some() || active_drag {
             return false;
         }
         let Some(idx) = self.selected.take() else { return false };
         self.begin_change();
-        self.shapes.remove(idx);
-        self.renumber_counters();
+        let removed = self.elements.remove(idx);
+        if matches!(removed, Element::Image(_)) {
+            self.invalidate_backdrop();
+        }
+        renumber_counters_in(&mut self.elements);
         self.touch_shapes();
         true
     }
 
-    fn begin_change(&mut self) {
-        self.history.push(self.shapes.clone());
+    fn current_snapshot(&self) -> Snapshot {
+        Snapshot { canvas: self.canvas_dims(), elements: self.elements.clone() }
     }
 
-    /// Drops the snapshot from `begin_change` if nothing actually changed.
+    fn begin_change(&mut self) {
+        self.history.push(self.current_snapshot());
+    }
+
     fn end_change(&mut self) {
-        if self.history.last() == Some(&self.shapes) {
+        if self.history.last().is_some_and(|last| last.canvas == self.canvas_dims() && last.elements == self.elements) {
             self.history.pop();
         }
     }
@@ -913,7 +1290,7 @@ impl Editor {
 
     fn set_caret_from_point(&mut self, p: Point) {
         let Some(edit) = &self.text else { return };
-        let shape = &self.shapes[edit.idx];
+        let Some(shape) = self.elements.get(edit.idx).and_then(Element::as_shape) else { return };
         let Some((origin, layout)) = self.text_layout(shape) else { return };
         let caret = layout.index_at(p - origin);
         if let Some(edit) = &mut self.text {
@@ -923,11 +1300,10 @@ impl Editor {
         self.touch_active();
     }
 
-    /// Commits the text being edited; empty text boxes are removed.
     pub fn finish_text(&mut self) {
         let Some(edit) = self.text.take() else { return };
-        if self.shapes[edit.idx].is_degenerate() {
-            self.shapes.remove(edit.idx);
+        if self.elements.get(edit.idx).is_some_and(Element::is_degenerate) {
+            self.elements.remove(edit.idx);
             self.selected = None;
         }
         self.end_change();
@@ -936,7 +1312,7 @@ impl Editor {
 
     pub fn text_content(&self) -> Option<&str> {
         let edit = self.text.as_ref()?;
-        match &self.shapes[edit.idx].geometry {
+        match &self.elements.get(edit.idx)?.as_shape()?.geometry {
             Geometry::Text { content, .. } => Some(content),
             _ => None,
         }
@@ -957,12 +1333,13 @@ impl Editor {
         }
     }
 
-    /// Replaces `range` (byte offsets; defaults to the marked text, else the caret) with
-    /// `new_text`. With `mark`, the inserted text becomes IME composition text and
-    /// `caret_in_new` positions the caret inside it.
     pub fn text_replace(&mut self, range: Option<Range<usize>>, new_text: &str, mark: bool, caret_in_new: Option<usize>) {
         let Some(edit) = self.text.clone() else { return };
-        let Geometry::Text { content, .. } = &mut self.shapes[edit.idx].geometry else { return };
+        let Some(Shape { geometry: Geometry::Text { content, .. }, .. }) =
+            self.elements.get_mut(edit.idx).and_then(Element::as_shape_mut)
+        else {
+            return;
+        };
         let range = range.or(edit.marked.clone()).unwrap_or(edit.caret..edit.caret);
         if range.start > range.end || !content.is_char_boundary(range.start) || !content.is_char_boundary(range.end) {
             return;
@@ -1004,23 +1381,20 @@ impl Editor {
         }
     }
 
-    /// A text shape's origin and layout, in its style's font family.
     fn text_layout(&self, shape: &Shape) -> Option<(Point, TextLayout)> {
         let Geometry::Text { origin, content, style } = &shape.geometry else { return None };
         Some((*origin, self.fonts.get(style.family()).layout(content, shape.size_px(self.scale))))
     }
 
-    /// The color of the edited text's glyphs (for its caret).
     pub fn text_ink(&self) -> Option<Color> {
-        let shape = &self.shapes[self.text.as_ref()?.idx];
+        let shape = self.elements.get(self.text.as_ref()?.idx)?.as_shape()?;
         let Geometry::Text { style, .. } = &shape.geometry else { return None };
         Some(style.ink(shape.style.color))
     }
 
-    /// Screen-space caret rectangle at byte offset `index` of the edited text.
     pub fn text_caret_rect_at(&self, index: usize) -> Option<Rect> {
         let edit = self.text.as_ref()?;
-        let shape = &self.shapes[edit.idx];
+        let shape = self.elements.get(edit.idx)?.as_shape()?;
         let (origin, layout) = self.text_layout(shape)?;
         Some(layout.caret_rect(index).translate(origin))
     }
@@ -1029,71 +1403,143 @@ impl Editor {
         self.text_caret_rect_at(self.text.as_ref()?.caret)
     }
 
-    /// Byte offset in the edited text closest to screen point `p`.
     pub fn text_index_at(&self, p: Point) -> Option<usize> {
         let edit = self.text.as_ref()?;
-        let shape = &self.shapes[edit.idx];
+        let shape = self.elements.get(edit.idx)?.as_shape()?;
         let (origin, layout) = self.text_layout(shape)?;
         Some(layout.index_at(p - origin))
     }
 
-    /// Box drawn around the text being edited.
     pub fn text_frame(&self) -> Option<Rect> {
         let edit = self.text.as_ref()?;
-        Some(self.shapes[edit.idx].bounds(self.metrics()).inflate(3.0 * self.scale))
+        Some(self.elements.get(edit.idx)?.bounds(self.metrics()).inflate(3.0 * self.scale))
     }
 
     // ----- output ---------------------------------------------------------
 
-    /// Changes whenever [`Self::render_static_layer`] would draw something different.
     pub fn static_layer_revision(&self) -> u64 {
         self.static_revision
     }
 
-    /// Changes whenever [`Self::render_active_layer`] would draw something different.
     pub fn active_layer_revision(&self) -> u64 {
         self.active_revision
     }
 
-    /// Every annotation except the active one, over the area they cover. This is
-    /// independent of the selection (the frontend clips to it), so it only needs
-    /// re-rendering when a shape is committed, deleted, restyled or undone.
-    ///
-    /// Only the part inside `clip` is rendered (pass [`Self::screen`] for all of
-    /// it); tall documents pass the visible area to keep textures small.
+    /// Z-ordered GPU rendering bands: placed images are drawn directly by GPUI,
+    /// while contiguous runs of shapes are rasterized into cached GPU layers.
+    pub fn visual_bands(&self) -> Vec<VisualBand> {
+        let active = self.active_index();
+        let mut bands = Vec::new();
+        let mut shape_run: Option<Range<usize>> = None;
+        let flush_run = |run: &mut Option<Range<usize>>, bands: &mut Vec<VisualBand>| {
+            if let Some(range) = run.take() {
+                bands.push(VisualBand::Shapes { range, revision: self.static_revision, active: false });
+            }
+        };
+        for (i, el) in self.elements.iter().enumerate() {
+            match el {
+                Element::Image(placed) => {
+                    flush_run(&mut shape_run, &mut bands);
+                    bands.push(VisualBand::Image(placed.clone()));
+                }
+                Element::Shape(_) if Some(i) == active => {
+                    flush_run(&mut shape_run, &mut bands);
+                    bands.push(VisualBand::Shapes { range: i..i + 1, revision: self.active_revision, active: true });
+                }
+                Element::Shape(_) => match &mut shape_run {
+                    Some(r) => r.end = i + 1,
+                    None => shape_run = Some(i..i + 1),
+                },
+            }
+        }
+        flush_run(&mut shape_run, &mut bands);
+        bands
+    }
+
+    pub fn render_band(&self, range: Range<usize>, active: bool, clip: Rect) -> Option<(Rect, Pixmap)> {
+        let shapes: Vec<&Shape> = self.elements.get(range)?.iter().filter_map(Element::as_shape).collect();
+        if shapes.is_empty() {
+            return None;
+        }
+        let underline = if active {
+            self.text.as_ref().and_then(|e| Some((0, e.marked.clone()?)))
+        } else {
+            None
+        };
+        self.render_shapes(&shapes, underline, clip)
+    }
+
     pub fn render_static_layer(&self, clip: Rect) -> Option<(Rect, Pixmap)> {
         let active = self.active_index();
-        let shapes: Vec<&Shape> =
-            self.shapes.iter().enumerate().filter(|(i, _)| Some(*i) != active).map(|(_, s)| s).collect();
+        let shapes: Vec<&Shape> = self
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != active)
+            .filter_map(|(_, el)| el.as_shape())
+            .collect();
         self.render_shapes(&shapes, None, clip)
     }
 
-    /// The shape being drawn, dragged or typed into, over just its own bounds, so
-    /// each mouse move or keystroke re-rasterizes only that shape. While active it
-    /// is drawn above the others; it drops back to its place when released.
-    /// Clipped to `clip` like [`Self::render_static_layer`].
     pub fn render_active_layer(&self, clip: Rect) -> Option<(Rect, Pixmap)> {
         let idx = self.active_index()?;
+        let shape = self.elements.get(idx)?.as_shape()?;
         let underline = self.text.as_ref().and_then(|e| Some((0, e.marked.clone()?)));
-        self.render_shapes(&[&self.shapes[idx]], underline, clip)
+        self.render_shapes(&[shape], underline, clip)
     }
 
     fn render_shapes(&self, shapes: &[&Shape], underline: Option<render::Underline>, clip: Rect) -> Option<(Rect, Pixmap)> {
+        if shapes.is_empty() {
+            return None;
+        }
         let m = self.metrics();
         let bounds = shapes.iter().map(|s| s.bounds(m)).reduce(|a, b| a.union(&b))?;
-        let region = bounds.inflate(1.0).round_out().intersect(&self.screen())?.intersect(&clip.round_out())?;
-        let pixmap = render::render_layer(&self.doc, region, shapes, m, underline)?;
-        Some((region, pixmap))
+        let canvas = self.active_canvas_rect();
+        let region = bounds.inflate(1.0).round_out().intersect(&canvas)?.intersect(&clip.round_out())?;
+
+        match &self.workspace {
+            Workspace::Capture { doc, .. } => {
+                let pixmap = render::render_layer(doc, region, shapes, m, underline)?;
+                Some((region, pixmap))
+            }
+            Workspace::Canvas { width, height, background, backdrop } => {
+                let needs_backdrop = shapes.iter().any(|s| {
+                    matches!(s.geometry, Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. })
+                });
+                if needs_backdrop {
+                    let mut guard = backdrop.borrow_mut();
+                    if guard.is_none() {
+                        *guard = render::render_canvas_backdrop(*width, *height, *background, &self.elements);
+                    }
+                    let doc = guard.as_ref()?;
+                    let pixmap = render::render_layer(doc, region, shapes, m, underline)?;
+                    Some((region, pixmap))
+                } else {
+                    let dummy = Document::from_pixmap(Pixmap::new(1, 1)?);
+                    let pixmap = render::render_layer(&dummy, region, shapes, m, underline)?;
+                    Some((region, pixmap))
+                }
+            }
+        }
     }
 
-    /// The selected region with all annotations, as the user sees it.
+    /// Exports the final composited image (cropped to `selection` in Capture mode,
+    /// or the full canvas in Canvas mode).
     pub fn export(&mut self) -> Option<Pixmap> {
         self.finish_text();
-        render::export(&self.doc, self.selection?, &self.shapes, self.metrics())
+        match &self.workspace {
+            Workspace::Capture { doc, selection, .. } => {
+                let shapes: Vec<Shape> = self.elements.iter().filter_map(Element::as_shape).cloned().collect();
+                render::export(doc, (*selection)?, &shapes, self.metrics())
+            }
+            Workspace::Canvas { .. } => {
+                let comp = self.to_composition()?;
+                render::render_composition(&comp, &self.fonts)
+            }
+        }
     }
 }
 
-/// Snaps `p` so the box from `start` is square.
 fn constrained(start: Point, p: Point, constrain: bool) -> Point {
     if !constrain {
         return p;
@@ -1103,8 +1549,6 @@ fn constrained(start: Point, p: Point, constrain: bool) -> Point {
     Point::new(start.x + side.copysign(d.x), start.y + side.copysign(d.y))
 }
 
-/// Snaps `p` so the line from `start` points in one of the eight directions
-/// (a multiple of 45°), at the point of that line nearest `p`.
 fn snapped(start: Point, p: Point, constrain: bool) -> Point {
     let d = p - start;
     if !constrain || d.length() == 0.0 {
@@ -1126,6 +1570,10 @@ mod tests {
         let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4]).unwrap();
         let windows = vec![Rect::new(50.0, 50.0, 100.0, 100.0), Rect::new(0.0, 0.0, 300.0, 200.0)];
         Editor::new(doc, Arc::new(Fonts::empty()), windows, 1.0)
+    }
+
+    fn shapes_of(e: &Editor) -> Vec<Shape> {
+        e.elements.iter().filter_map(Element::as_shape).cloned().collect()
     }
 
     fn click(e: &mut Editor, x: f32, y: f32) {
@@ -1176,19 +1624,17 @@ mod tests {
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.toggle_tool(Tool::Rect);
         drag(&mut e, (50.0, 50.0), (150.0, 120.0));
-        assert_eq!(e.shapes.len(), 1);
-        // Grab the outline (away from the handles) and move it.
+        assert_eq!(shapes_of(&e).len(), 1);
         drag(&mut e, (50.0, 70.0), (60.0, 80.0));
-        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 100.0, 70.0)));
-        // Resize via the bottom-right handle of the selected shape.
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 100.0, 70.0)));
         drag(&mut e, (160.0, 130.0), (170.0, 140.0));
-        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 110.0, 80.0)));
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Rect(Rect::new(60.0, 60.0, 110.0, 80.0)));
         assert!(e.delete_selected());
-        assert!(e.shapes.is_empty());
+        assert!(shapes_of(&e).is_empty());
         assert!(e.undo());
         assert!(e.undo());
         assert!(e.undo());
-        assert_eq!(e.shapes[0].geometry, Geometry::Rect(Rect::new(50.0, 50.0, 100.0, 70.0)));
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Rect(Rect::new(50.0, 50.0, 100.0, 70.0)));
     }
 
     #[test]
@@ -1197,7 +1643,7 @@ mod tests {
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.toggle_tool(Tool::Arrow);
         click(&mut e, 100.0, 100.0);
-        assert!(e.shapes.is_empty());
+        assert!(shapes_of(&e).is_empty());
         assert!(!e.can_undo());
     }
 
@@ -1217,12 +1663,11 @@ mod tests {
         e.text_key(TextKey::Left);
         e.text_key(TextKey::Newline);
         assert_eq!(e.text_content(), Some("h\ni"));
-        // Clicking elsewhere commits.
         click(&mut e, 300.0, 250.0);
         assert!(!e.is_editing_text());
-        assert_eq!(e.shapes.len(), 1);
+        assert_eq!(shapes_of(&e).len(), 1);
         assert!(e.undo());
-        assert!(e.shapes.is_empty());
+        assert!(shapes_of(&e).is_empty());
     }
 
     #[test]
@@ -1232,7 +1677,7 @@ mod tests {
         e.toggle_tool(Tool::Text);
         click(&mut e, 100.0, 100.0);
         e.finish_text();
-        assert!(e.shapes.is_empty());
+        assert!(shapes_of(&e).is_empty());
         assert!(!e.can_undo());
     }
 
@@ -1243,9 +1688,9 @@ mod tests {
         e.toggle_tool(Tool::Ellipse);
         drag(&mut e, (50.0, 50.0), (150.0, 120.0));
         e.set_color(crate::style::PALETTE[2]);
-        assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[2]);
+        assert_eq!(shapes_of(&e)[0].style.color, crate::style::PALETTE[2]);
         assert!(e.undo());
-        assert_eq!(e.shapes[0].style.color, crate::style::PALETTE[0]);
+        assert_eq!(shapes_of(&e)[0].style.color, crate::style::PALETTE[0]);
     }
 
     #[test]
@@ -1261,7 +1706,6 @@ mod tests {
         e.pointer_move(Point::new(240.0, 230.0), false);
         assert_eq!(e.static_layer_revision(), static_rev);
         assert!(e.active_layer_revision() > active_rev);
-        // The active layer covers only the stroke; the rectangle stays in the static one.
         let (active, _) = e.render_active_layer(e.screen()).unwrap();
         assert!(active.x > 150.0 && active.w < 100.0);
         let (fixed, _) = e.render_static_layer(e.screen()).unwrap();
@@ -1290,18 +1734,55 @@ mod tests {
     }
 
     #[test]
-    fn document_selection_is_the_image_and_never_changes() {
+    fn canvas_editor_moves_resizes_images_and_resizes_canvas_with_undo() {
         let mut e = document_editor();
-        let image = Rect::new(0.0, 0.0, 400.0, 3000.0);
-        assert_eq!(e.selection(), Some(image));
+        assert_eq!(e.screen(), Rect::new(0.0, 0.0, 400.0, 3000.0));
         assert!(e.toolbar_visible());
-        // Dragging the body or an edge without a tool changes nothing.
-        drag(&mut e, (200.0, 200.0), (260.0, 300.0));
-        drag(&mut e, (400.0, 1500.0), (300.0, 1500.0));
-        assert_eq!(e.selection(), Some(image));
-        assert_eq!(e.cursor(), CursorKind::Default);
-        assert_eq!(e.right_click(), RightClick::Handled);
-        assert_eq!(e.selection(), Some(image));
+
+        // Dragging the interior moves the placed image.
+        drag(&mut e, (200.0, 200.0), (250.0, 260.0));
+        assert_eq!(e.elements()[0].as_image().unwrap().bounds, Rect::new(50.0, 60.0, 400.0, 3000.0));
+        assert!(e.undo());
+        assert_eq!(e.elements()[0].as_image().unwrap().bounds, Rect::new(0.0, 0.0, 400.0, 3000.0));
+
+        // Dragging the left outer canvas edge (-6, 1500) outward by -100 expands the
+        // canvas to 500 wide and shifts the image to x = +100 so it stays anchored.
+        drag(&mut e, (-6.0, 1500.0), (-106.0, 1500.0));
+        assert_eq!(e.screen(), Rect::new(0.0, 0.0, 500.0, 3000.0));
+        assert_eq!(e.elements()[0].as_image().unwrap().bounds.x, 100.0);
+        assert_eq!(e.take_canvas_origin_shift(), Point::new(-100.0, 0.0));
+
+        // Undo restores both canvas size and image position.
+        assert!(e.undo());
+        assert_eq!(e.screen(), Rect::new(0.0, 0.0, 400.0, 3000.0));
+        assert_eq!(e.elements()[0].as_image().unwrap().bounds.x, 0.0);
+    }
+
+    #[test]
+    fn canvas_editor_appends_slices_rearranges_and_exports_unflattened() {
+        let mut e = editor();
+        drag(&mut e, (50.0, 40.0), (250.0, 190.0));
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (70.0, 60.0), (130.0, 110.0));
+
+        // Capture -> Composition keeps the raw cropped image AND the rectangle separately.
+        let comp = e.to_composition().unwrap();
+        assert_eq!((comp.width, comp.height), (200, 150));
+        assert_eq!(comp.elements.len(), 2);
+
+        let mut ce = Editor::from_composition(comp, Arc::new(Fonts::empty()));
+        let second = Pixmap::new(120, 80).unwrap();
+        let idx = ce.append_slice(second, 1.0, Vec::new()).unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(ce.selected_index(), Some(2));
+        assert!(ce.reorder_selected(LayerOrder::ToBack));
+        assert_eq!(ce.selected_index(), Some(0));
+
+        let out = ce.export().unwrap();
+        assert_eq!((out.width(), out.height()), (200, 150));
+        // Red rectangle carried over from capture is still rendered on export.
+        let px = out.pixel(20, 40).unwrap();
+        assert_eq!((px.red(), px.green(), px.blue()), (0xF5, 0x22, 0x2D));
     }
 
     #[test]
@@ -1309,8 +1790,8 @@ mod tests {
         let mut e = document_editor();
         e.toggle_tool(Tool::Rect);
         drag(&mut e, (50.0, 2500.0), (150.0, 2600.0));
-        drag(&mut e, (60.0, 2510.0), (70.0, 2520.0)); // inside: draws a second one
-        assert_eq!(e.shapes.len(), 2);
+        drag(&mut e, (60.0, 2510.0), (70.0, 2520.0));
+        assert_eq!(shapes_of(&e).len(), 2);
         let out = e.export().unwrap();
         assert_eq!((out.width(), out.height()), (400, 3000));
         let px = out.pixel(50, 2550).unwrap();
@@ -1321,10 +1802,8 @@ mod tests {
     fn ui_scale_sets_handle_hit_radius_on_screen() {
         let mut e = editor();
         drag(&mut e, (10.0, 20.0), (110.0, 80.0));
-        // 12 px from the corner: outside the 8 px radius at 1:1 ...
         e.pointer_move(Point::new(122.0, 80.0), false);
         assert_eq!(e.cursor(), CursorKind::Default);
-        // ... inside it when one on-screen pixel is two image pixels.
         e.set_ui_scale(2.0);
         e.pointer_move(Point::new(122.0, 80.5), false);
         assert_eq!(e.cursor(), CursorKind::ResizeNwSe);
@@ -1342,16 +1821,15 @@ mod tests {
 
     #[test]
     fn redact_areas_follow_the_settings_and_slider_drags_undo_once() {
-        use crate::style::RedactEffect;
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.toggle_tool(Tool::Redact);
         assert_eq!(e.current_redaction(), Some(Redaction::default()));
         e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
         drag(&mut e, (50.0, 50.0), (150.0, 120.0));
-        let Geometry::Redact { area: RedactShape::Rect(r), effect, .. } = &e.shapes[0].geometry else { panic!() };
+        let shapes = shapes_of(&e);
+        let Geometry::Redact { area: RedactShape::Rect(r), effect, .. } = &shapes[0].geometry else { panic!() };
         assert_eq!((*r, *effect), (Rect::new(50.0, 50.0, 100.0, 70.0), RedactEffect::Blur));
-        // The new redaction is selected; a slider drag changes it, as one undo step.
         let undo_depth = e.history.len();
         e.begin_continuous_edit();
         for i in 0..10 {
@@ -1362,7 +1840,8 @@ mod tests {
         assert_eq!(e.current_redaction().unwrap().strength, 0.9);
         assert!(e.undo());
         assert_eq!(e.current_redaction(), Some(Redaction { area: RedactArea::Rect, effect: RedactEffect::Blur, strength: 0.9 }));
-        let Geometry::Redact { strength, .. } = &e.shapes[0].geometry else { panic!() };
+        let shapes = shapes_of(&e);
+        let Geometry::Redact { strength, .. } = &shapes[0].geometry else { panic!() };
         assert_eq!(*strength, Redaction::default().strength);
     }
 
@@ -1374,16 +1853,16 @@ mod tests {
         e.set_redaction(|r| r.area = RedactArea::Rect);
         drag(&mut e, (50.0, 50.0), (150.0, 120.0));
         assert!(e.selected.is_some());
-        let before = e.shapes.clone();
+        let before = shapes_of(&e);
         e.set_redaction(|r| r.area = RedactArea::Brush);
         assert_eq!((e.selected, e.tool), (None, Some(Tool::Redact)));
         assert_eq!(e.current_redaction().unwrap().area, RedactArea::Brush);
-        assert_eq!(e.shapes, before);
+        assert_eq!(shapes_of(&e), before);
     }
 
     fn counters(e: &Editor) -> Vec<(u32, CounterFormat)> {
-        e.shapes
-            .iter()
+        shapes_of(e)
+            .into_iter()
             .filter_map(|s| match s.geometry {
                 Geometry::Counter { number, format, .. } => Some((number, format)),
                 _ => None,
@@ -1402,11 +1881,9 @@ mod tests {
         }
         let numbers = |e: &Editor| counters(e).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(numbers(&e), [1, 2, 3]);
-        // Clicking a counter grabs it instead of adding one.
         drag(&mut e, (120.0, 100.0), (120.0, 200.0));
         assert_eq!(numbers(&e), [1, 2, 3]);
-        assert!(matches!(e.shapes[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
-        // Deleting the second renumbers the third; undo brings both back.
+        assert!(matches!(shapes_of(&e)[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
         assert!(e.delete_selected());
         assert_eq!(numbers(&e), [1, 2]);
         click(&mut e, 260.0, 100.0);
@@ -1414,7 +1891,7 @@ mod tests {
         e.undo();
         e.undo();
         assert_eq!(numbers(&e), [1, 2, 3]);
-        assert!(matches!(e.shapes[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
+        assert!(matches!(shapes_of(&e)[1].geometry, Geometry::Counter { center, .. } if center == Point::new(120.0, 200.0)));
     }
 
     #[test]
@@ -1427,12 +1904,10 @@ mod tests {
         e.set_counter_format(CounterFormat::Roman);
         click(&mut e, 190.0, 100.0);
         assert!(counters(&e).iter().all(|(_, f)| *f == CounterFormat::Roman));
-        // One undo step for the format change (after undoing the third counter).
         e.undo();
         e.undo();
         assert!(counters(&e).iter().all(|(_, f)| *f == CounterFormat::Decimal));
         assert_eq!(e.current_counter_format(), Some(CounterFormat::Decimal));
-        // Other tools don't show the numbering.
         e.toggle_tool(Tool::Pen);
         assert_eq!(e.current_counter_format(), None);
     }
@@ -1448,10 +1923,8 @@ mod tests {
             e.pointer_move(Point::new(x, 100.0 + x / 10.0), true);
         }
         e.pointer_up(Point::new(160.0, 116.0));
-        assert_eq!(e.shapes[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 100.0)]));
-        // The ring shows the highlighter's width.
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 100.0)]));
         e.pointer_move(Point::new(300.0, 200.0), false);
-        // Medium: 18 px tall, 8.1 px wide.
         let ring = e.brush_ring().unwrap();
         assert_eq!((ring.center, ring.half_height), (Point::new(300.0, 200.0), 9.0));
         assert!(ring.half_width < ring.half_height);
@@ -1468,13 +1941,11 @@ mod tests {
             e.pointer_move(Point::new(130.0, 110.0), false);
             e.pointer_move(Point::new(end.0, end.1), shift);
             e.pointer_up(Point::new(end.0, end.1));
-            e.shapes[0].geometry.clone()
+            shapes_of(&e)[0].geometry.clone()
         };
-        // Nearly diagonal: onto the diagonal, at the point nearest the pointer.
         let diagonal = Point::new(150.0, 150.0);
         assert_eq!(draw(Tool::Arrow, (148.0, 152.0), true), Geometry::Arrow { from: start, to: diagonal, style: ArrowStyle::Straight });
         assert_eq!(draw(Tool::Arrow, (148.0, 152.0), false), Geometry::Arrow { from: start, to: Point::new(148.0, 152.0), style: ArrowStyle::Straight });
-        // Brush strokes become one straight segment, dropping the wiggle.
         assert_eq!(draw(Tool::Pen, (148.0, 152.0), true), Geometry::Pen(vec![start, diagonal]));
         assert_eq!(draw(Tool::Pen, (100.0, 40.0), true), Geometry::Pen(vec![start, Point::new(100.0, 40.0)]));
         assert_eq!(draw(Tool::Pen, (20.0, 97.0), true), Geometry::Pen(vec![start, Point::new(20.0, 100.0)]));
@@ -1484,7 +1955,6 @@ mod tests {
         assert_eq!(draw(Tool::Rect, (160.0, 120.0), true), Geometry::Rect(Rect::new(100.0, 100.0, 60.0, 60.0)));
         assert_eq!(draw(Tool::Ellipse, (40.0, 130.0), true), Geometry::Ellipse(Rect::new(40.0, 100.0, 60.0, 60.0)));
 
-        // Pressing or releasing Shift mid-drag applies without moving the pointer.
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.toggle_tool(Tool::Arrow);
@@ -1492,10 +1962,10 @@ mod tests {
         e.pointer_move(Point::new(148.0, 152.0), false);
         let revision = e.revision();
         e.constrain_changed(true);
-        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: diagonal, style: ArrowStyle::Straight });
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Arrow { from: start, to: diagonal, style: ArrowStyle::Straight });
         assert_ne!(e.revision(), revision);
         e.constrain_changed(false);
-        assert_eq!(e.shapes[0].geometry, Geometry::Arrow { from: start, to: Point::new(148.0, 152.0), style: ArrowStyle::Straight });
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Arrow { from: start, to: Point::new(148.0, 152.0), style: ArrowStyle::Straight });
     }
 
     #[test]
@@ -1508,12 +1978,12 @@ mod tests {
         e.set_arrow_style(ArrowStyle::Elbow);
         assert!(!e.can_undo());
         drag(&mut e, (50.0, 50.0), (250.0, 150.0));
-        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
         e.selected = Some(0);
         e.set_arrow_style(ArrowStyle::Curved);
-        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Curved, .. }));
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Arrow { style: ArrowStyle::Curved, .. }));
         e.undo();
-        assert!(matches!(e.shapes[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Arrow { style: ArrowStyle::Elbow, .. }));
     }
 
     #[test]
@@ -1521,13 +1991,12 @@ mod tests {
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (300.0, 200.0));
         e.toggle_tool(Tool::Redact);
-        e.set_redaction(|r| r.effect = crate::style::RedactEffect::Gray);
+        e.set_redaction(|r| r.effect = RedactEffect::Gray);
         let rects = [Rect::new(10.0, 10.0, 50.0, 12.0), Rect::new(280.0, 190.0, 50.0, 20.0), Rect::new(500.0, 10.0, 5.0, 5.0)];
-        // The second is clipped to the selection; the third is outside it.
         assert_eq!(e.add_redactions(&rects), 2);
-        assert!(matches!(&e.shapes[1].geometry, Geometry::Redact { area: RedactShape::Rect(r), effect: crate::style::RedactEffect::Gray, .. } if *r == Rect::new(280.0, 190.0, 20.0, 10.0)));
+        assert!(matches!(&shapes_of(&e)[1].geometry, Geometry::Redact { area: RedactShape::Rect(r), effect: RedactEffect::Gray, .. } if *r == Rect::new(280.0, 190.0, 20.0, 10.0)));
         assert!(e.undo());
-        assert!(e.shapes.is_empty() && !e.can_undo());
+        assert!(shapes_of(&e).is_empty() && !e.can_undo());
     }
 
     #[test]
@@ -1540,16 +2009,14 @@ mod tests {
         click(&mut e, 100.0, 100.0);
         e.text_replace(None, "hi", false, None);
         e.finish_text();
-        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
-        // Select it (a press and release on it), restyle: one undo step.
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
         click(&mut e, 101.0, 105.0);
         e.finish_text();
         e.selected = Some(0);
         e.set_text_style(TextStyle::Outlined);
-        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Outlined, .. }));
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Text { style: TextStyle::Outlined, .. }));
         assert!(e.undo());
-        assert!(matches!(e.shapes[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
-        // Other tools don't show text styles.
+        assert!(matches!(shapes_of(&e)[0].geometry, Geometry::Text { style: TextStyle::Boxed, .. }));
         e.toggle_tool(Tool::Rect);
         assert_eq!(e.current_text_style(), None);
     }
@@ -1563,12 +2030,10 @@ mod tests {
         e.toggle_tool(Tool::Text);
         click(&mut e, 200.0, 200.0);
         e.text_replace(None, "typing", false, None);
-        // Still typing: the text is committed, and everything is moved to the selection's origin.
         let shapes = e.shapes_in_selection();
         assert!(!e.is_editing_text());
         assert_eq!(shapes.len(), 2);
         assert_eq!(shapes[0].geometry, Geometry::Rect(Rect::new(20.0, 20.0, 40.0, 20.0)));
-        // A document editor for the new image starts with them, nothing to undo.
         let doc = Document::from_rgba(200, 600, vec![255; 200 * 600 * 4]).unwrap();
         let d = Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0).with_shapes(shapes);
         assert!(d.has_shapes() && !d.can_undo());
@@ -1585,7 +2050,7 @@ mod tests {
         assert!(!e.delete_selected());
         e.pointer_move(Point::new(100.0, 90.0), false);
         e.pointer_up(Point::new(100.0, 90.0));
-        assert_eq!(e.shapes.len(), 1);
+        assert_eq!(shapes_of(&e).len(), 1);
         assert!(e.delete_selected());
     }
 
@@ -1594,9 +2059,7 @@ mod tests {
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
         e.toggle_tool(Tool::Rect);
-        // A press whose release never arrives (let go outside the window)…
         e.pointer_down(Point::new(260.0, 16.0));
-        // …then text is started elsewhere and the release finally comes.
         e.toggle_tool(Tool::Text);
         e.pointer_down(Point::new(300.0, 24.0));
         e.pointer_up(Point::new(290.0, 120.0));
@@ -1605,12 +2068,8 @@ mod tests {
         assert_eq!(e.text_content(), Some("x"));
     }
 
-    /// Random sequences of everything a frontend can do, in any order (a key
-    /// press in the middle of a drag, undo while typing, …): nothing may panic,
-    /// and the layers and export must keep rendering.
     #[test]
     fn random_input_never_panics() {
-        use crate::style::{CounterFormat, RedactArea, RedactEffect, TextStyle};
         let mut seed = 0x9E37_79B9u32;
         let mut next = move |n: u32| {
             seed ^= seed << 13;
@@ -1618,11 +2077,16 @@ mod tests {
             seed ^= seed << 5;
             seed % n.max(1)
         };
-        for _ in 0..400 {
-            let mut e = editor();
+        for run in 0..400 {
+            let mut e = if run % 2 == 0 {
+                editor()
+            } else {
+                let comp = Composition::from_slice(Pixmap::new(400, 300).unwrap(), 1.0, Vec::new());
+                Editor::from_composition(comp, Arc::new(Fonts::empty()))
+            };
             for _ in 0..80 {
-                let p = Point::new(next(420) as f32 - 10.0, next(320) as f32 - 10.0);
-                match next(24) {
+                let p = Point::new(next(440) as f32 - 20.0, next(340) as f32 - 20.0);
+                match next(26) {
                     0..=3 => e.pointer_down(p),
                     4..=8 => e.pointer_move(p, next(4) == 0),
                     9..=11 => e.pointer_up(p),
@@ -1653,6 +2117,13 @@ mod tests {
                     22 => {
                         e.add_redactions(&[Rect::new(p.x, p.y, 30.0, 12.0)]);
                     }
+                    23 => {
+                        let order = [LayerOrder::Backward, LayerOrder::Forward, LayerOrder::ToBack, LayerOrder::ToFront][next(4) as usize];
+                        e.reorder_selected(order);
+                    }
+                    24 => {
+                        e.append_slice(Pixmap::new(60, 40).unwrap(), 1.0, Vec::new());
+                    }
                     _ => {
                         let strength = next(100) as f32 / 100.0;
                         e.begin_continuous_edit();
@@ -1660,16 +2131,19 @@ mod tests {
                         e.end_continuous_edit();
                     }
                 }
-                let screen = e.screen();
-                e.render_static_layer(screen);
-                e.render_active_layer(screen);
+                let screen = e.active_canvas_rect();
+                for band in e.visual_bands() {
+                    if let VisualBand::Shapes { range, active, .. } = band {
+                        e.render_band(range, active, screen);
+                    }
+                }
                 e.cursor();
                 e.selected_frame();
                 e.text_caret_rect();
                 e.brush_ring();
             }
             e.export();
-            e.shapes_in_selection();
+            e.to_composition();
         }
     }
 
@@ -1699,9 +2173,7 @@ mod tests {
         let mut e = editor();
         click(&mut e, 60.0, 60.0);
         e.toggle_tool(Tool::Arrow);
-        // Short 6 px arrow: both endpoints lie inside the 8 px handle hit radius.
         drag(&mut e, (80.0, 80.0), (86.0, 80.0));
-        // Dragging right on the tip (`(86, 80)`) must move the tip, not the tail.
         drag(&mut e, (86.0, 80.0), (120.0, 80.0));
         let (_, handles) = e.selected_frame().unwrap();
         assert_eq!(handles, vec![Point::new(80.0, 80.0), Point::new(120.0, 80.0)]);

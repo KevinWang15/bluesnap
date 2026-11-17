@@ -1,105 +1,86 @@
-//! The editing view: draws an [`Editor`]'s image and annotations with gpui and
-//! forwards input to it. It is hosted on two surfaces:
-//!
-//! - [`Surface::Capture`]: the full-screen overlay over the frozen screenshot,
-//!   shown 1:1 in device pixels, with window picking, a dimmed surrounding and
-//!   the toolbar following the selection;
-//! - [`Surface::Document`]: a normal window editing a whole image (a stitched
-//!   scrolling screenshot), fitted to the window width, scrollable, with the
-//!   toolbar at the top.
-//!
-//! The editor works in image pixels; [`Viewport`] maps them to the window.
+//! First-class reusable canvas surface (`CanvasView`): renders and drives an
+//! [`Editor`] across both the full-screen Capture overlay (`Surface::Capture`)
+//! and the multi-image resizable-canvas Composition Editor (`Surface::Editor`).
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bluesnap_core::layout::{place_panels, place_size_label};
 use bluesnap_core::reading_order::join_lines;
 use bluesnap_core::render::to_rgba_straight;
-use bluesnap_core::{CursorKind, Editor, Rect as PxRect, RightClick, SelectionMode, THEME_BLUE, TextKey};
+use bluesnap_core::shape::Shape;
+use bluesnap_core::{
+    Composition, CursorKind, Editor, ImageId, LayerOrder, Pixmap, Rect as PxRect, RightClick, SelectionMode,
+    THEME_BLUE, TextKey, VisualBand,
+};
 use bluesnap_platform::{DisplayInfo, Platform};
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
+    App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, DisplayId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection, Window, canvas, div,
-    fill, point, px, quad, rgb, rgba, size, transparent_black, white,
+    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection, Window, canvas,
+    div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
-use crate::gpu_image::{ImageTiles, LayerCache, paint_tiles};
+use crate::AppState;
+use crate::capture::{CaptureMode, CapturedSlice};
+use crate::gpu_image::{ImageAtlasCache, ImageTiles, LayerBandPool, paint_tiles};
 use crate::output::{self, Finish};
 use crate::text_field::{byte_to_utf16, range_from_utf16, range_to_utf16, truncate_chars, utf16_to_byte};
 use crate::toast::{self, Toast};
 use crate::toolbar::{self, Action, hsla};
 use crate::viewport::Viewport;
-use crate::AppState;
 
-/// Selection border width, in logical pixels.
 const BORDER: f32 = 2.0;
 const HANDLE_RADIUS: f32 = 4.0;
-/// Gap between the selection and the floating panels, in logical pixels.
 const PANEL_GAP: f32 = 8.0;
-/// Document surface: inset of the toolbar and of the image, in logical pixels.
 const DOC_INSET: f32 = 12.0;
-const DOC_MARGIN: f32 = 16.0;
-/// Document surface: annotation layers are rendered for the visible rows plus
-/// this many screens above and below, snapped to `LAYER_SNAP` rows, so
-/// scrolling only re-renders occasionally.
+const CANVAS_MARGIN: f32 = 36.0;
 const LAYER_SNAP: f32 = 512.0;
 
-/// Where the editor is shown; see the module docs.
 pub enum Surface {
     Capture {
-        /// The display this overlay covers, for starting a scrolling capture.
         display: DisplayInfo,
-        /// Set when the OS withheld window contents; where to grant the permission.
+        gpui_display: DisplayId,
         permission_url: Option<&'static str>,
+        mode: CaptureMode,
+        screenshot: ImageTiles,
     },
-    Document,
+    Editor {
+        images: ImageAtlasCache,
+        /// Scroll offset from the centered fit origin, in logical window pixels.
+        pan: Point<f32>,
+        /// Custom zoom multiplier (`None` = auto-fit within the workspace).
+        zoom_override: Option<f32>,
+    },
 }
 
-pub struct EditorView {
+pub struct CanvasView {
     editor: Editor,
     surface: Surface,
     focus: FocusHandle,
-    image: ImageTiles,
-    /// Finished annotations, re-rasterized only when they change.
-    static_layer: LayerCache,
-    /// The annotation being drawn, dragged or typed into.
-    active_layer: LayerCache,
+    layers: LayerBandPool,
     viewport: Viewport,
-    /// Document surface: how far the image is scrolled, in logical pixels.
-    scroll: f32,
-    /// Document surface: height of the toolbar area above the image.
     top_bar: f32,
     finished: bool,
-    /// Progress and results of text recognition and AI redaction.
     toast: Option<Toast>,
-    /// Running text recognition, if any. Dropping it cancels the UI update.
     ocr: Option<Task<()>>,
-    /// Running AI redaction, if any. Dropping it cancels the UI update.
     auto: Option<Task<()>>,
-    /// The magnifier beside the cursor while picking a region.
     loupe: crate::loupe::Loupe,
-    /// The text style menu is open.
     text_menu: bool,
-    /// Its previews, for the text color and display scale they were drawn in.
     text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
-    /// While the redact strength slider is dragged: its style bar's window x.
     slider: Option<f32>,
 }
 
-/// An error's message, short enough for a toast.
 fn short_error(e: &anyhow::Error) -> String {
     truncate_chars(&format!("{e:#}"), 200)
 }
 
-/// "1 line", "5 lines".
 fn plural(n: usize, noun: &str) -> String {
     if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") }
 }
 
-/// The servers AI requests go to, for telling the user.
 fn hosts(settings: &bluesnap_ai::AiSettings) -> String {
     let host = |e: &bluesnap_ai::Endpoint| {
         let url = e.url.trim();
@@ -111,8 +92,7 @@ fn hosts(settings: &bluesnap_ai::AiSettings) -> String {
     hosts.join(" and ")
 }
 
-/// Shown when macOS returned a capture without window contents.
-fn permission_banner(url: &'static str, cx: &mut Context<EditorView>) -> impl IntoElement {
+fn permission_banner(url: &'static str, cx: &mut Context<CanvasView>) -> impl IntoElement {
     div().absolute().top(px(16.0)).left_0().right_0().flex().justify_center().child(
         div()
             .flex()
@@ -146,15 +126,31 @@ fn permission_banner(url: &'static str, cx: &mut Context<EditorView>) -> impl In
     )
 }
 
-impl EditorView {
-    pub fn new(editor: Editor, image: ImageTiles, surface: Surface, cx: &mut Context<Self>) -> Self {
-        if let Surface::Capture { .. } = surface {
-            // However the window goes away (including OS-initiated closes), allow the next capture.
-            cx.on_release(|_, cx| {
-                log::debug!("overlay closed");
-                cx.global_mut::<AppState>().overlay = None;
-            })
-            .detach();
+impl CanvasView {
+    pub fn new(editor: Editor, surface: Surface, cx: &mut Context<Self>) -> Self {
+        match &surface {
+            Surface::Capture { mode, .. } => {
+                let is_for_editor = *mode == CaptureMode::ForEditor;
+                cx.on_release(move |this, cx| {
+                    log::debug!("capture overlay released");
+                    cx.global_mut::<AppState>().overlay = None;
+                    // Safety net: if closed externally (e.g. Alt+F4) before `finish`
+                    // handled `ForEditor`, always un-hide the Editor window.
+                    if is_for_editor && !this.finished {
+                        cx.defer(crate::editor_window::restore_if_hidden);
+                    }
+                })
+                .detach();
+            }
+            Surface::Editor { .. } => {
+                cx.on_release(|_, cx| {
+                    log::debug!("editor window released");
+                    let state = cx.global_mut::<AppState>();
+                    state.editor = None;
+                    state.editor_hidden = false;
+                })
+                .detach();
+            }
         }
         cx.background_executor()
             .spawn(async {
@@ -168,11 +164,8 @@ impl EditorView {
             editor,
             surface,
             focus: cx.focus_handle(),
-            image,
-            static_layer: LayerCache::default(),
-            active_layer: LayerCache::default(),
+            layers: LayerBandPool::default(),
             viewport,
-            scroll: 0.0,
             top_bar: 0.0,
             finished: false,
             toast: None,
@@ -183,6 +176,14 @@ impl EditorView {
             text_previews: None,
             slider: None,
         }
+    }
+
+    pub fn new_editor(editor: Editor, cx: &mut Context<Self>) -> Self {
+        Self::new(
+            editor,
+            Surface::Editor { images: ImageAtlasCache::default(), pan: Point { x: 0.0, y: 0.0 }, zoom_override: None },
+            cx,
+        )
     }
 
     pub fn editor(&self) -> &Editor {
@@ -197,60 +198,178 @@ impl EditorView {
         &self.focus
     }
 
-    /// Places the image in the window for this frame.
+    /// Appends a newly captured slice into this Editor session.
+    pub fn append_slice(&mut self, image: Pixmap, scale: f32, shapes: Vec<Shape>, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.append_slice(image, scale, shapes);
+        self.show_toast(
+            Toast::new(toast::Kind::Done, "Added to editor").detail("Drag to arrange, drag handles to resize, or drag canvas edges."),
+            window,
+            cx,
+        );
+    }
+
+    /// Replaces the entire composition (e.g. when loading a `.bs` file).
+    pub fn replace_composition(&mut self, comp: Composition, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.replace_composition(comp);
+        if let Surface::Editor { images, pan, zoom_override } = &mut self.surface {
+            images.clear(window);
+            *pan = Point { x: 0.0, y: 0.0 };
+            *zoom_override = None;
+        }
+        self.layers.clear(window);
+        cx.notify();
+    }
+
+    fn is_capture(&self) -> bool {
+        matches!(self.surface, Surface::Capture { .. })
+    }
+
+    fn capture_mode(&self) -> Option<CaptureMode> {
+        match self.surface {
+            Surface::Capture { mode, .. } => Some(mode),
+            Surface::Editor { .. } => None,
+        }
+    }
+
+    fn toolbar_groups(&self) -> &'static [&'static [Action]] {
+        match &self.surface {
+            Surface::Capture { mode: CaptureMode::Standard, .. } => toolbar::CAPTURE_TOOLBAR,
+            Surface::Capture { mode: CaptureMode::ForEditor, .. } => toolbar::CAPTURE_FOR_EDITOR_TOOLBAR,
+            Surface::Editor { .. } => toolbar::EDITOR_TOOLBAR,
+        }
+    }
+
+    fn fit_zoom(&self, window: &Window) -> (f32, f32) {
+        let native = Viewport::native(window.scale_factor());
+        let win = window.viewport_size();
+        let (w, h) = (f32::from(win.width), f32::from(win.height));
+        let top = DOC_INSET + toolbar::panel_size(toolbar::EDITOR_TOOLBAR, 0.0).1 + DOC_INSET;
+        let avail_w = (w - 2.0 * CANVAS_MARGIN).max(64.0);
+        let avail_h = (h - top - 2.0 * CANVAS_MARGIN).max(64.0);
+        let canvas = self.editor.screen();
+        let fit_w = avail_w / canvas.w.max(1.0);
+        // Tall scrolling screenshots fit width so text remains readable and scrollable;
+        // regular compositions fit both width and height so all 4 canvas edges show.
+        let fit = if canvas.h > canvas.w * 2.2 { fit_w } else { fit_w.min(avail_h / canvas.h.max(1.0)) };
+        (native.zoom.min(fit).max(0.02), top)
+    }
+
     fn layout(&mut self, window: &Window) {
         let native = Viewport::native(window.scale_factor());
-        self.viewport = match self.surface {
-            Surface::Capture { .. } => native,
-            Surface::Document => {
+        match &mut self.surface {
+            Surface::Capture { .. } => {
+                self.viewport = native;
+            }
+            Surface::Editor { pan, zoom_override, .. } => {
+                // Freeze the viewport while dragging a canvas edge so Left/Top
+                // edge drags never fight coordinate re-centering mid-drag.
+                if self.editor.is_resizing_canvas() {
+                    self.editor.set_ui_scale(self.viewport.ui_scale());
+                    return;
+                }
                 let win = window.viewport_size();
                 let (w, h) = (f32::from(win.width), f32::from(win.height));
-                let image = self.editor.screen();
-                // Fit the width, never above the image's native resolution.
-                let zoom = native.zoom.min((w - 2.0 * DOC_MARGIN) / image.w).max(0.01);
-                let top = DOC_INSET + toolbar::panel_size(toolbar::DOCUMENT_TOOLBAR, 0.0).1 + DOC_INSET;
+                let top = DOC_INSET + toolbar::panel_size(toolbar::EDITOR_TOOLBAR, 0.0).1 + DOC_INSET;
                 self.top_bar = top - DOC_INSET / 2.0;
-                let max_scroll = (top + image.h * zoom + DOC_MARGIN - h).max(0.0);
-                self.scroll = self.scroll.clamp(0.0, max_scroll);
-                let x = ((w - image.w * zoom) / 2.0).max(DOC_MARGIN);
-                Viewport { origin: point(px(x), px(top - self.scroll)), zoom }
+                let canvas = self.editor.screen();
+                let avail_w = (w - 2.0 * CANVAS_MARGIN).max(64.0);
+                let avail_h = (h - top - 2.0 * CANVAS_MARGIN).max(64.0);
+                let fit_w = avail_w / canvas.w.max(1.0);
+                let fit = if canvas.h > canvas.w * 2.2 { fit_w } else { fit_w.min(avail_h / canvas.h.max(1.0)) };
+                let default_zoom = native.zoom.min(fit).max(0.02);
+                let zoom = zoom_override.unwrap_or(default_zoom).clamp(0.02, native.zoom * 4.0);
+
+                let (cw, ch) = (canvas.w * zoom, canvas.h * zoom);
+                let base_x = ((w - cw) / 2.0).max(CANVAS_MARGIN);
+                let base_y = if ch <= avail_h { top + (avail_h + 2.0 * CANVAS_MARGIN - ch) / 2.0 } else { top + CANVAS_MARGIN };
+
+                let max_pan_x = (cw + 2.0 * CANVAS_MARGIN - w).max(0.0);
+                let max_pan_y = (top + ch + CANVAS_MARGIN - h).max(0.0);
+                pan.x = pan.x.clamp(-CANVAS_MARGIN, max_pan_x + CANVAS_MARGIN);
+                pan.y = pan.y.clamp(-CANVAS_MARGIN, max_pan_y + CANVAS_MARGIN);
+
+                self.viewport = Viewport { origin: point(px(base_x - pan.x), px(base_y - pan.y)), zoom };
             }
-        };
+        }
         self.editor.set_ui_scale(self.viewport.ui_scale());
     }
 
-    /// The image area annotation layers are rendered for.
     fn layer_clip(&self, window: &Window) -> PxRect {
-        let screen = self.editor.screen();
+        let screen = self.editor.active_canvas_rect();
         match self.surface {
             Surface::Capture { .. } => screen,
-            Surface::Document => {
+            Surface::Editor { .. } => {
                 let v = self.viewport.visible_image_rect(window.viewport_size());
+                let x0 = ((v.x - v.w) / LAYER_SNAP).floor() * LAYER_SNAP;
                 let y0 = ((v.y - v.h) / LAYER_SNAP).floor() * LAYER_SNAP;
+                let x1 = ((v.right() + v.w) / LAYER_SNAP).ceil() * LAYER_SNAP;
                 let y1 = ((v.bottom() + v.h) / LAYER_SNAP).ceil() * LAYER_SNAP;
-                PxRect::from_edges(0.0, y0.max(0.0), screen.w, y1.min(screen.h))
+                PxRect::from_edges(x0.max(screen.x), y0.max(screen.y), x1.min(screen.right()), y1.min(screen.bottom()))
             }
         }
     }
 
-    /// Re-rasterizes the annotation layers whose content or clip changed.
-    fn sync_layers(&mut self, window: &mut Window) {
+    fn sync_gpu_resources(&mut self, window: &mut Window) -> Vec<SceneBand> {
         let clip = self.layer_clip(window);
-        let e = &self.editor;
-        self.static_layer.sync(e.static_layer_revision(), clip, || e.render_static_layer(clip), window);
-        self.active_layer.sync(e.active_layer_revision(), clip, || e.render_active_layer(clip), window);
+        let window_bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let bands = self.editor.visual_bands();
+
+        if let Surface::Editor { images, .. } = &mut self.surface {
+            let live: HashSet<ImageId> = bands
+                .iter()
+                .filter_map(|b| match b {
+                    VisualBand::Image(img) => Some(img.asset.id),
+                    VisualBand::Shapes { .. } => None,
+                })
+                .collect();
+            images.prune(&live, window);
+            for b in &bands {
+                if let VisualBand::Image(img) = b {
+                    images.ensure(&img.asset);
+                }
+            }
+        }
+
+        let shape_band_count = bands.iter().filter(|b| matches!(b, VisualBand::Shapes { .. })).count();
+        self.layers.resize(shape_band_count, window);
+
+        let mut shape_slot = 0usize;
+        let mut out = Vec::with_capacity(bands.len());
+        for band in bands {
+            match band {
+                VisualBand::Image(placed) => {
+                    if let Surface::Editor { images, .. } = &mut self.surface
+                        && let Some(tiles) = images.ensure(&placed.asset)
+                    {
+                        out.push(SceneBand::Image(tiles.visible_in(placed.bounds, &self.viewport, window_bounds)));
+                    }
+                }
+                VisualBand::Shapes { range, revision, active } => {
+                    let e = &self.editor;
+                    let r_clone = range.clone();
+                    let cache = self.layers.get_mut(shape_slot);
+                    cache.sync(revision, range, clip, || e.render_band(r_clone, active, clip), window);
+                    if let Some((r, img)) = cache.image() {
+                        out.push(SceneBand::Layer(self.viewport.to_window(*r), img.clone()));
+                    }
+                    shape_slot += 1;
+                }
+            }
+        }
+        out
     }
 
-    /// Runs a toolbar action.
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
+            Action::AddImage => crate::editor_window::request_add_image(cx),
+            Action::OpenFile => crate::editor_window::prompt_open_file(false, cx),
             Action::Tool(tool) => self.editor.toggle_tool(tool),
             Action::Undo => {
                 self.editor.undo();
             }
             Action::Scrolling => self.start_scrolling_capture(window, cx),
             Action::ToText => self.extract_text(window, cx),
-            Action::Edit => {}
+            Action::AddToEditor => self.send_capture_to_editor(window, cx),
             Action::Save | Action::Cancel | Action::Done => {
                 if let Some(how) = action.finish() {
                     self.finish(how, window, cx);
@@ -260,9 +379,11 @@ impl EditorView {
     }
 
     fn drop_gpu_images(&mut self, window: &mut Window) {
-        self.image.drop_images(window);
-        self.static_layer.drop_image(window);
-        self.active_layer.drop_image(window);
+        match &mut self.surface {
+            Surface::Capture { screenshot, .. } => screenshot.drop_images(window),
+            Surface::Editor { images, .. } => images.clear(window),
+        }
+        self.layers.clear(window);
         self.loupe.drop_image(window);
         if let Some((_, _, old)) = self.text_previews.take() {
             for (_, img, _) in old {
@@ -271,34 +392,131 @@ impl EditorView {
         }
     }
 
-    pub fn finish(&mut self, how: Finish, window: &mut Window, cx: &mut Context<Self>) {
+    fn send_capture_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.finished, true) {
             return;
         }
-        let image = match how {
-            Finish::Cancel => None,
-            Finish::Copy | Finish::Save => self.editor.export(),
+        let display = match &self.surface {
+            Surface::Capture { gpui_display, .. } => Some(*gpui_display),
+            Surface::Editor { .. } => None,
         };
+        let slice = self.editor.extract_slice().map(|(image, scale, shapes)| CapturedSlice { image, scale, shapes, display });
         self.drop_gpu_images(window);
         window.remove_window();
-        output::deliver(how, image, cx);
+        if let Some(slice) = slice {
+            cx.defer(move |cx| crate::editor_window::add_slice(slice, cx));
+        } else {
+            cx.defer(crate::editor_window::restore_if_hidden);
+        }
     }
 
-    /// Closes the overlay and starts capturing the selection while the user
-    /// scrolls. Annotations come along: the result starts with the selection,
-    /// so they stay on the content they were made on.
+    pub fn finish(&mut self, how: Finish, window: &mut Window, cx: &mut Context<Self>) {
+        // In the Composition Editor, `Save` keeps the session open so the user
+        // can save a `.bs` project and continue editing or click `Tick` to copy.
+        if !self.is_capture() && how == Finish::Save {
+            let (Some(image), Some(comp)) = (self.editor.export(), self.editor.to_composition()) else {
+                return;
+            };
+            let entity = cx.entity().downgrade();
+            let handle = window.window_handle();
+            output::save_with_dialog(
+                image,
+                comp,
+                false,
+                Some(Box::new(move |path, cx| {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+                    let is_bs = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bs"));
+                    handle
+                        .update(cx, |_, window, cx| {
+                            if is_bs {
+                                window.set_window_title(&format!("bluesnap editor — {name}"));
+                            }
+                            if let Some(view) = entity.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.show_toast(Toast::new(toast::Kind::Done, format!("Saved {name}")), window, cx);
+                                });
+                            }
+                        })
+                        .ok();
+                })),
+                cx,
+            );
+            return;
+        }
+
+        // In `CaptureMode::ForEditor`, `Done` ("Tick") sends the captured slice
+        // straight into the open Editor window, and `Cancel` restores it.
+        if self.capture_mode() == Some(CaptureMode::ForEditor) {
+            match how {
+                Finish::Copy => return self.send_capture_to_editor(window, cx),
+                Finish::Cancel => {
+                    if std::mem::replace(&mut self.finished, true) {
+                        return;
+                    }
+                    self.drop_gpu_images(window);
+                    window.remove_window();
+                    cx.defer(crate::editor_window::restore_if_hidden);
+                    return;
+                }
+                Finish::Save => {}
+            }
+        }
+
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
+        let mode = self.capture_mode();
+        match how {
+            Finish::Cancel => {
+                self.drop_gpu_images(window);
+                window.remove_window();
+            }
+            Finish::Copy => {
+                let image = self.editor.export();
+                self.drop_gpu_images(window);
+                window.remove_window();
+                if let Some(image) = image {
+                    output::copy_to_clipboard(image, cx);
+                }
+            }
+            Finish::Save => {
+                let pair = self.editor.export().zip(self.editor.to_composition());
+                self.drop_gpu_images(window);
+                window.remove_window();
+                if mode == Some(CaptureMode::ForEditor) {
+                    cx.defer(crate::editor_window::restore_if_hidden);
+                }
+                if let Some((image, comp)) = pair {
+                    output::save_with_dialog(image, comp, mode != Some(CaptureMode::ForEditor), None, cx);
+                }
+            }
+        }
+    }
+
     fn start_scrolling_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Surface::Capture { display, .. } = &self.surface else { return };
+        let Surface::Capture { display, mode, .. } = &self.surface else { return };
         let Some(sel) = self.editor.selection() else { return };
         let sel = sel.round();
-        let rect = bluesnap_platform::PixelRect { x: sel.x as i32, y: sel.y as i32, width: sel.w as i32, height: sel.h as i32 };
+        let rect = bluesnap_platform::PixelRect {
+            x: sel.x as i32,
+            y: sel.y as i32,
+            width: sel.w as i32,
+            height: sel.h as i32,
+        };
         let screen = self.editor.screen();
-        let (display, screen) = (display.clone(), (screen.w as i32, screen.h as i32));
+        let (display, screen, mode) = (display.clone(), (screen.w as i32, screen.h as i32), *mode);
         let shapes = self.editor.shapes_in_selection();
-        self.finish(Finish::Cancel, window, cx);
+        // Mark `finished = true` so `on_release` doesn't un-hide the Editor
+        // prematurely while scrolling capture takes over the `ForEditor` session.
+        self.finished = true;
+        self.drop_gpu_images(window);
+        window.remove_window();
         cx.defer(move |cx| {
-            if let Err(e) = crate::scrolling::start(display, screen, rect, shapes, cx) {
+            if let Err(e) = crate::scrolling::start(display, screen, rect, shapes, mode, cx) {
                 log::error!("could not start scrolling capture: {e:#}");
+                if mode == CaptureMode::ForEditor {
+                    crate::editor_window::restore_if_hidden(cx);
+                }
             }
         });
     }
@@ -307,8 +525,7 @@ impl EditorView {
         self.ocr.is_some()
     }
 
-    /// Shows `toast` until its lifetime ends or another replaces it.
-    fn show_toast(&mut self, toast: Toast, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn show_toast(&mut self, toast: Toast, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(lifetime) = toast.lifetime() {
             let shown = toast.clone();
             cx.spawn_in(window, async move |this, cx| {
@@ -331,15 +548,13 @@ impl EditorView {
         match action {
             toast::Action::OpenAiSettings => {
                 self.toast = None;
-                let above_overlay = matches!(self.surface, Surface::Capture { .. });
+                let above_overlay = self.is_capture();
                 cx.defer(move |cx| crate::ai_settings::open(above_overlay, cx));
             }
         }
         cx.notify();
     }
 
-    /// Recognizes the text in the selection (as displayed, so redacted text stays
-    /// hidden), copies it to the clipboard and closes the view.
     fn extract_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.ocr.is_some() {
             return;
@@ -379,12 +594,20 @@ impl EditorView {
         });
         let toast = match text {
             Ok(text) if !text.trim().is_empty() => {
-                log::info!("copied {} characters of recognized text", text.chars().count());
+                let chars = text.chars().count();
+                log::info!("copied {chars} characters of recognized text");
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.finished = true;
-                self.drop_gpu_images(window);
-                window.remove_window();
-                return;
+                if self.is_capture() {
+                    let was_for_editor = self.capture_mode() == Some(CaptureMode::ForEditor);
+                    self.finished = true;
+                    self.drop_gpu_images(window);
+                    window.remove_window();
+                    if was_for_editor {
+                        cx.defer(crate::editor_window::restore_if_hidden);
+                    }
+                    return;
+                }
+                Toast::new(toast::Kind::Done, format!("Copied {chars} characters"))
             }
             Ok(_) => Toast::new(toast::Kind::Info, "No text found").detail("Select an area with text, then try again."),
             Err(e) => {
@@ -395,10 +618,8 @@ impl EditorView {
         self.show_toast(toast, window, cx);
     }
 
-    /// Where the loupe goes, and the image pixel under the cursor: shown while
-    /// picking a region on the capture overlay, gone once it's selected.
     fn loupe_target(&self, window: &Window) -> Option<(Point<Pixels>, (i32, i32))> {
-        if !matches!(self.surface, Surface::Capture { .. }) || !self.editor.is_picking() {
+        if !self.is_capture() || !self.editor.is_picking() {
             return None;
         }
         let cursor = window.mouse_position();
@@ -406,15 +627,14 @@ impl EditorView {
         Some((cursor, (p.x.floor() as i32, p.y.floor() as i32)))
     }
 
-    /// Copies the color under the cursor as `#RRGGBB` (the I key while picking).
     fn copy_color(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some((_, (x, y))) = self.loupe_target(window) else { return };
-        let Some(color) = self.editor.document().color_at(x, y) else { return };
+        let Some(doc) = self.editor.capture_document() else { return };
+        let Some(color) = doc.color_at(x, y) else { return };
         let hex = crate::loupe::hex(color);
         log::info!("copied color {hex}");
         cx.write_to_clipboard(ClipboardItem::new_string(hex));
         self.loupe.copied();
-        // Back to the hint once "Copied" has shown.
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(crate::loupe::COPIED_FOR).await;
             this.update(cx, |_, cx| cx.notify()).ok();
@@ -422,36 +642,35 @@ impl EditorView {
         .detach();
     }
 
-    /// Demo mode: where the controls are (see [`crate::demo`]).
     fn report_layout(&self, window: &Window) {
         let mut items = Vec::new();
         let (toolbar_at, style_at) = self.panel_positions(window);
-        let groups = match self.surface {
-            Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
-            Surface::Document => toolbar::DOCUMENT_TOOLBAR,
-        };
+        let groups = self.toolbar_groups();
         if self.editor.toolbar_visible() {
             items.extend(toolbar::row_items(&toolbar::toolbar_slots(groups, 0.0), 32.0, (toolbar_at.x, toolbar_at.y)));
         }
-        if let (true, Some(at), Some((tool, _))) = (self.editor.toolbar_visible(), style_at, self.editor.current_style()) {
-            let style = toolbar::row_items(&toolbar::style_slots(tool), 24.0, (at.x, at.y));
-            items.extend(style.into_iter().map(|(name, r)| (format!("style:{name}"), r)));
-            if self.text_menu {
-                let (x, y, w) = self.text_menu_origin(at, window);
-                for (i, style) in bluesnap_core::TextStyle::ALL.into_iter().enumerate() {
-                    let row = toolbar::text_style_menu_row(i);
-                    items.push((format!("menu:{style:?}"), (x + row.0, y + row.1, w - 2.0 * row.0, row.3)));
+        let layer_ops = self.layer_ops();
+        if let (true, Some(at)) = (self.editor.toolbar_visible(), style_at) {
+            if let Some((tool, _)) = self.editor.current_style() {
+                let style = toolbar::row_items(&toolbar::style_slots_ex(tool, layer_ops.is_some()), 24.0, (at.x, at.y));
+                items.extend(style.into_iter().map(|(name, r)| (format!("style:{name}"), r)));
+                if self.text_menu {
+                    let (x, y, w) = self.text_menu_origin(at, window);
+                    for (i, style) in bluesnap_core::TextStyle::ALL.into_iter().enumerate() {
+                        let row = toolbar::text_style_menu_row(i);
+                        items.push((format!("menu:{style:?}"), (x + row.0, y + row.1, w - 2.0 * row.0, row.3)));
+                    }
                 }
+            } else if self.editor.selected_is_image() {
+                let bar = toolbar::row_items(&toolbar::image_bar_slots(), 24.0, (at.x, at.y));
+                items.extend(bar.into_iter().map(|(name, r)| (format!("style:{name}"), r)));
             }
         }
         if let Some(sel) = self.editor.selection() {
             let r = self.viewport.to_window_rect(sel);
             items.push(("selection".into(), (r.x, r.y, r.w, r.h)));
         }
-        let name = match self.surface {
-            Surface::Capture { .. } => "capture",
-            Surface::Document => "document",
-        };
+        let name = if self.is_capture() { "capture" } else { "editor" };
         crate::demo::report(name, window.scale_factor(), items);
     }
 
@@ -464,8 +683,6 @@ impl EditorView {
         self.text_menu = false;
     }
 
-    /// The text style menu under the style bar's style button (above the bar
-    /// when there's no room below).
     fn text_menu(
         &mut self,
         current: bluesnap_core::TextStyle,
@@ -480,7 +697,6 @@ impl EditorView {
             let previews = bluesnap_core::TextStyle::ALL
                 .into_iter()
                 .filter_map(|style| {
-                    // Drawn at device resolution, shown at 15 logical px.
                     let sample = bluesnap_core::render::text_sample(&fonts, style.label(), style, color, 15.0 * scale)?;
                     let size = (sample.width() as f32 / scale, sample.height() as f32 / scale);
                     Some((style, crate::gpu_image::pixmap_image(&sample)?, size))
@@ -497,7 +713,6 @@ impl EditorView {
         toolbar::text_style_menu(&previews, current, color.is_light(), x, y, cx)
     }
 
-    /// The text style menu's top-left corner and width, for a style bar at `bar`.
     fn text_menu_origin(&self, bar: Point<f32>, window: &Window) -> (f32, f32, f32) {
         let (w, h) = toolbar::text_style_menu_size(bluesnap_core::TextStyle::ALL.len());
         let (button_x, _) = toolbar::text_style_button(bar.x);
@@ -509,8 +724,6 @@ impl EditorView {
         (x, y, w)
     }
 
-    /// A press on the redact strength slider: jumps to the pointer and follows
-    /// it until release, as one undo step.
     pub fn press_slider(&mut self, x: Pixels, window: &Window) {
         let Some(bar) = self.panel_positions(window).1 else { return };
         self.editor.begin_continuous_edit();
@@ -525,15 +738,10 @@ impl EditorView {
         }
     }
 
-    /// The redact bar's Auto button, and whether it's running.
     fn auto_state(&self) -> toolbar::Auto {
         if self.auto.is_some() { toolbar::Auto::Running } else { toolbar::Auto::Ready }
     }
 
-    /// Finds sensitive text in the selection (as displayed, so what's already
-    /// redacted isn't found again) and covers it with area redactions in the
-    /// current effect, as one undo step. Text is recognized locally; only the
-    /// text goes to the configured AI endpoints. Each stage shows in a toast.
     pub fn auto_redact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.auto.is_some() {
             return;
@@ -552,9 +760,6 @@ impl EditorView {
         self.show_toast(Toast::new(toast::Kind::Busy, "Reading the text…"), window, cx);
         let started = std::time::Instant::now();
         self.auto = Some(cx.spawn_in(window, async move |this, cx| {
-            // Tall images (scrolling screenshots) are read in bands: memory
-            // stays bounded, the toast shows progress, and each band's text is
-            // checked by the AI while the next band is being read.
             let image = Arc::new(pixmap);
             let bands = bluesnap_core::reading_order::bands(image.height(), 1200, 64);
             let mut checks = Vec::new();
@@ -580,7 +785,6 @@ impl EditorView {
                             let b = l.bounds;
                             (PxRect::new(b.x as f32, b.y as f32 + read.start as f32, b.width as f32, b.height as f32), l.text)
                         })
-                        // A line read twice in an overlap belongs to one band.
                         .filter(|(r, _)| own.contains(&(r.center().y.max(0.0) as u32)))
                         .collect(),
                     Err(e) => {
@@ -609,7 +813,6 @@ impl EditorView {
                 .detail(format!("Sending the text, not the image, to {}", hosts(&settings)));
             this.update_in(cx, |this, window, cx| this.show_toast(checking, window, cx)).ok();
 
-            // All bands' results, or the first error if every band failed.
             let mut found: anyhow::Result<(Vec<PxRect>, bluesnap_ai::Report)> = Ok((Vec::new(), bluesnap_ai::Report::default()));
             let mut errors = Vec::new();
             for check in checks {
@@ -626,7 +829,6 @@ impl EditorView {
             }
             if let Some(e) = errors.into_iter().next() {
                 match &mut found {
-                    // Some bands failed entirely: count them as failed requests.
                     Ok((all, total)) if !all.is_empty() || total.requests > 0 => {
                         total.failed += 1;
                         total.first_error = total.first_error.take().or(Some(format!("{e:#}")));
@@ -638,7 +840,6 @@ impl EditorView {
             this.update_in(cx, |this, window, cx| {
                 let toast = match found {
                     Ok((rects, report)) => {
-                        // Found in the selection's pixels; placed on the screenshot.
                         let rects: Vec<PxRect> = rects.into_iter().map(|r| r.translate(origin)).collect();
                         let added = this.editor.add_redactions(&rects);
                         let toast = match added {
@@ -647,7 +848,6 @@ impl EditorView {
                             n => Toast::new(toast::Kind::Done, format!("Redacted {}", plural(n, "item")))
                                 .detail("Undo removes them all; click one to change or delete it."),
                         };
-                        // Some lines went unchecked: say so rather than imply all is covered.
                         match (report.failed, report.first_error) {
                             (0, _) | (_, None) => toast,
                             (failed, Some(e)) => Toast::new(toast::Kind::Error, format!("{} · {} failed", toast.title, plural(failed, "request")))
@@ -676,15 +876,13 @@ impl EditorView {
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.text_menu) {
-            return cx.notify(); // a click outside the menu just closes it
+            return cx.notify();
         }
         if self.toast.as_ref().is_some_and(Toast::dismissable) {
             self.toast = None;
         }
-        if let Surface::Document = self.surface
-            && f32::from(ev.position.y) < self.top_bar
-        {
-            return; // the toolbar area, over content scrolled out of view
+        if !self.is_capture() && f32::from(ev.position.y) < self.top_bar {
+            return;
         }
         let p = self.viewport.to_image(ev.position);
         match ev.button {
@@ -705,8 +903,8 @@ impl EditorView {
     }
 
     fn mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
-        if self.editor.is_picking() && matches!(self.surface, Surface::Capture { .. }) {
-            cx.notify(); // the loupe follows the cursor
+        if self.editor.is_picking() && self.is_capture() {
+            cx.notify();
         }
         if self.slider.is_some() {
             self.drag_slider(ev.position.x);
@@ -724,30 +922,60 @@ impl EditorView {
             self.editor.end_continuous_edit();
             cx.notify();
         } else if ev.button == MouseButton::Left {
+            let zoom = self.viewport.zoom;
             self.editor.pointer_up(self.viewport.to_image(ev.position));
+            let shift = self.editor.take_canvas_origin_shift();
+            if shift != bluesnap_core::Point::default()
+                && let Surface::Editor { pan, .. } = &mut self.surface
+            {
+                pan.x -= shift.x * zoom;
+                pan.y -= shift.y * zoom;
+            }
             cx.notify();
         }
     }
 
     fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
-        if let Surface::Document = self.surface {
-            self.scroll -= f32::from(ev.delta.pixel_delta(window.line_height()).y);
-            cx.notify(); // clamped in `layout`
+        let delta = ev.delta.pixel_delta(window.line_height());
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        let cmd = ev.modifiers.secondary();
+        let shift = ev.modifiers.shift;
+        if cmd && !self.is_capture() {
+            let (fit, _) = self.fit_zoom(window);
+            let native_zoom = Viewport::native(window.scale_factor()).zoom;
+            if let Surface::Editor { zoom_override, .. } = &mut self.surface {
+                let cur = zoom_override.unwrap_or(fit);
+                let factor = if dy > 0.0 { 1.12 } else if dy < 0.0 { 1.0 / 1.12 } else { 1.0 };
+                *zoom_override = Some((cur * factor).clamp(0.05, native_zoom * 4.0));
+                cx.notify();
+            }
+            return;
+        }
+        if let Surface::Editor { pan, .. } = &mut self.surface {
+            if shift && dx == 0.0 {
+                pan.x -= dy;
+            } else {
+                pan.x -= dx;
+                pan.y -= dy;
+            }
+            cx.notify();
         }
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let cmd = ks.modifiers.secondary(); // Cmd on macOS, Ctrl elsewhere
+        let cmd = ks.modifiers.secondary();
+        let shift = ks.modifiers.shift;
         let editing = self.editor.is_editing_text();
         if editing && self.editor.text_marked().is_some() {
-            return; // the IME owns the keyboard while composing
+            return;
         }
         match ks.key.as_str() {
             "escape" if self.text_menu => self.text_menu = false,
             "i" if !editing && self.loupe_target(window).is_some() => self.copy_color(window, cx),
             "escape" if editing => self.editor.finish_text(),
-            "escape" => return self.finish(Finish::Cancel, window, cx),
+            "escape" if !self.is_capture() && self.editor.clear_tool_or_selection() => {}
+            "escape" if self.is_capture() => return self.finish(Finish::Cancel, window, cx),
             "enter" if editing => self.editor.text_key(TextKey::Newline),
             "enter" => return self.finish(Finish::Copy, window, cx),
             "backspace" if editing => self.editor.text_key(TextKey::Backspace),
@@ -759,24 +987,111 @@ impl EditorView {
             "backspace" | "delete" => {
                 self.editor.delete_selected();
             }
+            "[" if !editing && !self.is_capture() => {
+                let order = if shift { LayerOrder::ToBack } else { LayerOrder::Backward };
+                self.editor.reorder_selected(order);
+            }
+            "]" if !editing && !self.is_capture() => {
+                let order = if shift { LayerOrder::ToFront } else { LayerOrder::Forward };
+                self.editor.reorder_selected(order);
+            }
             "z" if cmd => {
                 self.editor.undo();
             }
-            "c" if cmd && !editing => return self.finish(Finish::Copy, window, cx),
+            "o" if cmd && !self.is_capture() => {
+                crate::editor_window::prompt_open_file(false, cx);
+            }
+            "0" if cmd && !self.is_capture() => {
+                if let Surface::Editor { pan, zoom_override, .. } = &mut self.surface {
+                    *zoom_override = None;
+                    *pan = Point { x: 0.0, y: 0.0 };
+                }
+            }
+            "=" | "+" if cmd && !self.is_capture() => {
+                let (fit, _) = self.fit_zoom(window);
+                let max_z = Viewport::native(window.scale_factor()).zoom * 4.0;
+                if let Surface::Editor { zoom_override, .. } = &mut self.surface {
+                    *zoom_override = Some((zoom_override.unwrap_or(fit) * 1.18).min(max_z));
+                }
+            }
+            "-" if cmd && !self.is_capture() => {
+                let (fit, _) = self.fit_zoom(window);
+                if let Surface::Editor { zoom_override, .. } = &mut self.surface {
+                    *zoom_override = Some((zoom_override.unwrap_or(fit) / 1.18).max(0.05));
+                }
+            }
+            "c" if cmd && !editing => {
+                if self.is_capture() {
+                    return self.finish(Finish::Copy, window, cx);
+                }
+                if let Some(image) = self.editor.export() {
+                    output::copy_to_clipboard(image, cx);
+                    self.show_toast(Toast::new(toast::Kind::Done, "Copied image to clipboard"), window, cx);
+                }
+            }
             "s" if cmd => return self.finish(Finish::Save, window, cx),
-            // Unhandled keys propagate, so typed characters reach the text input handler.
             _ => return,
         }
         cx.stop_propagation();
         cx.notify();
     }
 
-    fn scene(&self, entity: Entity<Self>, window: &Window) -> Scene {
+    fn layer_ops(&self) -> Option<(bool, bool)> {
+        if self.is_capture() {
+            None
+        } else {
+            self.editor.can_reorder_selected()
+        }
+    }
+
+    fn style_panel_size(&self) -> Option<(f32, f32)> {
+        let layer_ops = self.layer_ops();
+        if let Some((tool, _)) = self.editor.current_style() {
+            Some(toolbar::style_bar_size_ex(tool, layer_ops.is_some()))
+        } else if !self.is_capture() && self.editor.selected_is_image() && layer_ops.is_some() {
+            Some(toolbar::image_bar_size())
+        } else {
+            None
+        }
+    }
+
+    fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
+        let style = self.style_panel_size();
+        let groups = self.toolbar_groups();
+        if self.is_capture() {
+            let sel = self.editor.selection().unwrap_or_default();
+            let screen = self.viewport.to_window_rect(self.editor.screen());
+            let layout = place_panels(
+                self.viewport.to_window_rect(sel),
+                screen,
+                toolbar::panel_size(groups, 0.0),
+                style,
+                PANEL_GAP,
+            );
+            let at = |r: PxRect| Point { x: r.x, y: r.y };
+            (at(layout.toolbar), layout.style_bar.map(at))
+        } else {
+            let (tw, th) = toolbar::panel_size(groups, 0.0);
+            let width = f32::from(window.viewport_size().width);
+            let toolbar = Point { x: DOC_INSET, y: DOC_INSET };
+            let style = style.map(|(sw, sh)| {
+                let beside = DOC_INSET + tw + PANEL_GAP;
+                if beside + sw + DOC_INSET <= width {
+                    Point { x: beside, y: DOC_INSET + (th - sh) / 2.0 }
+                } else {
+                    Point { x: DOC_INSET, y: DOC_INSET + th + PANEL_GAP }
+                }
+            });
+            (toolbar, style)
+        }
+    }
+
+    fn scene(&self, entity: Entity<Self>, bands: Vec<SceneBand>, window: &Window) -> Scene {
         let e = &self.editor;
         let v = &self.viewport;
         let window_bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-        let (dim, selection_frame, backdrop) = match self.surface {
-            Surface::Capture { .. } => {
+        let (dim, selection_frame, backdrop, canvas_surface, canvas_handles, capture_tiles) = match &self.surface {
+            Surface::Capture { screenshot, .. } => {
                 let active = e.active_rect().map(|r| v.to_window(r));
                 let handles = match e.selection() {
                     Some(sel) if e.selection_mode() == SelectionMode::Pick => bluesnap_core::geom::Handle::ALL
@@ -785,25 +1100,25 @@ impl EditorView {
                         .collect(),
                     _ => Vec::new(),
                 };
-                (Some(active), active.map(|a| (a, handles)), None)
+                (Some(active), active.map(|a| (a, handles)), None, None, Vec::new(), screenshot.visible(v, window_bounds))
             }
-            Surface::Document => (None, None, Some(rgb(0xE9EAEE).into())),
+            Surface::Editor { .. } => {
+                let canvas_bg = e.background_color().map(hsla).unwrap_or_else(white);
+                let handles = e.canvas_handles().into_iter().map(|p| v.point_to_window(p)).collect();
+                (None, None, Some(rgb(0xE5E7EB).into()), Some(canvas_bg), handles, Vec::new())
+            }
         };
-        let top_bar = match self.surface {
-            Surface::Capture { .. } => None,
-            Surface::Document => Some(px(self.top_bar)),
-        };
+        let top_bar = (!self.is_capture()).then_some(px(self.top_bar));
         Scene {
             entity,
             focus: self.focus.clone(),
             backdrop,
+            canvas_surface,
             top_bar,
-            image_bounds: v.to_window(e.screen()),
-            tiles: self.image.visible(v, window_bounds),
-            layers: [&self.static_layer, &self.active_layer]
-                .into_iter()
-                .filter_map(|l| l.image().map(|(r, img)| (v.to_window(*r), img.clone())))
-                .collect(),
+            canvas_bounds: v.to_window(e.active_canvas_rect()),
+            canvas_handles,
+            capture_tiles,
+            bands,
             clip: e.selection().map(|r| v.to_window(r)),
             dim,
             selection_frame,
@@ -832,49 +1147,14 @@ impl EditorView {
             editing_text: e.is_editing_text(),
         }
     }
-
-    /// Where the toolbar and style bar go, in window coordinates.
-    fn panel_positions(&self, window: &Window) -> (Point<f32>, Option<Point<f32>>) {
-        let style = self.editor.current_style().map(|(tool, _)| toolbar::style_bar_size(tool));
-        match self.surface {
-            Surface::Capture { .. } => {
-                let sel = self.editor.selection().unwrap_or_default();
-                let screen = self.viewport.to_window_rect(self.editor.screen());
-                let layout = place_panels(
-                    self.viewport.to_window_rect(sel),
-                    screen,
-                    toolbar::panel_size(toolbar::CAPTURE_TOOLBAR, 0.0),
-                    style,
-                    PANEL_GAP,
-                );
-                let at = |r: PxRect| Point { x: r.x, y: r.y };
-                (at(layout.toolbar), layout.style_bar.map(at))
-            }
-            Surface::Document => {
-                // Top-left, with the style bar beside the toolbar, or below if narrow.
-                let (tw, th) = toolbar::panel_size(toolbar::DOCUMENT_TOOLBAR, 0.0);
-                let width = f32::from(window.viewport_size().width);
-                let toolbar = Point { x: DOC_INSET, y: DOC_INSET };
-                let style = style.map(|(sw, sh)| {
-                    let beside = DOC_INSET + tw + PANEL_GAP;
-                    if beside + sw + DOC_INSET <= width {
-                        Point { x: beside, y: DOC_INSET + (th - sh) / 2.0 }
-                    } else {
-                        Point { x: DOC_INSET, y: DOC_INSET + th + PANEL_GAP }
-                    }
-                });
-                (toolbar, style)
-            }
-        }
-    }
 }
 
-impl Render for EditorView {
+impl Render for CanvasView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.layout(window);
-        self.sync_layers(window);
+        let bands = self.sync_gpu_resources(window);
 
-        let scene = self.scene(cx.entity(), window);
+        let scene = self.scene(cx.entity(), bands, window);
         let mut root = div()
             .size_full()
             .relative()
@@ -896,38 +1176,43 @@ impl Render for EditorView {
                 .size_full(),
             );
 
-        if let Surface::Capture { permission_url, .. } = self.surface {
-            if let Some(active) = self.editor.active_rect() {
-                let label = format!("{} × {}", active.w.round() as i32, active.h.round() as i32);
-                let screen = self.viewport.to_window_rect(self.editor.screen());
-                let at = place_size_label(self.viewport.to_window_rect(active), screen, (90.0, 20.0), 6.0);
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(at.x))
-                        .top(px(at.y))
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(4.0))
-                        .bg(rgba(0x0000_00B3))
-                        .text_color(white())
-                        .text_size(px(12.0))
-                        .child(label),
-                );
-            }
-            if let Some(url) = permission_url {
-                root = root.child(permission_banner(url, cx));
-            }
+        // Size badge: shown on Capture selection, or while resizing the Editor canvas.
+        let show_size_badge = self.is_capture() || self.editor.is_resizing_canvas();
+        if show_size_badge
+            && let Some(active) = self.editor.active_rect()
+        {
+            let label = format!("{} × {}", active.w.round() as i32, active.h.round() as i32);
+            let win_size = window.viewport_size();
+            let bounds_rect = PxRect::new(0.0, self.top_bar, f32::from(win_size.width), (f32::from(win_size.height) - self.top_bar).max(40.0));
+            let at = place_size_label(self.viewport.to_window_rect(active), bounds_rect, (96.0, 20.0), 8.0);
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(px(at.x))
+                    .top(px(at.y))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x0000_00BF))
+                    .text_color(white())
+                    .text_size(px(12.0))
+                    .child(label),
+            );
         }
 
-        if let Some((cursor, pixel)) = self.loupe_target(window) {
-            let (doc, selection) = (self.editor.document(), self.editor.active_rect());
+        if let Surface::Capture { permission_url: Some(url), .. } = self.surface {
+            root = root.child(permission_banner(url, cx));
+        }
+
+        if let Some((cursor, pixel)) = self.loupe_target(window)
+            && let Some(doc) = self.editor.capture_document()
+        {
+            let selection = self.editor.active_rect();
             let loupe = self.loupe.element(doc, pixel, cursor, selection, window.viewport_size(), window);
             root = root.child(loupe);
         }
 
         if let Some(toast) = &self.toast {
-            // At the top of the visible selection (the document window: under its toolbar).
             let win = window.viewport_size();
             let full = Bounds::new(point(px(0.), px(0.)), win);
             let (center_x, top) = match (&self.surface, self.editor.selection()) {
@@ -936,11 +1221,9 @@ impl Render for EditorView {
                     (f32::from(b.center().x), f32::from(b.origin.y) + 12.0)
                 }
                 _ => {
-                    // Under the toolbar and the style bar, which wraps below
-                    // it in a narrow window.
                     let (_, style_at) = self.panel_positions(window);
-                    let style_bottom = match (style_at, self.editor.current_style()) {
-                        (Some(at), Some((tool, _))) => at.y + toolbar::style_bar_size(tool).1,
+                    let style_bottom = match (style_at, self.style_panel_size()) {
+                        (Some(at), Some((_, sh))) => at.y + sh,
                         _ => 0.0,
                     };
                     (f32::from(win.width) / 2.0, self.top_bar.max(style_bottom) + 8.0)
@@ -967,16 +1250,15 @@ impl Render for EditorView {
             self.report_layout(window);
         }
         if self.editor.toolbar_visible() {
-            let groups = match self.surface {
-                Surface::Capture { .. } => toolbar::CAPTURE_TOOLBAR,
-                Surface::Document => toolbar::DOCUMENT_TOOLBAR,
-            };
+            let groups = self.toolbar_groups();
+            let done_adds_to_editor = self.capture_mode() == Some(CaptureMode::ForEditor);
             let (at, style_at) = self.panel_positions(window);
             let auto = self.auto_state();
-            root = root.child(toolbar::toolbar(self, groups, at.x, at.y, cx));
+            let layer_ops = self.layer_ops();
+            root = root.child(toolbar::toolbar(self, groups, done_adds_to_editor, at.x, at.y, cx));
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
                 root = root.child(match self.editor.current_redaction() {
-                    Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, at.x, at.y, cx),
+                    Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, layer_ops, at.x, at.y, cx),
                     None => {
                         let extra = if let Some(numbering) = self.editor.current_counter_format() {
                             toolbar::Extra::Numbering(numbering)
@@ -987,7 +1269,7 @@ impl Render for EditorView {
                         } else {
                             toolbar::Extra::None
                         };
-                        toolbar::style_bar(tool, style.size, style.color, extra, at.x, at.y, cx)
+                        toolbar::style_bar(tool, style, extra, layer_ops, at.x, at.y, cx)
                     }
                 });
                 if let Some(current) = self.editor.current_text_style().filter(|_| self.text_menu) {
@@ -996,6 +1278,9 @@ impl Render for EditorView {
                 } else {
                     self.text_menu = false;
                 }
+            } else if let (true, Some(ops), Some(at)) = (self.editor.selected_is_image(), layer_ops, style_at) {
+                self.text_menu = false;
+                root = root.child(toolbar::image_bar(ops, at.x, at.y, cx));
             } else {
                 self.text_menu = false;
             }
@@ -1004,27 +1289,26 @@ impl Render for EditorView {
     }
 }
 
-/// Everything the canvas paints, captured in window coordinates.
+enum SceneBand {
+    Image(Vec<(Bounds<Pixels>, Arc<RenderImage>)>),
+    Layer(Bounds<Pixels>, Arc<RenderImage>),
+}
+
 struct Scene {
-    entity: Entity<EditorView>,
+    entity: Entity<CanvasView>,
     focus: FocusHandle,
-    /// Document surface: color behind the image.
     backdrop: Option<Hsla>,
-    /// Document surface: the toolbar area, covered so scrolled content doesn't
-    /// show around the toolbars.
+    canvas_surface: Option<Hsla>,
     top_bar: Option<Pixels>,
-    image_bounds: Bounds<Pixels>,
-    tiles: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
-    /// Annotation layers, bottom to top, and the selection they are clipped to.
-    layers: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
+    canvas_bounds: Bounds<Pixels>,
+    canvas_handles: Vec<Point<Pixels>>,
+    capture_tiles: Vec<(Bounds<Pixels>, Arc<RenderImage>)>,
+    bands: Vec<SceneBand>,
     clip: Option<Bounds<Pixels>>,
-    /// Capture surface: dim everything outside this (or everything, if `None`).
     dim: Option<Option<Bounds<Pixels>>>,
-    /// Capture surface: the highlighted region's border and its resize handles.
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
-    /// A brush's outline at the pointer: center, half size, corner radius.
     brush_ring: Option<(Point<Pixels>, gpui::Size<Pixels>, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
     cursor: CursorStyle,
@@ -1036,12 +1320,17 @@ impl Scene {
         let blue = hsla(THEME_BLUE);
         if let Some(backdrop) = self.backdrop {
             window.paint_quad(fill(bounds, backdrop));
-            let frame = self.image_bounds.dilate(px(1.));
-            window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), rgba(0x0000_0026), BorderStyle::Solid));
+            if let Some(surface) = self.canvas_surface {
+                window.paint_quad(fill(self.canvas_bounds, surface));
+            }
+            let frame = self.canvas_bounds.dilate(px(1.));
+            window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), rgba(0x0000_0029), BorderStyle::Solid));
         }
-        paint_tiles(self.tiles, window);
 
-        // Dim everything outside the highlighted region.
+        if !self.capture_tiles.is_empty() {
+            paint_tiles(self.capture_tiles, window);
+        }
+
         let dim = rgba(0x0000_0073);
         match self.dim {
             Some(Some(a)) => {
@@ -1059,22 +1348,30 @@ impl Scene {
 
         if let Some(clip) = self.clip {
             window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
-                for (b, image) in self.layers {
-                    window.paint_image(b, Corners::default(), image, 0, false).ok();
+                for band in self.bands {
+                    match band {
+                        SceneBand::Image(tiles) => paint_tiles(tiles, window),
+                        SceneBand::Layer(b, image) => {
+                            window.paint_image(b, Corners::default(), image, 0, false).ok();
+                        }
+                    }
                 }
             });
         }
 
-        // Over the canvas only, not over the panels.
+        // Outer canvas resize handles in the Composition Editor.
+        for p in &self.canvas_handles {
+            let b = Bounds::centered_at(*p, size(px(8.), px(8.)));
+            window.paint_quad(quad(b, px(2.), white(), px(1.5), rgba(0x6474_8BCC), BorderStyle::Solid));
+        }
+
         if let Some((center, half, corner)) = self.brush_ring.filter(|_| hitbox.is_hovered(window)) {
             let ring = Bounds::centered_at(center, size(half.width * 2., half.height * 2.));
-            // A white ring between two dark ones shows on any background.
             window.paint_quad(quad(ring.dilate(px(1.)), corner + px(1.), transparent_black(), px(3.5), rgba(0x0000_0059), BorderStyle::Solid));
             window.paint_quad(quad(ring, corner, transparent_black(), px(1.5), white(), BorderStyle::Solid));
         }
 
         if let Some((region, handles)) = &self.selection_frame {
-            // Outside the region, so the border never covers captured pixels.
             let border = region.dilate(px(BORDER));
             window.paint_quad(quad(border, px(0.), transparent_black(), px(BORDER), blue, BorderStyle::Solid));
             for p in handles {
@@ -1085,10 +1382,10 @@ impl Scene {
         }
 
         if let Some((frame, handles)) = &self.shape_frame {
-            window.paint_quad(quad(*frame, px(0.), transparent_black(), px(1.), blue, BorderStyle::Dashed));
+            window.paint_quad(quad(*frame, px(0.), transparent_black(), px(1.5), blue, BorderStyle::Dashed));
             for p in handles {
                 let b = Bounds::centered_at(*p, size(px(7.), px(7.)));
-                window.paint_quad(quad(b, px(1.), white(), px(1.), blue, BorderStyle::Solid));
+                window.paint_quad(quad(b, px(1.), white(), px(1.5), blue, BorderStyle::Solid));
             }
         }
         if let Some(frame) = self.text_frame {
@@ -1107,8 +1404,6 @@ impl Scene {
             window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.entity.clone()), cx);
         }
 
-        // Presses and wheel only count on the canvas (panels above it occlude it);
-        // moves and releases are tracked everywhere so drags keep working over the panels.
         let entity = self.entity.clone();
         let pressed = hitbox.clone();
         window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
@@ -1137,12 +1432,7 @@ impl Scene {
     }
 }
 
-// ----- IME / text input ----------------------------------------------------
-//
-// gpui speaks UTF-16 offsets (the platform IME convention); the editor uses
-// UTF-8 byte offsets into the text being edited.
-
-impl EntityInputHandler for EditorView {
+impl EntityInputHandler for CanvasView {
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -1220,14 +1510,12 @@ mod tests {
     #[test]
     fn utf16_offsets_round_trip() {
         let s = "a你😀b";
-        // a=1 unit, 你=1 unit, 😀=2 units, b=1 unit
         assert_eq!(utf16_to_byte(s, 0), 0);
         assert_eq!(utf16_to_byte(s, 2), 4);
         assert_eq!(utf16_to_byte(s, 4), 8);
         assert_eq!(utf16_to_byte(s, 99), s.len());
         assert_eq!(byte_to_utf16(s, 8), 4);
         assert_eq!(range_to_utf16(s, &(1..8)), 1..4);
-        // Reversed UTF-16 ranges normalize without panicking.
         #[allow(clippy::reversed_empty_ranges)]
         let reversed = 4..1;
         assert_eq!(range_from_utf16(s, &reversed), 1..8);

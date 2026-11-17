@@ -5,11 +5,11 @@
 
 mod ai_settings;
 mod assets;
+mod canvas_view;
 mod capture;
 mod config;
 mod demo;
-mod document;
-mod editor_view;
+mod editor_window;
 mod gpu_image;
 mod loupe;
 mod output;
@@ -19,6 +19,7 @@ mod toast;
 mod toolbar;
 mod viewport;
 
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +46,10 @@ pub struct AppState {
     pub(crate) fonts: Arc<Fonts>,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
+    /// The open multi-image Composition Editor window, if any.
+    pub(crate) editor: Option<gpui::WindowHandle<canvas_view::CanvasView>>,
+    /// True while the Editor window is temporarily hidden during an `"Add image"` capture.
+    pub(crate) editor_hidden: bool,
     /// The running scrolling capture, if any.
     pub scrolling: Option<gpui::WeakEntity<scrolling::ScrollingCapture>>,
     /// The 3-second launch corner toast, if still visible.
@@ -66,8 +71,18 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     record_panics();
     let config = Config::load();
+    let cli_files: Vec<PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|p| p.exists() || !p.as_os_str().to_string_lossy().starts_with('-'))
+        .collect();
+    let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
 
-    Application::new().with_assets(assets::Assets).run(move |cx: &mut App| {
+    let app = Application::new().with_assets(assets::Assets);
+    app.on_open_urls(move |urls| {
+        url_tx.unbounded_send(urls).ok();
+    });
+    app.run(move |cx: &mut App| {
         let platform = bluesnap_platform::native();
         if let Err(e) = platform.init() {
             log::error!("platform setup failed: {e:#}");
@@ -108,16 +123,75 @@ fn main() {
             ai_window: None,
             fonts,
             overlay: None,
+            editor: None,
+            editor_hidden: false,
             scrolling: None,
             startup_toast: None,
             hotkeys,
             tray,
         });
-        if tray_ready && !demo::enabled() {
+
+        let mut opened_initial_file = false;
+        for path in &cli_files {
+            opened_initial_file = true;
+            if let Err(e) = editor_window::open_file(path, cx) {
+                show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
+            }
+        }
+        cx.spawn(async move |cx| {
+            while let Some(urls) = url_rx.next().await {
+                cx.update(|cx| {
+                    for url in urls {
+                        if let Some(path) = url_to_path(&url)
+                            && let Err(e) = editor_window::open_file(&path, cx)
+                        {
+                            show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
+                        }
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        if tray_ready && !demo::enabled() && !opened_initial_file {
             toast::show_startup(startup_hotkey.as_deref(), cx);
         }
         start_demo_capture(cx);
     });
+}
+
+fn url_to_path(url: &str) -> Option<PathBuf> {
+    if let Some(rest) = url.strip_prefix("file://") {
+        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+        // On Windows, `file:///C:/foo.bs` leaves `/C:/foo.bs`.
+        let rest = if cfg!(windows) && rest.starts_with('/') && rest.as_bytes().get(2) == Some(&b':') {
+            &rest[1..]
+        } else {
+            rest
+        };
+        let mut bytes = Vec::with_capacity(rest.len());
+        let raw = rest.as_bytes();
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%'
+                && i + 2 < raw.len()
+                && let Ok(hex) = std::str::from_utf8(&raw[i + 1..i + 3])
+                && let Ok(b) = u8::from_str_radix(hex, 16)
+            {
+                bytes.push(b);
+                i += 3;
+                continue;
+            }
+            bytes.push(raw[i]);
+            i += 1;
+        }
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    } else if !url.contains("://") {
+        Some(PathBuf::from(url))
+    } else {
+        None
+    }
 }
 
 /// Demo mode (Linux, see the platform crate): `BLUESNAP_DEMO_CAPTURE_AFTER_MS`
@@ -246,6 +320,12 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                     cx.background_executor().timer(Duration::from_millis(200)).await;
                     cx.update(capture::start_capture).ok();
                 }
+                TrayCommand::OpenEditor => {
+                    cx.update(editor_window::open_or_focus).ok();
+                }
+                TrayCommand::OpenBsFile => {
+                    cx.update(|cx| editor_window::prompt_open_file(true, cx)).ok();
+                }
                 TrayCommand::EditSettings => {
                     cx.update(|cx| match Config::path() {
                         // `Config::load` created the file on startup.
@@ -280,7 +360,7 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
 }
 
 /// Explains a problem the user has to fix (e.g. a hotkey another app owns).
-fn show_error(message: String, cx: &mut App) {
+pub(crate) fn show_error(message: String, cx: &mut App) {
     log::error!("{message}");
     struct ErrorView(String);
     impl Render for ErrorView {
@@ -302,5 +382,20 @@ fn show_error(message: String, cx: &mut App) {
     };
     if let Err(e) = cx.open_window(options, |_, cx| cx.new(|_| ErrorView(message))) {
         log::error!("could not show error window: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::url_to_path;
+
+    #[test]
+    fn url_to_path_decodes_file_urls_and_plain_paths() {
+        assert_eq!(url_to_path("file:///tmp/My%20Shot.bs"), Some(PathBuf::from("/tmp/My Shot.bs")));
+        assert_eq!(url_to_path("file://localhost/tmp/test.bs"), Some(PathBuf::from("/tmp/test.bs")));
+        assert_eq!(url_to_path("/var/tmp/plain.bs"), Some(PathBuf::from("/var/tmp/plain.bs")));
+        assert_eq!(url_to_path("https://example.com/a.bs"), None);
     }
 }

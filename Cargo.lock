@@ -843,6 +843,7 @@ dependencies = [
  "ab_glyph",
  "criterion",
  "memmap2",
+ "png 0.18.1",
  "tiny-skia 0.12.0",
 ]
 

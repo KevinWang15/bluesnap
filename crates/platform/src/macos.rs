@@ -8,8 +8,11 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use objc2::rc::Retained;
-use objc2::{AllocAnyThread, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen, NSView, NSWindowStyleMask};
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel, NSScreen,
+    NSView, NSWindowStyleMask,
+};
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreateImage, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
@@ -17,13 +20,13 @@ use objc2_core_graphics::{
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
     kCGWindowLayer, kCGWindowOwnerPID,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSString};
+use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
-    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand,
-    WindowRef,
+    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat, TextLine, Tray,
+    TrayCommand, WindowRef,
 };
 
 pub struct Native;
@@ -178,6 +181,75 @@ impl Platform for Native {
         ns_window.setFrame_display(frame, true);
         ns_window.orderFrontRegardless();
         Ok(())
+    }
+
+    fn set_window_visible(&self, window: WindowRef, visible: bool) -> anyhow::Result<()> {
+        let ns_window = raw_ns_window(window.0)?;
+        if visible {
+            ns_window.makeKeyAndOrderFront(None);
+        } else {
+            ns_window.orderOut(None);
+        }
+        Ok(())
+    }
+
+    fn save_dialog(
+        &self,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> anyhow::Result<Option<Option<(PathBuf, SaveFormat)>>> {
+        let mtm = MainThreadMarker::new().context("save_dialog must run on the main thread")?;
+        let panel = NSSavePanel::savePanel(mtm);
+        if let Some(dir_str) = dir.to_str() {
+            let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(dir_str), true);
+            panel.setDirectoryURL(Some(&url));
+        }
+        panel.setNameFieldStringValue(&NSString::from_str(&format!("{stem}.png")));
+
+        let popup = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: 260.0, height: 28.0 } },
+            false,
+        );
+        popup.addItemWithTitle(&NSString::from_str("PNG Image (.png)"));
+        popup.addItemWithTitle(&NSString::from_str("BlueSnap Editable (.bs)"));
+        panel.setAccessoryView(Some(&popup));
+
+        if panel.runModal() != NSModalResponseOK {
+            return Ok(Some(None));
+        }
+        let Some(url) = panel.URL() else { return Ok(Some(None)) };
+        let Some(ns_path) = url.path() else { return Ok(Some(None)) };
+        let raw_path = PathBuf::from(ns_path.to_string());
+        let format = match SaveFormat::from_path(&raw_path) {
+            Some(SaveFormat::Bs) => SaveFormat::Bs,
+            _ if popup.indexOfSelectedItem() == 1 => SaveFormat::Bs,
+            _ => SaveFormat::Png,
+        };
+        let final_path = if SaveFormat::from_path(&raw_path) == Some(format) {
+            raw_path
+        } else {
+            raw_path.with_extension(format.extension())
+        };
+        Ok(Some(Some((final_path, format))))
+    }
+
+    fn open_dialog(&self, dir: &std::path::Path, _bs_only: bool) -> anyhow::Result<Option<Option<PathBuf>>> {
+        let mtm = MainThreadMarker::new().context("open_dialog must run on the main thread")?;
+        let panel = NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(false);
+        panel.setAllowsMultipleSelection(false);
+        if let Some(dir_str) = dir.to_str() {
+            let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(dir_str), true);
+            panel.setDirectoryURL(Some(&url));
+        }
+        if panel.runModal() != NSModalResponseOK {
+            return Ok(Some(None));
+        }
+        let Some(url) = panel.URLs().firstObject() else { return Ok(Some(None)) };
+        let Some(ns_path) = url.path() else { return Ok(Some(None)) };
+        Ok(Some(Some(PathBuf::from(ns_path.to_string()))))
     }
 
     fn escape_pressed(&self) -> bool {
