@@ -21,12 +21,12 @@ use objc2_core_graphics::{
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
     kCGWindowLayer, kCGWindowOwnerPID,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSProcessInfo, NSString, NSURL};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
-    AppRole, Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
+    AppRole, Capture, CapturedWindow, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
     TextLine, Tray, TrayCommand, WindowRef,
 };
 
@@ -663,12 +663,25 @@ fn is_pickable_window_layer(layer: i32) -> bool {
     (0..20).contains(&layer)
 }
 
-/// On-screen windows of other apps in front-to-back order, relative to `display`
-/// and converted from points to image pixels.
-fn visible_windows(display: &CGRect, scale: f64) -> Vec<PixelRect> {
+/// Corner radius in points macOS draws on standard windows, or `None` where
+/// it isn't known: rounded since macOS 11 (10 pt through macOS 15); macOS 26
+/// varies it per window style, so those windows are treated as square.
+fn window_corner_radius_points() -> Option<f64> {
+    static RADIUS: OnceLock<Option<f64>> = OnceLock::new();
+    *RADIUS.get_or_init(|| {
+        let major = NSProcessInfo::processInfo().operatingSystemVersion().majorVersion;
+        (11..=15).contains(&major).then_some(10.0)
+    })
+}
+
+/// On-screen windows of other apps in front-to-back order, relative to
+/// `display` and converted from points to image pixels. Bounds aren't clipped
+/// to the display, so only on-screen corners get rounded.
+fn visible_windows(display: &CGRect, scale: f64) -> Vec<CapturedWindow> {
     let options = CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
     let Some(list) = CGWindowListCopyWindowInfo(options, 0) else { return Vec::new() };
     let own_pid = std::process::id() as i32;
+    let radius = window_corner_radius_points();
 
     let mut out = Vec::new();
     for i in 0..list.count() {
@@ -696,17 +709,25 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<PixelRect> {
         if !ok {
             continue;
         }
-        let l = r.origin.x.max(display.origin.x);
-        let t = r.origin.y.max(display.origin.y);
-        let rr = (r.origin.x + r.size.width).min(display.origin.x + display.size.width);
-        let b = (r.origin.y + r.size.height).min(display.origin.y + display.size.height);
-        if rr - l < 2.0 || b - t < 2.0 {
+        let (right, bottom) = (r.origin.x + r.size.width, r.origin.y + r.size.height);
+        let visible_w = right.min(display.origin.x + display.size.width) - r.origin.x.max(display.origin.x);
+        let visible_h = bottom.min(display.origin.y + display.size.height) - r.origin.y.max(display.origin.y);
+        if visible_w < 2.0 || visible_h < 2.0 {
             continue;
         }
         let px = |v: f64| (v * scale).round() as i32;
-        let (x0, y0) = (px(l - display.origin.x), px(t - display.origin.y));
-        let (x1, y1) = (px(rr - display.origin.x), px(b - display.origin.y));
-        out.push(PixelRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+        let (x0, y0) = (px(r.origin.x - display.origin.x), px(r.origin.y - display.origin.y));
+        let (x1, y1) = (px(right - display.origin.x), px(bottom - display.origin.y));
+        // Full-screen windows (and ones covering the whole display) are square.
+        let covers_display = r.origin.x <= display.origin.x
+            && r.origin.y <= display.origin.y
+            && right >= display.origin.x + display.size.width
+            && bottom >= display.origin.y + display.size.height;
+        let corner_radius = match radius {
+            Some(points) if layer == 0 && !covers_display => (points * scale) as f32,
+            _ => 0.0,
+        };
+        out.push(CapturedWindow { bounds: PixelRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, corner_radius });
     }
     out
 }

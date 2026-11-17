@@ -16,7 +16,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmGetWindowAttribute,
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS,
+    DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DEFAULT, DWMWCP_DONOTROUND, DWMWCP_ROUND, DWMWCP_ROUNDSMALL, DwmFlush, DwmGetWindowAttribute,
     DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
@@ -26,7 +28,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     ROP_CODE, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+    RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Controls::Dialogs::{
@@ -39,17 +42,17 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_WNDPROC,
+    CallWindowProcW, CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWL_STYLE, GWLP_HWNDPARENT, GWLP_WNDPROC,
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCURSOR, HTCLIENT,
     HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENWSE, IDC_SIZENS, IDC_SIZEWE,
-    IsIconic, IsWindowVisible, LoadCursorW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED,
+    IsIconic, IsWindowVisible, IsZoomed, LoadCursorW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, WM_NCDESTROY, WM_SETCURSOR, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_CAPTION, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
 };
 
 use crate::{
-    AppRole, Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
+    AppRole, Capture, CapturedWindow, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
     TextLine, Tray, TrayCommand, WindowRef,
 };
 
@@ -623,15 +626,15 @@ impl Platform for Native {
     }
 }
 
-/// Reads a `REG_SZ` string value under `HKEY_CURRENT_USER\subkey`.
-fn reg_get_sz(subkey: &str, name: Option<&str>) -> Option<String> {
+/// Reads a `REG_SZ` string value under `root\subkey`.
+fn reg_get_sz(root: HKEY, subkey: &str, name: Option<&str>) -> Option<String> {
     let key = wide(subkey);
     let name_w = name.map(wide);
     let name_ptr = name_w.as_ref().map_or(null(), |v| v.as_ptr());
     let mut byte_len: u32 = 0;
     let status = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             key.as_ptr(),
             name_ptr,
             RRF_RT_REG_SZ,
@@ -647,7 +650,7 @@ fn reg_get_sz(subkey: &str, name: Option<&str>) -> Option<String> {
     let mut actual = std::mem::size_of_val(buf.as_slice()) as u32;
     let status = unsafe {
         RegGetValueW(
-            HKEY_CURRENT_USER,
+            root,
             key.as_ptr(),
             name_ptr,
             RRF_RT_REG_SZ,
@@ -699,13 +702,13 @@ fn register_bs_file_association(overwrite_existing: bool) -> anyhow::Result<()> 
     open_cmd_w.extend("\" \"%1\"\0".encode_utf16());
     let expected_cmd = String::from_utf16_lossy(&open_cmd_w[..open_cmd_w.len() - 1]);
 
-    let existing_cmd = reg_get_sz(BS_CMD_KEY, None);
+    let existing_cmd = reg_get_sz(HKEY_CURRENT_USER, BS_CMD_KEY, None);
     if !overwrite_existing && existing_cmd.as_deref().is_some_and(|s| !s.is_empty()) {
         return Ok(());
     }
 
-    let existing_ext = reg_get_sz(BS_EXT_KEY, None);
-    let open_with_registered = reg_get_sz(BS_OPEN_WITH_KEY, Some(BS_PROGID)).is_some();
+    let existing_ext = reg_get_sz(HKEY_CURRENT_USER, BS_EXT_KEY, None);
+    let open_with_registered = reg_get_sz(HKEY_CURRENT_USER, BS_OPEN_WITH_KEY, Some(BS_PROGID)).is_some();
     let ext_ready = existing_ext.as_deref().is_some_and(|s| !s.is_empty());
     if existing_cmd.as_deref() == Some(expected_cmd.as_str()) && ext_ready && open_with_registered {
         return Ok(());
@@ -765,7 +768,7 @@ fn capture_under_cursor() -> anyhow::Result<Capture> {
 
     let image = capture_rect(&rc, SRCCOPY | CAPTUREBLT)?;
     let captured = started.elapsed();
-    let windows = visible_windows(&rc);
+    let windows = visible_windows(&rc, &info.rcWork, display.scale_factor);
     log::debug!(
         "captured {}x{} in {:?}, {} windows in {:?}",
         image.width,
@@ -845,9 +848,10 @@ fn capture_rect(rc: &RECT, rop: ROP_CODE) -> anyhow::Result<Image> {
     }
 }
 
-/// Visible, non-minimized, non-cloaked top-level windows of other processes,
-/// in Z order (topmost first), relative to `monitor`.
-fn visible_windows(monitor: &RECT) -> Vec<PixelRect> {
+/// Visible, non-minimized, non-cloaked top-level windows of other processes
+/// that show on `monitor`, in Z order (topmost first). Bounds are relative to
+/// `monitor` but not clipped to it, so only on-screen corners get rounded.
+fn visible_windows(monitor: &RECT, work: &RECT, scale: f32) -> Vec<CapturedWindow> {
     unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
         unsafe { (*(data as *mut Vec<HWND>)).push(hwnd) };
         TRUE
@@ -865,20 +869,105 @@ fn visible_windows(monitor: &RECT) -> Vec<PixelRect> {
             pid != own_pid
         })
         .filter(|&hwnd| !is_cloaked(hwnd))
-        .filter_map(frame_bounds)
-        .filter_map(|r| {
-            let l = r.left.max(monitor.left);
-            let t = r.top.max(monitor.top);
-            let rr = r.right.min(monitor.right);
-            let b = r.bottom.min(monitor.bottom);
-            (rr - l > 1 && b - t > 1).then(|| PixelRect {
-                x: l - monitor.left,
-                y: t - monitor.top,
-                width: rr - l,
-                height: b - t,
-            })
+        .filter_map(|hwnd| Some((hwnd, frame_bounds(hwnd)?)))
+        .filter(|(_, r)| r.right.min(monitor.right) - r.left.max(monitor.left) > 1 && r.bottom.min(monitor.bottom) - r.top.max(monitor.top) > 1)
+        .map(|(hwnd, frame)| {
+            let radius = corner_radius(hwnd, &frame, monitor, work, scale);
+            // DWM draws a 1 px translucent border around rounded windows, mostly
+            // showing what's behind; leave it out so only the window's own
+            // pixels are captured.
+            let border = if radius > 0.0 { visible_border(hwnd) } else { 0 };
+            let r = RECT {
+                left: frame.left + border,
+                top: frame.top + border,
+                right: frame.right - border,
+                bottom: frame.bottom - border,
+            };
+            CapturedWindow {
+                bounds: PixelRect {
+                    x: r.left - monitor.left,
+                    y: r.top - monitor.top,
+                    width: (r.right - r.left).max(1),
+                    height: (r.bottom - r.top).max(1),
+                },
+                corner_radius: (radius - border as f32).max(0.0),
+            }
         })
         .collect()
+}
+
+/// Thickness in physical pixels of the border DWM draws around `hwnd` (Windows 11).
+fn visible_border(hwnd: HWND) -> i32 {
+    let mut thickness: u32 = 0;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_VISIBLE_FRAME_BORDER_THICKNESS as u32,
+            &mut thickness as *mut _ as *mut c_void,
+            size_of::<u32>() as u32,
+        )
+    };
+    if hr == 0 { thickness.min(4) as i32 } else { 0 }
+}
+
+/// Whether this is Windows 11 or later (build 22000+), whose DWM rounds window
+/// corners. Read from the registry: `GetVersionEx` reports Windows 8 to
+/// executables without a compatibility manifest.
+fn is_windows_11() -> bool {
+    static IS_11: OnceLock<bool> = OnceLock::new();
+    *IS_11.get_or_init(|| {
+        reg_get_sz(HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", Some("CurrentBuildNumber"))
+            .and_then(|build| build.trim().parse::<u32>().ok())
+            .is_some_and(|build| build >= 22000)
+    })
+}
+
+/// Radius in physical pixels of the corners Windows 11's DWM rounds on `hwnd`
+/// whose visible frame is `frame`: 8 px at 100% scaling (4 px for "small"
+/// rounding), or 0 where corners are square: Windows 10, maximized, snapped and
+/// full-screen windows, windows that opted out, and frameless pop-ups.
+fn corner_radius(hwnd: HWND, frame: &RECT, monitor: &RECT, work: &RECT, scale: f32) -> f32 {
+    if !is_windows_11() || unsafe { IsZoomed(hwnd) } != FALSE {
+        return 0.0;
+    }
+    if is_snapped_or_filling(frame, monitor, work) {
+        return 0.0;
+    }
+    let mut preference = DWMWCP_DEFAULT;
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &mut preference as *mut _ as *mut c_void,
+            size_of::<i32>() as u32,
+        )
+    };
+    if hr != 0 {
+        preference = DWMWCP_DEFAULT;
+    }
+    let logical = match preference {
+        DWMWCP_DONOTROUND => 0.0,
+        DWMWCP_ROUNDSMALL => 4.0,
+        DWMWCP_ROUND => 8.0,
+        // The system's choice: rounded for windows with a frame or caption.
+        _ => {
+            let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+            if style & WS_THICKFRAME != 0 || style & WS_CAPTION == WS_CAPTION { 8.0 } else { 0.0 }
+        }
+    };
+    logical * scale
+}
+
+/// Windows 11 squares the corners of windows snapped to the side or a corner
+/// of the work area, and of windows filling the monitor or work area.
+fn is_snapped_or_filling(frame: &RECT, monitor: &RECT, work: &RECT) -> bool {
+    let near = |a: i32, b: i32| (a - b).abs() <= 1;
+    let fills = |area: &RECT| {
+        near(frame.left, area.left) && near(frame.top, area.top) && near(frame.right, area.right) && near(frame.bottom, area.bottom)
+    };
+    let touches_side = near(frame.left, work.left) || near(frame.right, work.right);
+    let touches_top_or_bottom = near(frame.top, work.top) || near(frame.bottom, work.bottom);
+    fills(monitor) || fills(work) || (touches_side && touches_top_or_bottom)
 }
 
 /// Windows on other virtual desktops and suspended UWP apps report as visible
@@ -906,4 +995,24 @@ fn frame_bounds(hwnd: HWND) -> Option<RECT> {
         return None;
     }
     (rect.right > rect.left && rect.bottom > rect.top).then_some(rect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapped_and_filling_windows_have_square_corners() {
+        let rect = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let monitor = rect(0, 0, 1920, 1080);
+        let work = rect(0, 0, 1920, 1032);
+        // Floating windows, even near an edge, keep their rounded corners.
+        assert!(!is_snapped_or_filling(&rect(100, 80, 900, 700), &monitor, &work));
+        assert!(!is_snapped_or_filling(&rect(0, 80, 900, 700), &monitor, &work));
+        // Snapped to a half or a quarter, maximized into the work area, or full screen.
+        assert!(is_snapped_or_filling(&rect(0, 0, 960, 1032), &monitor, &work));
+        assert!(is_snapped_or_filling(&rect(960, 516, 1920, 1032), &monitor, &work));
+        assert!(is_snapped_or_filling(&work, &monitor, &work));
+        assert!(is_snapped_or_filling(&monitor, &monitor, &work));
+    }
 }

@@ -125,7 +125,8 @@ impl Platform for Native {
     fn capture_display_under_cursor(&self) -> anyhow::Result<Capture> {
         let demo = demo()?;
         let image = crate::Image { width: demo.screen.width as u32, height: demo.screen.height as u32, bgrx: demo.pixels() };
-        Ok(Capture { display: demo.display(), image, windows: demo.windows.clone(), permission_missing: false })
+        let windows = demo.windows.iter().map(|&bounds| crate::CapturedWindow { bounds, corner_radius: 0.0 }).collect();
+        Ok(Capture { display: demo.display(), image, windows, permission_missing: false })
     }
 
     fn configure_overlay(&self, _window: &dyn HasWindowHandle, _display: &DisplayInfo) -> anyhow::Result<()> {

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bluesnap_core::shape::Shape;
-use bluesnap_core::{Document, Editor, Pixmap, Rect};
+use bluesnap_core::{Document, Editor, Pixmap, Rect, WindowOutline};
 use bluesnap_platform::{Native, Platform};
 use gpui::{App, AppContext, DisplayId, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions};
 
@@ -99,10 +99,13 @@ fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
     let screenshot = ImageTiles::from_bgra(width, height, bgra).context("bad capture buffer")?;
     stages.push(("gpu image", started.elapsed()));
     let scale = capture.display.scale_factor;
-    let windows = capture
+    let windows: Vec<WindowOutline> = capture
         .windows
         .iter()
-        .map(|w| Rect::new(w.x as f32, w.y as f32, w.width as f32, w.height as f32))
+        .map(|w| {
+            let b = w.bounds;
+            WindowOutline::new(Rect::new(b.x as f32, b.y as f32, b.width as f32, b.height as f32), w.corner_radius)
+        })
         .collect();
     let doc = Document::from_rgba(width, height, rgba).context("bad capture buffer")?;
     let fonts = cx.global::<AppState>().fonts.clone();

@@ -16,6 +16,7 @@ use crate::composition::{
     Composition, Element, LayerOrder, PlacedImage, renumber_counters_in, reorder_element,
 };
 use crate::geom::{CursorKind, Handle, Point, Rect, resize_rect_with_handle};
+use crate::outline::WindowOutline;
 use crate::pixels::crop;
 use crate::render::{self, CanvasBackdrop, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
@@ -117,10 +118,15 @@ struct Snapshot {
 enum Workspace {
     Capture {
         doc: Document,
-        /// Candidate window rectangles, topmost first.
-        windows: Vec<Rect>,
+        /// Candidate windows, topmost first: (bounds clipped to the screenshot, full outline).
+        windows: Vec<(Rect, WindowOutline)>,
         hover: Option<Rect>,
+        /// Outline of the window under the pointer, when `hover` is a window.
+        hover_window: Option<WindowOutline>,
         selection: Option<Rect>,
+        /// Set when `selection` came from a single click on a window and hasn't
+        /// been resized or moved since: output is clipped to its exact outline.
+        snapped: Option<WindowOutline>,
     },
     Canvas {
         width: u32,
@@ -163,12 +169,23 @@ pub struct Editor {
 
 impl Editor {
     /// Full-screen capture session over `doc`. `scale` is screenshot pixels per
-    /// logical pixel (the display's scale factor).
-    pub fn new(doc: Document, fonts: Arc<Fonts>, windows: Vec<Rect>, scale: f32) -> Self {
+    /// logical pixel (the display's scale factor). `windows` are the pickable
+    /// windows, topmost first: plain rectangles or [`WindowOutline`]s with
+    /// rounded corners.
+    pub fn new(
+        doc: Document,
+        fonts: Arc<Fonts>,
+        windows: impl IntoIterator<Item = impl Into<WindowOutline>>,
+        scale: f32,
+    ) -> Self {
         let bounds = doc.bounds();
-        let windows = windows.iter().filter_map(|w| w.intersect(&bounds)).collect();
+        let windows = windows
+            .into_iter()
+            .map(Into::into)
+            .filter_map(|w: WindowOutline| Some((w.bounds.intersect(&bounds)?, w)))
+            .collect();
         let mut editor = Self::with_workspace(
-            Workspace::Capture { doc, windows, hover: None, selection: None },
+            Workspace::Capture { doc, windows, hover: None, hover_window: None, selection: None, snapped: None },
             Vec::new(),
             fonts,
             scale,
@@ -295,9 +312,12 @@ impl Editor {
     pub fn extract_slice(&mut self) -> Option<(Pixmap, f32, Vec<Shape>)> {
         self.finish_text();
         match &self.workspace {
-            Workspace::Capture { doc, selection, .. } => {
+            Workspace::Capture { doc, selection, snapped, .. } => {
                 let sel = (*selection)?.round().intersect(&doc.bounds())?;
-                let raw = crop(doc.image(), sel.x as u32, sel.y as u32, sel.w as u32, sel.h as u32)?;
+                let mut raw = crop(doc.image(), sel.x as u32, sel.y as u32, sel.w as u32, sel.h as u32)?;
+                if let Some(outline) = snapped {
+                    outline.clip(&mut raw, Point::new(sel.x, sel.y));
+                }
                 let to_origin = Point::new(-sel.x, -sel.y);
                 let shapes = self
                     .elements
@@ -893,9 +913,11 @@ impl Editor {
 
     fn update_hover(&mut self) {
         let p = self.pointer;
-        if let Workspace::Capture { doc, windows, hover, .. } = &mut self.workspace {
+        if let Workspace::Capture { doc, windows, hover, hover_window, .. } = &mut self.workspace {
             let bounds = doc.bounds();
-            *hover = Some(windows.iter().find(|w| w.contains(p)).copied().unwrap_or(bounds));
+            let found = windows.iter().find(|(clipped, _)| clipped.contains(p));
+            *hover = Some(found.map_or(bounds, |(clipped, _)| *clipped));
+            *hover_window = found.map(|(_, outline)| *outline);
         }
     }
 
@@ -1144,17 +1166,22 @@ impl Editor {
                 let screen = self.screen();
                 let r = Rect::from_points(start, p).intersect(&screen);
                 let min = DRAG_THRESHOLD * self.ui_scale;
-                if let Workspace::Capture { selection, hover, .. } = &mut self.workspace {
-                    *selection = match r {
-                        Some(r) if moved && r.w >= min && r.h >= min => Some(r.round()),
-                        _ => *hover,
+                if let Workspace::Capture { selection, hover, hover_window, snapped, .. } = &mut self.workspace {
+                    (*selection, *snapped) = match r {
+                        Some(r) if moved && r.w >= min && r.h >= min => (Some(r.round()), None),
+                        // A click picks the window under the pointer, outline and all.
+                        _ => (*hover, hover_window.filter(WindowOutline::is_rounded)),
                     };
                 }
             }
-            Drag::SelResize { .. } | Drag::SelMove { .. } => {
+            Drag::SelResize { orig, .. } | Drag::SelMove { orig, .. } => {
                 self.touch();
-                if let Workspace::Capture { selection, .. } = &mut self.workspace {
+                if let Workspace::Capture { selection, snapped, .. } = &mut self.workspace {
                     *selection = selection.map(|s| s.round());
+                    // Any change to a snapped selection makes it a plain region.
+                    if *selection != Some(orig.round()) {
+                        *snapped = None;
+                    }
                 }
             }
             Drag::CanvasResize { current, .. } => {
@@ -1268,13 +1295,14 @@ impl Editor {
         if !self.elements.is_empty() {
             return RightClick::Handled;
         }
-        let Workspace::Capture { selection, .. } = &mut self.workspace else {
+        let Workspace::Capture { selection, snapped, .. } = &mut self.workspace else {
             return RightClick::Handled;
         };
         if selection.is_none() {
             return RightClick::Exit;
         }
         *selection = None;
+        *snapped = None;
         self.tool = None;
         self.selected = None;
         self.update_hover();
@@ -1702,9 +1730,9 @@ impl Editor {
     pub fn export(&mut self) -> Option<Pixmap> {
         self.finish_text();
         match &self.workspace {
-            Workspace::Capture { doc, selection, .. } => {
+            Workspace::Capture { doc, selection, snapped, .. } => {
                 let shapes: Vec<Shape> = self.elements.iter().filter_map(Element::as_shape).cloned().collect();
-                render::export(doc, (*selection)?, &shapes, self.metrics())
+                render::export_within(doc, (*selection)?, snapped.as_ref(), &shapes, self.metrics())
             }
             Workspace::Canvas { .. } => {
                 let comp = self.to_composition()?;
@@ -1780,6 +1808,62 @@ mod tests {
         let mut e = editor();
         drag(&mut e, (10.0, 20.0), (110.0, 80.0));
         assert_eq!(e.selection(), Some(Rect::new(10.0, 20.0, 100.0, 60.0)));
+    }
+
+    #[test]
+    fn clicking_a_rounded_window_exports_only_its_outline_until_the_selection_changes() {
+        let doc = Document::from_rgba(400, 300, vec![255; 400 * 300 * 4]).unwrap();
+        let windows = [
+            WindowOutline::new(Rect::new(50.0, 40.0, 200.0, 120.0), 10.0),
+            // Hangs off the screen's bottom-right: only its top-left corner is visible.
+            WindowOutline::new(Rect::new(300.0, 200.0, 200.0, 200.0), 10.0),
+        ];
+        let corner_alpha = |e: &mut Editor| {
+            let image = e.export().unwrap();
+            let (w, h) = (image.width(), image.height());
+            [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)].map(|(x, y)| image.pixel(x, y).unwrap().alpha())
+        };
+        let mut e = Editor::new(doc, Arc::new(Fonts::empty()), windows, 1.0);
+
+        // A click snaps to the window: exactly its bounds, corners transparent,
+        // in both the image and an editable slice (Add to editor, .bs).
+        click(&mut e, 100.0, 100.0);
+        assert_eq!(e.selection(), Some(Rect::new(50.0, 40.0, 200.0, 120.0)));
+        assert_eq!(corner_alpha(&mut e), [0; 4]);
+        assert_eq!(e.export().unwrap().pixel(100, 60).unwrap().alpha(), 255);
+        let (raw, _, _) = e.extract_slice().unwrap();
+        assert_eq!(raw.pixel(0, 0).unwrap().alpha(), 0);
+        // A click inside that doesn't move it keeps the snap.
+        click(&mut e, 120.0, 90.0);
+        assert_eq!(corner_alpha(&mut e), [0; 4]);
+
+        // Moving the selection makes it a plain rectangle again.
+        drag(&mut e, (120.0, 90.0), (130.0, 95.0));
+        assert_eq!(corner_alpha(&mut e), [255; 4]);
+        // So does resizing a fresh snap, even back to the same size.
+        e.right_click_at(Point::new(10.0, 10.0));
+        click(&mut e, 100.0, 100.0);
+        assert_eq!(corner_alpha(&mut e), [0; 4]);
+        drag(&mut e, (250.0, 160.0), (260.0, 170.0));
+        assert_eq!(e.selection(), Some(Rect::new(50.0, 40.0, 210.0, 130.0)));
+        assert_eq!(corner_alpha(&mut e), [255; 4]);
+
+        // Dragging out a region never clips, even over a rounded window.
+        e.right_click_at(Point::new(10.0, 10.0));
+        drag(&mut e, (50.0, 40.0), (250.0, 160.0));
+        assert_eq!(corner_alpha(&mut e), [255; 4]);
+
+        // A window cut off by the screen edge only rounds the corner on screen.
+        e.right_click_at(Point::new(10.0, 10.0));
+        click(&mut e, 350.0, 250.0);
+        assert_eq!(e.selection(), Some(Rect::new(300.0, 200.0, 100.0, 100.0)));
+        assert_eq!(corner_alpha(&mut e), [0, 255, 255, 255]);
+
+        // The desktop (no window under the pointer) is never clipped.
+        e.right_click_at(Point::new(10.0, 10.0));
+        click(&mut e, 10.0, 290.0);
+        assert_eq!(e.selection(), Some(e.screen()));
+        assert_eq!(corner_alpha(&mut e), [255; 4]);
     }
 
     #[test]

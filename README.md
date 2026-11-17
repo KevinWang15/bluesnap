@@ -23,7 +23,12 @@ Press the hotkey, then:
   dragged) and the color under the cursor. Press **I** to copy that color as
   `#RRGGBB`. The loupe stays on screen, flipping to the other side of the cursor
   near an edge, and goes away once a selection is made.
-- click: select that window, or drag: select a region
+- click: select that window, or drag: select a region. A clicked window is captured
+  exactly: on Windows 11 and macOS 11–15, whose windows have rounded corners, the
+  corners come out transparent (anti-aliased, with no background showing through)
+  and Windows 11's translucent 1 px frame border is left out, so a saved PNG holds
+  only the window's own pixels. Resizing or moving the selection afterwards turns it
+  back into a plain rectangle.
 - drag the 8 handles to resize the selection, or drag inside it to move it
 - annotate with rectangle, ellipse, arrow, pen, highlighter, counter, redact and
   text. Click an existing

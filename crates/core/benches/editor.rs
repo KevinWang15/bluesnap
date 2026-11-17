@@ -45,7 +45,7 @@ fn fonts() -> Arc<Fonts> {
 
 fn editor(w: u32, h: u32) -> Editor {
     let doc = Document::from_rgba(w, h, screenshot(w, h)).unwrap();
-    let windows = (0..50).map(|i| Rect::new(i as f32 * 30.0, i as f32 * 20.0, 800.0, 600.0)).collect();
+    let windows = (0..50).map(|i| Rect::new(i as f32 * 30.0, i as f32 * 20.0, 800.0, 600.0));
     Editor::new(doc, fonts(), windows, 2.0)
 }
 
@@ -121,7 +121,7 @@ fn startup(c: &mut Criterion) {
             || rgba.clone(),
             |rgba| {
                 let doc = Document::from_rgba(W4K, H4K, rgba).unwrap();
-                black_box(Editor::new(doc, Arc::new(Fonts::empty()), Vec::new(), 2.0))
+                black_box(Editor::new(doc, Arc::new(Fonts::empty()), Vec::<Rect>::new(), 2.0))
             },
             BatchSize::LargeInput,
         )

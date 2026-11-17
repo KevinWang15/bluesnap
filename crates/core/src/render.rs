@@ -12,6 +12,7 @@ use tiny_skia::{
 
 use crate::composition::{Composition, Element, PlacedImage};
 use crate::geom::{Point, Rect};
+use crate::outline::WindowOutline;
 pub use crate::pixels::{swap_red_blue, to_bgra_straight, to_rgba_straight};
 use crate::pixels::{blur_margin, crop, gaussian_blur, par_map, pixelate, pixmap_from_rgba};
 use crate::shape::{ArrowPath, Geometry, Metrics, RedactShape, Shape, arrow_head_len, counter_box, counter_font_size, text_box};
@@ -207,10 +208,27 @@ pub fn render_layer(doc: &Document, region: Rect, shapes: &[&Shape], m: Metrics,
 
 /// The final image: the screenshot cropped to `region` with all shapes drawn on top.
 pub fn export(doc: &Document, region: Rect, shapes: &[Shape], m: Metrics) -> Option<Pixmap> {
+    export_within(doc, region, None, shapes, m)
+}
+
+/// Like [`export`], with the screenshot clipped to a snapped window's rounded
+/// `outline` first (so its corners are transparent). Shapes are drawn after
+/// clipping, so annotations reaching into a corner stay whole.
+pub fn export_within(
+    doc: &Document,
+    region: Rect,
+    outline: Option<&WindowOutline>,
+    shapes: &[Shape],
+    m: Metrics,
+) -> Option<Pixmap> {
     let region = region.round().intersect(&doc.bounds())?;
     let mut pixmap = crop(doc.image(), region.x as u32, region.y as u32, region.w as u32, region.h as u32)?;
+    let origin = Point::new(region.x, region.y);
+    if let Some(outline) = outline {
+        outline.clip(&mut pixmap, origin);
+    }
     let shapes: Vec<&Shape> = shapes.iter().collect();
-    draw_shapes(&mut pixmap, doc, &shapes, m, Point::new(region.x, region.y), None);
+    draw_shapes(&mut pixmap, doc, &shapes, m, origin, None);
     Some(pixmap)
 }
 

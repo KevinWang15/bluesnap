@@ -62,11 +62,23 @@ pub struct TextLine {
     pub bounds: PixelRect,
 }
 
+/// A visible window on the captured display.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CapturedWindow {
+    /// Visible frame in image pixels, not clipped to the display (a window
+    /// partly off-screen keeps its real size, so only its on-screen corners
+    /// get rounded).
+    pub bounds: PixelRect,
+    /// Radius in image pixels of the corners the compositor rounds (Windows 11,
+    /// macOS); `0` for square corners (maximized, snapped, older systems).
+    pub corner_radius: f32,
+}
+
 pub struct Capture {
     pub display: DisplayInfo,
     pub image: Image,
-    /// Visible top-level windows on that display, topmost first, clipped to it.
-    pub windows: Vec<PixelRect>,
+    /// Visible top-level windows on that display, topmost first.
+    pub windows: Vec<CapturedWindow>,
     /// The OS withheld window contents (macOS Screen Recording permission), so
     /// the image likely shows only the desktop. The UI should say so.
     pub permission_missing: bool,
