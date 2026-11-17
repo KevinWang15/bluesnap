@@ -843,7 +843,7 @@ impl CanvasView {
         let settings = cx.global::<AppState>().ai.clone();
         if !settings.is_configured() {
             let toast = Toast::new(toast::Kind::Info, "Set up AI first")
-                .detail("Auto finds sensitive text with an LLM or a decision model. Add one in AI Settings; only recognized text is sent, never the image.")
+                .detail("Auto finds sensitive text with an LLM and/or a decision model. Add one in AI Settings.")
                 .action("AI Settings…", toast::Action::OpenAiSettings);
             return self.show_toast(toast, window, cx);
         }
@@ -851,16 +851,32 @@ impl CanvasView {
         let origin = bluesnap_core::Point::new(sel.round().x, sel.round().y);
         let fonts = cx.global::<AppState>().fonts.clone();
         let scale = self.editor.scale();
-        self.show_toast(Toast::new(toast::Kind::Busy, "Reading the text…"), window, cx);
+        let initial_title = if settings.llm().is_some() {
+            "Reading text & analyzing screen…"
+        } else {
+            "Reading the text…"
+        };
+        self.show_toast(Toast::new(toast::Kind::Busy, initial_title), window, cx);
         let started = std::time::Instant::now();
         self.auto = Some(cx.spawn_in(window, async move |this, cx| {
             let image = Arc::new(pixmap);
+            // Run the LLM screen-context step in parallel with local OCR ("find text")
+            // so the decision model and span extractor know what the page is and which
+            // values are confidential without adding serial OCR + context latency.
+            let context_task = settings.llm().cloned().map(|llm_ep| {
+                let (ep, img) = (llm_ep.clone(), image.clone());
+                let task = cx.background_executor().spawn(async move {
+                    let t0 = std::time::Instant::now();
+                    (bluesnap_ai::describe_image_context(&ep, &img), t0.elapsed())
+                });
+                (llm_ep, task)
+            });
+
             let bands = bluesnap_core::reading_order::bands(image.height(), 1200, 64);
-            let mut checks = Vec::new();
-            let mut count = 0;
+            let mut all_lines: Vec<(PxRect, String)> = Vec::new();
             for (i, (read, own)) in bands.iter().cloned().enumerate() {
                 if bands.len() > 1 {
-                    let progress = Toast::new(toast::Kind::Busy, format!("Reading the text… {} of {}", i + 1, bands.len()));
+                    let progress = Toast::new(toast::Kind::Busy, format!("{initial_title} {} of {}", i + 1, bands.len()));
                     this.update_in(cx, |this, window, cx| this.show_toast(progress, window, cx)).ok();
                 }
                 let band = image.clone();
@@ -872,65 +888,85 @@ impl CanvasView {
                         bluesnap_platform::native().recognize_text(part.width(), part.height(), &to_rgba_straight(&part), scale)
                     })
                     .await;
-                let lines: Vec<(PxRect, String)> = match recognized {
-                    Ok(lines) => lines
-                        .into_iter()
-                        .map(|l| {
-                            let b = l.bounds;
-                            (PxRect::new(b.x as f32, b.y as f32 + read.start as f32, b.width as f32, b.height as f32), l.text)
-                        })
-                        .filter(|(r, _)| own.contains(&(r.center().y.max(0.0) as u32)))
-                        .collect(),
+                match recognized {
+                    Ok(lines) => all_lines.extend(
+                        lines
+                            .into_iter()
+                            .map(|l| {
+                                let b = l.bounds;
+                                (PxRect::new(b.x as f32, b.y as f32 + read.start as f32, b.width as f32, b.height as f32), l.text)
+                            })
+                            .filter(|(r, _)| own.contains(&(r.center().y.max(0.0) as u32))),
+                    ),
                     Err(e) => {
                         log::error!("auto redact: text recognition failed: {e:#}");
                         let toast = Toast::new(toast::Kind::Error, "Couldn't read the text").detail(short_error(&e));
                         this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
                         return;
                     }
-                };
-                if lines.is_empty() {
-                    continue;
                 }
-                count += lines.len();
-                let (settings, image, fonts) = (settings.clone(), image.clone(), fonts.clone());
-                checks.push(cx.background_executor().spawn(async move {
-                    bluesnap_ai::locate_sensitive(&settings, &image, &lines, fonts.sans())
-                }));
             }
+            let count = all_lines.len();
             if count == 0 {
                 let toast = Toast::new(toast::Kind::Info, "No text found").detail("There's nothing to redact in the selection.");
                 this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
                 return;
             }
             let ocr_time = started.elapsed();
+
+            let (screen_context, context_time) = match context_task {
+                Some((llm_ep, task)) => {
+                    let analyzing = Toast::new(toast::Kind::Busy, "Analyzing screen context…")
+                        .detail(format!("Summarizing what is sensitive on this screen with {}", hosts(&settings)));
+                    this.update_in(cx, |this, window, cx| this.show_toast(analyzing, window, cx)).ok();
+                    let (outcome, elapsed) = task.await;
+                    match outcome {
+                        bluesnap_ai::ContextOutcome::Ready(ctx) => (Some(ctx), elapsed),
+                        bluesnap_ai::ContextOutcome::UnsupportedImage => {
+                            let boxes: Vec<PxRect> = all_lines.iter().map(|(r, _)| *r).collect();
+                            let texts: Vec<String> = bluesnap_core::reading_order::rows(&boxes)
+                                .into_iter()
+                                .flatten()
+                                .map(|i| all_lines[i].1.clone())
+                                .collect();
+                            let t0 = std::time::Instant::now();
+                            let ctx = cx
+                                .background_executor()
+                                .spawn(async move { bluesnap_ai::describe_text_context(&llm_ep, &texts) })
+                                .await;
+                            (ctx, elapsed + t0.elapsed())
+                        }
+                        bluesnap_ai::ContextOutcome::Failed(err) => {
+                            log::warn!("auto redact: screen context failed: {err}");
+                            (None, elapsed)
+                        }
+                    }
+                }
+                None => (None, std::time::Duration::ZERO),
+            };
+
             let checking = Toast::new(toast::Kind::Busy, format!("Checking {} with AI…", plural(count, "line")))
-                .detail(format!("Sending the text, not the image, to {}", hosts(&settings)));
+                .detail(format!("Using {}", hosts(&settings)));
             this.update_in(cx, |this, window, cx| this.show_toast(checking, window, cx)).ok();
 
-            let mut found: anyhow::Result<(Vec<PxRect>, bluesnap_ai::Report)> = Ok((Vec::new(), bluesnap_ai::Report::default()));
-            let mut errors = Vec::new();
-            for check in checks {
-                match (check.await, &mut found) {
-                    (Ok((rects, report)), Ok((all, total))) => {
-                        all.extend(rects);
-                        total.failed += report.failed;
-                        total.requests += report.requests;
-                        total.first_error = total.first_error.take().or(report.first_error);
-                    }
-                    (Err(e), _) => errors.push(e),
-                    _ => {}
-                }
-            }
-            if let Some(e) = errors.into_iter().next() {
-                match &mut found {
-                    Ok((all, total)) if !all.is_empty() || total.requests > 0 => {
-                        total.failed += 1;
-                        total.first_error = total.first_error.take().or(Some(format!("{e:#}")));
-                    }
-                    _ => found = Err(e),
-                }
-            }
-            log::info!("auto redact: {count} lines, OCR {ocr_time:?}, total {:?}", started.elapsed());
+            let found = {
+                let (settings, image, fonts) = (settings.clone(), image.clone(), fonts.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        bluesnap_ai::locate_sensitive_with_context(
+                            &settings,
+                            &image,
+                            &all_lines,
+                            fonts.sans(),
+                            screen_context.as_deref(),
+                        )
+                    })
+                    .await
+            };
+            log::info!(
+                "auto redact: {count} lines, OCR {ocr_time:?}, context {context_time:?}, total {:?}",
+                started.elapsed()
+            );
             this.update_in(cx, |this, window, cx| {
                 let toast = match found {
                     Ok((rects, report)) => {
@@ -975,11 +1011,15 @@ impl CanvasView {
         if std::mem::take(&mut self.text_menu) {
             return cx.notify();
         }
+        if ev.button == MouseButton::Left && self.bg_menu.take().is_some() {
+            return cx.notify();
+        }
         if self.toast.as_ref().is_some_and(Toast::dismissable) {
             self.toast = None;
         }
         if !self.is_capture() && f32::from(ev.position.y) < self.top_bar {
-            return;
+            self.bg_menu = None;
+            return cx.notify();
         }
         let p = self.viewport.to_image(ev.position);
         match ev.button {
@@ -994,7 +1034,10 @@ impl CanvasView {
                 RightClick::BackgroundMenu => {
                     self.bg_menu = Some(Point { x: f32::from(ev.position.x), y: f32::from(ev.position.y) });
                 }
-            }
+                RightClick::Handled => {
+                    self.bg_menu = None;
+                }
+            },
             _ => return,
         }
         cx.notify();
@@ -1012,9 +1055,6 @@ impl CanvasView {
         }
         let before = (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered);
         self.editor.pointer_move(self.viewport.to_image(ev.position), ev.modifiers.shift);
-        if ev.button == MouseButton::Left && self.bg_menu.take().is_some() {
-            return cx.notify();
-        }
         self.canvas_hovered = canvas_hovered;
         if (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered) != before {
             cx.notify();
@@ -1034,15 +1074,13 @@ impl CanvasView {
             {
                 pan.x -= shift.x * zoom;
                 pan.y -= shift.y * zoom;
-                RightClick::Handled => {
-                    self.bg_menu = None;
-                }
-            },
+            }
             cx.notify();
         }
     }
 
     fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+        self.bg_menu = None;
         let delta = ev.delta.pixel_delta(window.line_height());
         let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
         let cmd = ev.modifiers.secondary();
@@ -1056,8 +1094,7 @@ impl CanvasView {
                 *zoom_override = Some((cur * factor).clamp(0.05, native_zoom * 4.0));
                 cx.notify();
             }
-            self.bg_menu = None;
-            return cx.notify();
+            return;
         }
         if let Surface::Editor { pan, .. } = &mut self.surface {
             if shift && dx == 0.0 {
@@ -1080,7 +1117,7 @@ impl CanvasView {
         }
         match ks.key.as_str() {
             "escape" if self.text_menu => self.text_menu = false,
-        self.bg_menu = None;
+            "escape" if self.bg_menu.is_some() => self.bg_menu = None,
             "i" if !editing && self.loupe_target(window).is_some() => self.copy_color(window, cx),
             "escape" if editing => self.editor.finish_text(),
             "escape" if !self.is_capture() && self.editor.clear_tool_or_selection() => {}
@@ -1117,7 +1154,6 @@ impl CanvasView {
                     *pan = Point { x: 0.0, y: 0.0 };
                 }
             }
-            "escape" if self.bg_menu.is_some() => self.bg_menu = None,
             "=" | "+" if cmd && !self.is_capture() => {
                 let (fit, _) = self.fit_zoom(window);
                 let max_z = Viewport::native(window.scale_factor()).zoom * 4.0;
@@ -1398,6 +1434,11 @@ impl Render for CanvasView {
                 self.text_menu = false;
             }
         }
+        if let (Some(anchor), Some(current_bg)) = (self.bg_menu, self.editor.background_color()) {
+            let (mx, my) = self.bg_menu_origin(anchor, window);
+            let has_custom = bluesnap_platform::Native::HAS_COLOR_DIALOG;
+            root = root.child(toolbar::background_menu(current_bg, has_custom, mx, my, cx));
+        }
         root
     }
 }
@@ -1434,11 +1475,6 @@ impl Scene {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let blue = hsla(THEME_BLUE);
         if let Some(backdrop) = self.backdrop {
-        if let (Some(anchor), Some(current_bg)) = (self.bg_menu, self.editor.background_color()) {
-            let (mx, my) = self.bg_menu_origin(anchor, window);
-            let has_custom = bluesnap_platform::Native::HAS_COLOR_DIALOG;
-            root = root.child(toolbar::background_menu(current_bg, has_custom, mx, my, cx));
-        }
             window.paint_quad(fill(bounds, backdrop));
             if let Some(bg) = self.canvas_surface {
                 if bg.is_transparent() {

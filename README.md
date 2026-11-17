@@ -138,20 +138,21 @@ token and model; either or both:
 - a **decision model** behind a Decisions API (`/v1/decisions`).
 
 Each section has a Test button. The settings are saved to `ai.json` beside
-`config.toml`, readable only by the user (it holds the tokens). Features send
-recognized text, never the screenshot.
+`config.toml`, readable only by the user (it holds the tokens).
 
 ### Auto redaction
 
-Text is recognized on the computer with the same OCR as To text; only the
-recognized text is sent to the endpoints, never the image. Tall images (scrolling
-screenshots) are read in bands of 1200 rows, with progress in the toast, and each
-band's text is checked by the AI while the next band is read; recognition, about
-1 s per 1000 rows of dense text at 900 px wide, is most of the time there. The lines are sent in
-reading order, 8 per LLM request and one per decision request, all in parallel (up
-to 16 at a time per model; busy responses are retried). Each finding is then
-placed on the screen: the line's words are matched to the clusters of ink in the
-pixels, so boxes fit the actual glyphs in any font, descenders included.
+Text is recognized locally on the computer with the same OCR as To text, while (when
+an LLM is configured) a compact thumbnail is analyzed in parallel so the models know
+what kind of screen or dashboard is shown and which figures or identifiers are
+confidential in context. Tall images (scrolling screenshots) are read in bands of
+1200 rows, with progress in the toast; recognition, about 1 s per 1000 rows of dense
+text at 900 px wide, runs concurrently with the screen-context step. Recognized lines
+are then checked in reading order alongside that screen context, 8 per LLM request
+and one per decision request, all in parallel (up to 16 at a time per model; busy
+responses are retried). Each finding is then placed on the screen: the line's words
+are matched to the clusters of ink in the pixels, so boxes fit the actual glyphs in
+any font, descenders included.
 
 How this was chosen: 12 synthetic screenshots (settings page, terminal, chat,
 Chinese form and chat, config file, email, bank page, code diff, admin table, and

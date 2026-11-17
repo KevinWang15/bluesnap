@@ -94,23 +94,60 @@ fn with_retries<T>(mut f: impl FnMut() -> Result<T, ApiError>) -> Result<T, ApiE
     f()
 }
 
-/// The LLM's text reply to `prompt`. Asks for no reasoning, which the
-/// experiments showed is ~10x faster for this task at the same quality; servers
-/// that reject the option get the request again without it.
-pub fn llm_reply(endpoint: &Endpoint, prompt: &str) -> anyhow::Result<String> {
+/// Why a multimodal (`input_image`) LLM request failed.
+#[derive(Debug)]
+pub enum VisionError {
+    /// The server or model rejected image input (e.g. a text-only LLM).
+    UnsupportedImage(String),
+    /// Network, authentication, or server failure.
+    Request(anyhow::Error),
+}
+
+fn post_responses(endpoint: &Endpoint, content: Value) -> Result<Value, ApiError> {
     let mut body = json!({
         "model": endpoint.model.trim(),
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        "input": [{"role": "user", "content": content}],
+        "tool_choice": "none",
         "reasoning": {"effort": "none"},
     });
-    let reply = match with_retries(|| post(endpoint, "responses", &body)) {
-        Err(e) if e.status == 400 && e.message.to_lowercase().contains("reasoning") => {
-            body.as_object_mut().expect("object").remove("reasoning");
-            with_retries(|| post(endpoint, "responses", &body))
+    for _ in 0..2 {
+        match with_retries(|| post(endpoint, "responses", &body)) {
+            Err(e) if e.status == 400 => {
+                let low = e.message.to_lowercase();
+                let obj = body.as_object_mut().expect("object");
+                if low.contains("reasoning") && obj.remove("reasoning").is_some() {
+                    continue;
+                }
+                if low.contains("tool_choice") && obj.remove("tool_choice").is_some() {
+                    continue;
+                }
+                return Err(e);
+            }
+            other => return other,
         }
-        other => other,
-    }?;
+    }
+    with_retries(|| post(endpoint, "responses", &body))
+}
+
+/// The LLM's text reply to `prompt`. Asks for no reasoning and no tool calls,
+/// which experiments showed is ~10x faster and avoids gateway-injected MCP tool
+/// preambles; servers that reject either option get the request again without it.
+pub fn llm_reply(endpoint: &Endpoint, prompt: &str) -> anyhow::Result<String> {
+    let reply = post_responses(endpoint, json!([{"type": "input_text", "text": prompt}]))?;
     output_text(&reply).ok_or_else(|| anyhow!("the response has no text output"))
+}
+
+/// Multimodal LLM reply to `prompt` + `image_data_url` (`data:image/png;base64,...`).
+pub fn llm_vision_reply(endpoint: &Endpoint, prompt: &str, image_data_url: &str) -> Result<String, VisionError> {
+    let content = json!([
+        {"type": "input_text", "text": prompt},
+        {"type": "input_image", "image_url": image_data_url},
+    ]);
+    match post_responses(endpoint, content) {
+        Ok(val) => output_text(&val).ok_or_else(|| VisionError::Request(anyhow!("the response has no text output"))),
+        Err(e) if matches!(e.status, 400 | 415 | 422) => Err(VisionError::UnsupportedImage(e.to_string())),
+        Err(e) => Err(VisionError::Request(e.into())),
+    }
 }
 
 /// The text of a Responses API reply: `output_text`, else the message parts.

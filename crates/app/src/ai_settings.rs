@@ -330,8 +330,9 @@ impl Render for SettingsView {
             .child(
                 div().text_size(px(13.)).text_color(rgb(0x555555)).line_height(px(19.)).child(
                     "Optional AI services for bluesnap's AI features. Nothing is sent anywhere until a \
-                     service is set up here. Text is recognized on this computer; only text is sent, \
-                     never the screenshot. Used by: Auto in the Redact tool.",
+                     service is set up here. Text is recognized on this computer; when an LLM is set up, \
+                     a compact preview is analyzed in parallel to understand what is sensitive on screen \
+                     before checking the recognized lines. Used by: Auto in the Redact tool.",
                 ),
             )
             .child(self.section(0, cx))
