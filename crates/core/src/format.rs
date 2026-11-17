@@ -8,13 +8,16 @@ use std::path::Path;
 use crate::bson::{self, Doc, Value};
 use crate::composition::{Composition, Element, ImageAsset, ImageId, PlacedImage};
 use crate::geom::{Point, Rect};
-use crate::pixels::{pixmap_from_rgba, to_rgba_straight};
+use crate::pixels::{par_map, pixmap_from_rgba, to_rgba_straight};
 use crate::shape::{Geometry, RedactShape, Shape};
 use crate::style::{ArrowStyle, Color, CounterFormat, RedactEffect, SizeLevel, Style, TextStyle};
 
 const FORMAT_MAGIC: &str = "bluesnap";
 const FORMAT_VERSION: i32 = 1;
 const MAX_CANVAS_SIDE: u32 = 65_535;
+const MAX_IMAGE_PIXELS: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = (MAX_IMAGE_PIXELS as usize) * 4;
+const MAX_ABS_COORD: f32 = 1_000_000.0;
 
 #[derive(Debug)]
 pub enum FormatError {
@@ -54,18 +57,22 @@ fn bad(msg: impl Into<String>) -> FormatError {
 /// Encodes `comp` into `.bs` BSON bytes.
 pub fn encode_bs(comp: &Composition) -> Result<Vec<u8>, FormatError> {
     let mut seen: HashMap<ImageId, ()> = HashMap::new();
-    let mut images = Vec::new();
+    let mut unique_assets: Vec<&ImageAsset> = Vec::new();
     for el in &comp.elements {
         if let Element::Image(placed) = el
             && seen.insert(placed.asset.id, ()).is_none()
         {
-            images.push(Value::Document(encode_image_asset(&placed.asset)?));
+            unique_assets.push(&placed.asset);
         }
     }
+    let images: Vec<Value> = par_map(&unique_assets, |asset| encode_image_asset(asset))
+        .into_iter()
+        .map(|res| res.map(Value::Document))
+        .collect::<Result<_, _>>()?;
 
     let elements: Vec<Value> = comp.elements.iter().map(|el| Value::Document(encode_element(el))).collect();
 
-    let mut root = Doc::new();
+    let mut root = Doc::with_capacity(8);
     root.push("format", Value::String(FORMAT_MAGIC.into()));
     root.push("version", Value::Int32(FORMAT_VERSION));
     root.push("width", Value::Int32(comp.width as i32));
@@ -96,21 +103,31 @@ pub fn decode_bs(bytes: &[u8]) -> Result<Composition, FormatError> {
         .ok()
         .filter(|&h| (1..=MAX_CANVAS_SIDE).contains(&h))
         .ok_or_else(|| bad("invalid canvas height"))?;
+    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
+        return Err(bad("canvas dimensions exceed maximum pixel budget"));
+    }
     let scale = root.req_f32("scale")?;
     if !(0.1..=16.0).contains(&scale) {
         return Err(bad("invalid canvas scale"));
     }
     let background = root.get("background").and_then(Value::as_doc).map(decode_color).transpose()?.unwrap_or(Color::rgb(0xFFFFFF));
 
-    let mut assets: HashMap<ImageId, ImageAsset> = HashMap::new();
-    for val in root.req_array("images")? {
-        let doc = val.as_doc().ok_or_else(|| bad("image entry is not a BSON document"))?;
-        let asset = decode_image_asset(doc)?;
+    let img_vals = root.req_array("images")?;
+    let img_docs: Vec<&Doc> = img_vals
+        .iter()
+        .map(|val| val.as_doc().ok_or_else(|| bad("image entry is not a BSON document")))
+        .collect::<Result<_, _>>()?;
+    let decoded_assets: Vec<ImageAsset> =
+        par_map(&img_docs, |doc| decode_image_asset(doc)).into_iter().collect::<Result<_, _>>()?;
+
+    let mut assets: HashMap<ImageId, ImageAsset> = HashMap::with_capacity(decoded_assets.len());
+    for asset in decoded_assets {
         assets.insert(asset.id, asset);
     }
 
-    let mut elements = Vec::new();
-    for val in root.req_array("elements")? {
+    let elem_vals = root.req_array("elements")?;
+    let mut elements = Vec::with_capacity(elem_vals.len());
+    for val in elem_vals {
         let doc = val.as_doc().ok_or_else(|| bad("element entry is not a BSON document"))?;
         elements.push(decode_element(doc, &assets)?);
     }
@@ -156,17 +173,23 @@ fn write_private_or_normal(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn encode_image_asset(asset: &ImageAsset) -> Result<Doc, FormatError> {
-    let rgba = to_rgba_straight(asset.pixmap());
-    let mut png_bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut png_bytes, asset.width(), asset.height());
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder.write_header().map_err(|e| bad(format!("PNG encode header: {e}")))?;
-        writer.write_image_data(&rgba).map_err(|e| bad(format!("PNG encode data: {e}")))?;
-    }
-    let mut d = Doc::new();
+    let png_bytes = if let Some(cached) = asset.cached_png() {
+        cached.to_vec()
+    } else {
+        let rgba = to_rgba_straight(asset.pixmap());
+        let mut out = Vec::with_capacity(rgba.len() / 4);
+        {
+            let mut encoder = png::Encoder::new(&mut out, asset.width(), asset.height());
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fast);
+            let mut writer = encoder.write_header().map_err(|e| bad(format!("PNG encode header: {e}")))?;
+            writer.write_image_data(&rgba).map_err(|e| bad(format!("PNG encode data: {e}")))?;
+        }
+        asset.cache_png(out.clone());
+        out
+    };
+    let mut d = Doc::with_capacity(5);
     d.push("id", Value::Int64(asset.id.0 as i64));
     d.push("width", Value::Int32(asset.width() as i32));
     d.push("height", Value::Int32(asset.height() as i32));
@@ -185,33 +208,45 @@ fn decode_image_asset(doc: &Doc) -> Result<ImageAsset, FormatError> {
         .ok()
         .filter(|&h| (1..=MAX_CANVAS_SIDE).contains(&h))
         .ok_or_else(|| bad("invalid image height"))?;
+    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
+        return Err(bad("image dimensions exceed maximum pixel budget"));
+    }
     let encoding = doc.req_str("encoding")?;
     let raw = doc.req_bytes("data")?;
 
-    let rgba = match encoding {
-        "png" => decode_png_rgba(raw, width, height)?,
+    match encoding {
+        "png" => {
+            let rgba = decode_png_rgba(raw, width, height)?;
+            let pixmap = pixmap_from_rgba(width, height, rgba).ok_or_else(|| bad("failed to build image pixmap"))?;
+            Ok(ImageAsset::with_id_and_png(ImageId(id), pixmap, raw.to_vec()))
+        }
         "rgba" => {
             let expected = width as usize * height as usize * 4;
             if raw.len() != expected {
                 return Err(bad("raw RGBA byte length mismatch"));
             }
-            raw.to_vec()
+            let pixmap = pixmap_from_rgba(width, height, raw.to_vec()).ok_or_else(|| bad("failed to build image pixmap"))?;
+            Ok(ImageAsset::with_id(ImageId(id), pixmap))
         }
-        other => return Err(bad(format!("unsupported image encoding `{other}`"))),
-    };
-    let pixmap = pixmap_from_rgba(width, height, rgba).ok_or_else(|| bad("failed to build image pixmap"))?;
-    Ok(ImageAsset::with_id(ImageId(id), pixmap))
+        other => Err(bad(format!("unsupported image encoding `{other}`"))),
+    }
 }
 
 fn decode_png_rgba(bytes: &[u8], expected_w: u32, expected_h: u32) -> Result<Vec<u8>, FormatError> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);
     let mut reader = decoder.read_info().map_err(|e| bad(format!("PNG decode header: {e}")))?;
-    let buf_size = reader.output_buffer_size().ok_or_else(|| bad("PNG buffer too large"))?;
+    if reader.info().width != expected_w || reader.info().height != expected_h {
+        return Err(bad("PNG dimensions do not match asset header"));
+    }
+    let buf_size = reader
+        .output_buffer_size()
+        .filter(|&n| n <= MAX_IMAGE_BYTES)
+        .ok_or_else(|| bad("PNG buffer too large"))?;
     let mut buf = vec![0u8; buf_size];
     let info = reader.next_frame(&mut buf).map_err(|e| bad(format!("PNG decode pixels: {e}")))?;
     if info.width != expected_w || info.height != expected_h {
-        return Err(bad("PNG dimensions do not match asset header"));
+        return Err(bad("PNG frame dimensions do not match asset header"));
     }
     buf.truncate(info.buffer_size());
     match info.color_type {
@@ -224,7 +259,7 @@ fn decode_png_rgba(bytes: &[u8], expected_w: u32, expected_h: u32) -> Result<Vec
 }
 
 fn encode_color(c: Color) -> Doc {
-    let mut d = Doc::new();
+    let mut d = Doc::with_capacity(4);
     d.push("r", Value::Int32(c.r as i32));
     d.push("g", Value::Int32(c.g as i32));
     d.push("b", Value::Int32(c.b as i32));
@@ -239,19 +274,27 @@ fn decode_color(d: &Doc) -> Result<Color, FormatError> {
     Ok(Color { r: byte("r")?, g: byte("g")?, b: byte("b")?, a: byte("a")? })
 }
 
+fn check_coord(v: f32, label: &str) -> Result<f32, FormatError> {
+    if (-MAX_ABS_COORD..=MAX_ABS_COORD).contains(&v) {
+        Ok(v)
+    } else {
+        Err(bad(format!("coordinate `{label}` out of valid range")))
+    }
+}
+
 fn encode_point(p: Point) -> Doc {
-    let mut d = Doc::new();
+    let mut d = Doc::with_capacity(2);
     d.push("x", Value::Double(p.x as f64));
     d.push("y", Value::Double(p.y as f64));
     d
 }
 
 fn decode_point(d: &Doc) -> Result<Point, FormatError> {
-    Ok(Point::new(d.req_f32("x")?, d.req_f32("y")?))
+    Ok(Point::new(check_coord(d.req_f32("x")?, "x")?, check_coord(d.req_f32("y")?, "y")?))
 }
 
 fn encode_rect(r: Rect) -> Doc {
-    let mut d = Doc::new();
+    let mut d = Doc::with_capacity(4);
     d.push("x", Value::Double(r.x as f64));
     d.push("y", Value::Double(r.y as f64));
     d.push("w", Value::Double(r.w as f64));
@@ -260,11 +303,45 @@ fn encode_rect(r: Rect) -> Doc {
 }
 
 fn decode_rect(d: &Doc) -> Result<Rect, FormatError> {
-    Ok(Rect::new(d.req_f32("x")?, d.req_f32("y")?, d.req_f32("w")?, d.req_f32("h")?))
+    let x = check_coord(d.req_f32("x")?, "x")?;
+    let y = check_coord(d.req_f32("y")?, "y")?;
+    let w = check_coord(d.req_f32("w")?, "w")?;
+    let h = check_coord(d.req_f32("h")?, "h")?;
+    if w < 0.0 || h < 0.0 {
+        return Err(bad("rectangle width and height must be non-negative"));
+    }
+    Ok(Rect::new(x, y, w, h))
 }
 
-fn encode_points(pts: &[Point]) -> Value {
-    Value::Array(pts.iter().map(|&p| Value::Document(encode_point(p))).collect())
+fn encode_points_bin(pts: &[Point]) -> Value {
+    let mut bytes = Vec::with_capacity(pts.len() * 8);
+    for p in pts {
+        bytes.extend_from_slice(&p.x.to_le_bytes());
+        bytes.extend_from_slice(&p.y.to_le_bytes());
+    }
+    Value::Binary(bytes)
+}
+
+fn decode_shape_points(d: &Doc) -> Result<Vec<Point>, FormatError> {
+    let pts = if let Some(bin_val) = d.get("points_bin") {
+        let bytes = bin_val.as_bytes().ok_or_else(|| bad("`points_bin` is not binary"))?;
+        if !bytes.len().is_multiple_of(8) {
+            return Err(bad("`points_bin` byte length must be a multiple of 8"));
+        }
+        let mut pts = Vec::with_capacity(bytes.len() / 8);
+        for chunk in bytes.as_chunks::<8>().0 {
+            let x = check_coord(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]), "x")?;
+            let y = check_coord(f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]), "y")?;
+            pts.push(Point::new(x, y));
+        }
+        pts
+    } else {
+        decode_points(d.req_array("points")?)?
+    };
+    if pts.is_empty() {
+        return Err(bad("stroke must contain at least one point"));
+    }
+    Ok(pts)
 }
 
 fn decode_points(vals: &[Value]) -> Result<Vec<Point>, FormatError> {
@@ -291,7 +368,7 @@ fn decode_size(s: &str) -> Result<SizeLevel, FormatError> {
 }
 
 fn encode_element(el: &Element) -> Doc {
-    let mut d = Doc::new();
+    let mut d = Doc::with_capacity(6);
     match el {
         Element::Image(placed) => {
             d.push("kind", Value::String("image".into()));
@@ -328,11 +405,11 @@ fn encode_shape(d: &mut Doc, shape: &Shape) {
         }
         Geometry::Pen(pts) => {
             d.push("kind", Value::String("pen".into()));
-            d.push("points", encode_points(pts));
+            d.push("points_bin", encode_points_bin(pts));
         }
         Geometry::Highlight(pts) => {
             d.push("kind", Value::String("highlight".into()));
-            d.push("points", encode_points(pts));
+            d.push("points_bin", encode_points_bin(pts));
         }
         Geometry::Counter { center, number, format } => {
             d.push("kind", Value::String("counter".into()));
@@ -358,7 +435,7 @@ fn encode_shape(d: &mut Doc, shape: &Shape) {
             match area {
                 RedactShape::Brush(pts) => {
                     d.push("area_kind", Value::String("brush".into()));
-                    d.push("points", encode_points(pts));
+                    d.push("points_bin", encode_points_bin(pts));
                 }
                 RedactShape::Rect(r) => {
                     d.push("area_kind", Value::String("rect".into()));
@@ -392,6 +469,9 @@ fn decode_element(d: &Doc, assets: &HashMap<ImageId, ImageAsset>) -> Result<Elem
         let id = ImageId(u64::try_from(d.req_i64("image_id")?).map_err(|_| bad("invalid image_id"))?);
         let asset = assets.get(&id).ok_or_else(|| bad(format!("missing image asset {}", id.0)))?.clone();
         let bounds = decode_rect(d.req_doc("bounds")?)?;
+        if bounds.w < 1.0 || bounds.h < 1.0 {
+            return Err(bad("placed image bounds must be at least 1x1"));
+        }
         return Ok(Element::Image(PlacedImage::new(asset, bounds)));
     }
 
@@ -413,8 +493,8 @@ fn decode_element(d: &Doc, assets: &HashMap<ImageId, ImageAsset>) -> Result<Elem
             };
             Geometry::Arrow { from, to, style: arrow_style }
         }
-        "pen" => Geometry::Pen(decode_points(d.req_array("points")?)?),
-        "highlight" => Geometry::Highlight(decode_points(d.req_array("points")?)?),
+        "pen" => Geometry::Pen(decode_shape_points(d)?),
+        "highlight" => Geometry::Highlight(decode_shape_points(d)?),
         "counter" => {
             let center = decode_point(d.req_doc("center")?)?;
             let number = u32::try_from(d.req_i32("number")?).unwrap_or(1).max(1);
@@ -436,7 +516,7 @@ fn decode_element(d: &Doc, assets: &HashMap<ImageId, ImageAsset>) -> Result<Elem
             };
             let strength = d.req_f32("strength")?.clamp(0.0, 1.0);
             let area = match d.req_str("area_kind")? {
-                "brush" => RedactShape::Brush(decode_points(d.req_array("points")?)?),
+                "brush" => RedactShape::Brush(decode_shape_points(d)?),
                 "rect" => RedactShape::Rect(decode_rect(d.req_doc("bounds")?)?),
                 other => return Err(bad(format!("unknown redact area `{other}`"))),
             };

@@ -1,8 +1,8 @@
 //! First-class multi-image composition model: a resizable canvas holding placed
 //! images and vector/text/redaction annotations in unified Z-order.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use tiny_skia::Pixmap;
 
@@ -28,10 +28,23 @@ impl ImageId {
 
 /// Shared immutable raster image asset. Equality compares the asset ID and
 /// dimensions so undo snapshots are O(1) without scanning megabytes of pixels.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ImageAsset {
     pub id: ImageId,
     pixmap: Arc<Pixmap>,
+    opaque: bool,
+    png_cache: Arc<OnceLock<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for ImageAsset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageAsset")
+            .field("id", &self.id)
+            .field("width", &self.width())
+            .field("height", &self.height())
+            .field("opaque", &self.opaque)
+            .finish()
+    }
 }
 
 impl PartialEq for ImageAsset {
@@ -44,16 +57,35 @@ impl Eq for ImageAsset {}
 
 impl ImageAsset {
     pub fn new(pixmap: Pixmap) -> Self {
-        Self { id: ImageId::next(), pixmap: Arc::new(pixmap) }
+        Self::with_id(ImageId::next(), pixmap)
     }
 
     pub fn with_id(id: ImageId, pixmap: Pixmap) -> Self {
         id.observe();
-        Self { id, pixmap: Arc::new(pixmap) }
+        let opaque = pixmap.data().as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+        Self { id, pixmap: Arc::new(pixmap), opaque, png_cache: Arc::new(OnceLock::new()) }
+    }
+
+    pub fn with_id_and_png(id: ImageId, pixmap: Pixmap, png: Vec<u8>) -> Self {
+        let asset = Self::with_id(id, pixmap);
+        let _ = asset.png_cache.set(png);
+        asset
     }
 
     pub fn pixmap(&self) -> &Pixmap {
         &self.pixmap
+    }
+
+    pub fn is_opaque(&self) -> bool {
+        self.opaque
+    }
+
+    pub(crate) fn cached_png(&self) -> Option<&[u8]> {
+        self.png_cache.get().map(Vec::as_slice)
+    }
+
+    pub(crate) fn cache_png(&self, png: Vec<u8>) {
+        let _ = self.png_cache.set(png);
     }
 
     pub fn width(&self) -> u32 {

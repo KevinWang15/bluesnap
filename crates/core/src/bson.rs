@@ -121,6 +121,10 @@ impl Doc {
         Self { fields: Vec::new() }
     }
 
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { fields: Vec::with_capacity(cap) }
+    }
+
     pub fn push(&mut self, key: impl Into<String>, value: Value) -> &mut Self {
         self.fields.push((key.into(), value));
         self
@@ -160,9 +164,56 @@ impl Doc {
 }
 
 pub fn encode(doc: &Doc) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(approx_doc_len(doc, 0));
     write_doc(&mut buf, doc, 0)?;
     Ok(buf)
+}
+
+fn approx_doc_len(doc: &Doc, depth: usize) -> usize {
+    if depth > MAX_DEPTH {
+        return 5;
+    }
+    let mut n = 5usize;
+    for (k, v) in &doc.fields {
+        n = n.saturating_add(2).saturating_add(k.len()).saturating_add(approx_val_len(v, depth));
+    }
+    n
+}
+
+fn approx_val_len(val: &Value, depth: usize) -> usize {
+    match val {
+        Value::Double(_) | Value::Int64(_) => 8,
+        Value::String(s) => 5usize.saturating_add(s.len()),
+        Value::Document(d) => approx_doc_len(d, depth + 1),
+        Value::Array(items) => {
+            if depth + 1 > MAX_DEPTH {
+                return 5;
+            }
+            let mut n = 5usize;
+            for item in items {
+                n = n.saturating_add(6).saturating_add(approx_val_len(item, depth + 1));
+            }
+            n
+        }
+        Value::Binary(b) => 5usize.saturating_add(b.len()),
+        Value::Bool(_) => 1,
+        Value::Null => 0,
+        Value::Int32(_) => 4,
+    }
+}
+
+fn format_usize(mut n: usize, out: &mut [u8; 20]) -> &str {
+    if n == 0 {
+        out[19] = b'0';
+        return std::str::from_utf8(&out[19..]).expect("ascii digit");
+    }
+    let mut pos = 20;
+    while n > 0 {
+        pos -= 1;
+        out[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    std::str::from_utf8(&out[pos..]).expect("ascii digits")
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Doc, Error> {
@@ -225,8 +276,9 @@ fn write_elem(buf: &mut Vec<u8>, key: &str, value: &Value, depth: usize) -> Resu
             }
             let start = buf.len();
             buf.extend_from_slice(&[0; 4]);
+            let mut idx_buf = [0u8; 20];
             for (i, item) in items.iter().enumerate() {
-                write_elem(buf, &i.to_string(), item, depth + 1)?;
+                write_elem(buf, format_usize(i, &mut idx_buf), item, depth + 1)?;
             }
             buf.push(0);
             let len = i32::try_from(buf.len() - start).map_err(|_| err("BSON array exceeds 2 GiB"))?;

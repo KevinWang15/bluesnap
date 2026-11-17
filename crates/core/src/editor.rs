@@ -6,6 +6,7 @@
 //! coordinates and render what it reports.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use crate::composition::{
 };
 use crate::geom::{CursorKind, Handle, Point, Rect, resize_rect_with_handle};
 use crate::pixels::crop;
-use crate::render::{self, Document};
+use crate::render::{self, CanvasBackdrop, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
 use crate::style::{ArrowStyle, Color, CounterFormat, RedactArea, RedactEffect, Redaction, SizeLevel, Style, TextStyle, Tool};
 use crate::text::{Fonts, TextLayout};
@@ -35,6 +36,8 @@ const CANVAS_EDGE_OUTER: f32 = 14.0;
 const CANVAS_EDGE_INNER: f32 = 4.0;
 /// Minimum canvas width/height in logical pixels.
 const MIN_CANVAS_LOGICAL: f32 = 32.0;
+/// Maximum undo snapshots retained per editing session.
+pub const MAX_HISTORY: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextKey {
@@ -119,8 +122,8 @@ enum Workspace {
         width: u32,
         height: u32,
         background: Color,
-        /// Lazily composited `(background + placed images)` for Mosaic/Blur tiles.
-        backdrop: RefCell<Option<Document>>,
+        /// Region-clipped Z-order backdrop + tile cache for Mosaic/Blur redactions.
+        backdrop: RefCell<Option<CanvasBackdrop>>,
     },
 }
 
@@ -136,8 +139,8 @@ pub struct Editor {
     constrain: bool,
     drag: Option<Drag>,
     elements: Vec<Element>,
-    /// Snapshots taken before each undoable change.
-    history: Vec<Snapshot>,
+    /// Snapshots taken before each undoable change (bounded by [`MAX_HISTORY`]).
+    history: VecDeque<Snapshot>,
     selected: Option<usize>,
     tool: Option<Tool>,
     styles: [Style; Tool::ALL.len()],
@@ -218,7 +221,7 @@ impl Editor {
             constrain: false,
             drag: None,
             elements,
-            history: Vec::new(),
+            history: VecDeque::new(),
             selected: None,
             tool: None,
             styles: Tool::ALL.map(Tool::default_style),
@@ -262,7 +265,7 @@ impl Editor {
         *height = comp.height;
         self.elements = comp.elements;
         *backdrop.borrow_mut() = None;
-        self.history.push(prev);
+        self.push_snapshot(prev);
         self.end_change();
         self.tool = None;
         self.selected = Some(img_idx);
@@ -349,20 +352,30 @@ impl Editor {
     }
 
     fn invalidate_backdrop(&mut self) {
-        if let Workspace::Canvas { backdrop, .. } = &mut self.workspace {
+        self.invalidate_backdrop_from(0);
+    }
+
+    /// Invalidates cached redaction backdrop pixels iff the cached `upto` prefix
+    /// includes `first_changed` (`upto > first_changed`).
+    fn invalidate_backdrop_from(&self, first_changed: usize) {
+        if let Workspace::Canvas { backdrop, .. } = &self.workspace
+            && backdrop.borrow().as_ref().is_some_and(|b| b.upto() > first_changed)
+        {
             *backdrop.borrow_mut() = None;
         }
     }
 
-    fn has_image_effect_redactions(&self) -> bool {
-        self.elements.iter().any(|el| {
-            matches!(
-                el,
-                Element::Shape(Shape {
-                    geometry: Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. },
-                    ..
-                })
-            )
+    fn has_effect_redaction_above(&self, idx: usize) -> bool {
+        self.elements.get(idx.saturating_add(1)..).is_some_and(|above| {
+            above.iter().any(|el| {
+                matches!(
+                    el,
+                    Element::Shape(Shape {
+                        geometry: Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. },
+                        ..
+                    })
+                )
+            })
         })
     }
 
@@ -383,7 +396,7 @@ impl Editor {
 
     fn active_index(&self) -> Option<usize> {
         match &self.drag {
-            Some(Drag::Create { idx, .. } | Drag::ElementMove { idx, .. } | Drag::ElementHandle { idx, .. }) => {
+            Some(Drag::Create { idx, .. } | Drag::ElementHandle { idx, .. } | Drag::ElementMove { idx, moved: true, .. }) => {
                 self.elements.get(*idx).and_then(|e| e.as_shape().map(|_| *idx))
             }
             _ => self.text.as_ref().map(|t| t.idx),
@@ -580,6 +593,7 @@ impl Editor {
         {
             (*effect, *strength) = (changed.effect, changed.strength);
         }
+        self.invalidate_backdrop_from(idx);
         if self.continuous.is_none() {
             self.end_change();
         }
@@ -631,6 +645,7 @@ impl Editor {
         {
             *style = new;
         }
+        self.invalidate_backdrop_from(idx);
         if self.text.is_none() {
             self.end_change();
         }
@@ -661,6 +676,7 @@ impl Editor {
         {
             *style = new;
         }
+        self.invalidate_backdrop_from(idx);
         self.end_change();
         self.touch_shapes();
     }
@@ -673,6 +689,7 @@ impl Editor {
                 *f = format;
             }
         }
+        self.invalidate_backdrop();
         self.end_change();
         self.touch_shapes();
     }
@@ -730,6 +747,10 @@ impl Editor {
 
     pub fn can_undo(&self) -> bool {
         !self.history.is_empty()
+    }
+
+    pub fn undo_depth(&self) -> usize {
+        self.history.len().min(MAX_HISTORY)
     }
 
     pub fn has_shapes(&self) -> bool {
@@ -888,8 +909,11 @@ impl Editor {
 
         if let Some((idx, handle)) = self.element_handle_at(p) {
             self.begin_change();
+            let is_shape = self.elements[idx].as_shape().is_some();
             self.drag = Some(Drag::ElementHandle { idx, handle, orig: self.elements[idx].clone(), start: p });
-            self.touch_shapes();
+            if is_shape {
+                self.touch_shapes();
+            }
             return;
         }
         if let Some(handle) = self.selection_handle_at(sel, p) {
@@ -906,7 +930,6 @@ impl Editor {
             self.selected = Some(idx);
             self.begin_change();
             self.drag = Some(Drag::ElementMove { idx, orig: self.elements[idx].clone(), start: p, moved: false });
-            self.touch_shapes();
             return;
         }
         self.selected = None;
@@ -958,7 +981,7 @@ impl Editor {
         } else {
             self.drag = Some(Drag::Create { idx, start: p });
         }
-        self.touch_shapes();
+        self.touch_active();
     }
 
     pub fn pointer_move(&mut self, p: Point, constrain: bool) {
@@ -978,8 +1001,10 @@ impl Editor {
         let screen = self.screen();
         let scale = self.ui_scale;
         let content_scale = self.scale;
-        let mut shape_drag = false;
-        let mut image_changed = false;
+        let is_canvas = matches!(self.workspace, Workspace::Canvas { .. });
+        let mut shape_drag: Option<usize> = None;
+        let mut split_static = false;
+        let mut image_changed: Option<usize> = None;
 
         match self.drag.as_mut().expect("checked") {
             Drag::Pick { start, moved } => {
@@ -1010,9 +1035,10 @@ impl Editor {
                 *current = Rect::new(r.x.round(), r.y.round(), r.w.round().max(min_side), r.h.round().max(min_side));
             }
             Drag::Create { idx, start } => {
-                shape_drag = true;
+                let elem_idx = *idx;
+                shape_drag = Some(elem_idx);
                 let start = *start;
-                if let Some(Shape { geometry, .. }) = self.elements.get_mut(*idx).and_then(Element::as_shape_mut) {
+                if let Some(Shape { geometry, .. }) = self.elements.get_mut(elem_idx).and_then(Element::as_shape_mut) {
                     match geometry {
                         Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
                             *r = Rect::from_points(start, constrained(start, p, constrain))
@@ -1038,30 +1064,47 @@ impl Editor {
                 }
             }
             Drag::ElementMove { idx, orig, start, moved } => {
+                let was_moved = *moved;
                 *moved |= start.distance(p) > DRAG_THRESHOLD * scale;
                 if *moved {
+                    let elem_idx = *idx;
                     let next = orig.translated(p - *start);
-                    image_changed = matches!(next, Element::Image(_));
-                    shape_drag = matches!(next, Element::Shape(_));
-                    self.elements[*idx] = next;
+                    if matches!(next, Element::Image(_)) {
+                        image_changed = Some(elem_idx);
+                    } else {
+                        shape_drag = Some(elem_idx);
+                        split_static = !was_moved;
+                    }
+                    self.elements[elem_idx] = next;
                 }
             }
             Drag::ElementHandle { idx, handle, orig, start } => {
+                let elem_idx = *idx;
                 let next = orig.with_handle_moved(*handle, p - *start, constrain);
-                image_changed = matches!(next, Element::Image(_));
-                shape_drag = matches!(next, Element::Shape(_));
-                self.elements[*idx] = next;
+                if matches!(next, Element::Image(_)) {
+                    image_changed = Some(elem_idx);
+                } else {
+                    shape_drag = Some(elem_idx);
+                }
+                self.elements[elem_idx] = next;
             }
         }
-        if image_changed {
-            self.invalidate_backdrop();
-            if self.has_image_effect_redactions() {
+        if let Some(idx) = image_changed {
+            self.invalidate_backdrop_from(idx);
+            if self.has_effect_redaction_above(idx) {
                 self.touch_shapes();
             } else {
                 self.touch();
             }
+        } else if let Some(idx) = shape_drag {
+            self.invalidate_backdrop_from(idx);
+            if split_static || (is_canvas && self.has_effect_redaction_above(idx)) {
+                self.touch_shapes();
+            } else {
+                self.touch_active();
+            }
         } else if prev != p {
-            if shape_drag { self.touch_active() } else { self.touch() }
+            self.touch();
         }
     }
 
@@ -1071,13 +1114,8 @@ impl Editor {
             self.drag,
             Some(Drag::Create { .. } | Drag::ElementHandle { .. } | Drag::CanvasResize { .. } | Drag::SelResize { .. })
         ) {
-            let active_shape = matches!(self.drag, Some(Drag::Create { .. } | Drag::ElementHandle { .. }));
             self.pointer_move(self.pointer, constrain);
-            if active_shape {
-                self.touch_active();
-            } else {
-                self.touch();
-            }
+            self.touch();
         }
     }
 
@@ -1123,31 +1161,52 @@ impl Editor {
                 self.touch_shapes();
             }
             Drag::Create { idx, .. } => {
-                if self.elements[idx].is_degenerate() {
+                let degenerate = self.elements[idx].is_degenerate();
+                if degenerate {
                     self.elements.remove(idx);
+                    self.invalidate_backdrop_from(idx);
                     self.selected = None;
                 }
                 self.end_change();
-                self.touch_shapes();
+                if degenerate && idx == self.elements.len() {
+                    self.touch_active();
+                } else {
+                    self.touch_shapes();
+                }
             }
             Drag::ElementMove { idx, moved, .. } => {
-                if matches!(self.elements[idx], Element::Image(_)) {
-                    self.invalidate_backdrop();
-                }
                 self.end_change();
-                self.touch_shapes();
-                if !moved
-                    && self.elements.get(idx).and_then(Element::as_shape).is_some_and(|s| matches!(s.geometry, Geometry::Text { .. }))
-                {
-                    self.edit_text(idx, p);
+                if !moved {
+                    if self
+                        .elements
+                        .get(idx)
+                        .and_then(Element::as_shape)
+                        .is_some_and(|s| matches!(s.geometry, Geometry::Text { .. }))
+                    {
+                        self.edit_text(idx, p);
+                    } else {
+                        self.touch();
+                    }
+                } else {
+                    self.invalidate_backdrop_from(idx);
+                    if matches!(self.elements[idx], Element::Shape(_)) || self.has_effect_redaction_above(idx) {
+                        self.touch_shapes();
+                    } else {
+                        self.touch();
+                    }
                 }
             }
-            Drag::ElementHandle { idx, .. } => {
-                if matches!(self.elements[idx], Element::Image(_)) {
-                    self.invalidate_backdrop();
+            Drag::ElementHandle { idx, orig, .. } => {
+                let changed = self.elements[idx] != orig;
+                if changed {
+                    self.invalidate_backdrop_from(idx);
                 }
                 self.end_change();
-                self.touch_shapes();
+                if matches!(self.elements[idx], Element::Shape(_)) || (changed && self.has_effect_redaction_above(idx)) {
+                    self.touch_shapes();
+                } else {
+                    self.touch();
+                }
             }
         }
     }
@@ -1233,6 +1292,7 @@ impl Editor {
             if let Some(shape) = self.elements.get_mut(idx).and_then(Element::as_shape_mut) {
                 f(&mut shape.style);
             }
+            self.invalidate_backdrop_from(idx);
             if self.text.is_none() {
                 self.end_change();
             }
@@ -1243,7 +1303,7 @@ impl Editor {
     pub fn undo(&mut self) -> bool {
         self.finish_text();
         self.drag = None;
-        let Some(prev) = self.history.pop() else { return false };
+        let Some(prev) = self.history.pop_back() else { return false };
         if let Workspace::Canvas { width, height, backdrop, .. } = &mut self.workspace {
             let old_dims = (*width, *height);
             (*width, *height) = prev.canvas;
@@ -1268,11 +1328,10 @@ impl Editor {
         }
         let Some(idx) = self.selected.take() else { return false };
         self.begin_change();
-        let removed = self.elements.remove(idx);
-        if matches!(removed, Element::Image(_)) {
-            self.invalidate_backdrop();
-        }
+        self.elements.remove(idx);
+        self.invalidate_backdrop();
         renumber_counters_in(&mut self.elements);
+        self.end_change();
         self.touch_shapes();
         true
     }
@@ -1281,13 +1340,26 @@ impl Editor {
         Snapshot { canvas: self.canvas_dims(), elements: self.elements.clone() }
     }
 
+    fn push_snapshot(&mut self, snap: Snapshot) {
+        // Allow one in-flight tentative snapshot (`MAX_HISTORY + 1`) so a no-op
+        // click reverted by `end_change()` never evicts the oldest undo entry.
+        while self.history.len() > MAX_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(snap);
+    }
+
     fn begin_change(&mut self) {
-        self.history.push(self.current_snapshot());
+        self.push_snapshot(self.current_snapshot());
     }
 
     fn end_change(&mut self) {
-        if self.history.last().is_some_and(|last| last.canvas == self.canvas_dims() && last.elements == self.elements) {
-            self.history.pop();
+        if self.history.back().is_some_and(|last| last.canvas == self.canvas_dims() && last.elements == self.elements) {
+            self.history.pop_back();
+        } else {
+            while self.history.len() > MAX_HISTORY {
+                self.history.pop_front();
+            }
         }
     }
 
@@ -1302,6 +1374,7 @@ impl Editor {
         self.selected = Some(idx);
         self.text = Some(TextEdit { idx, caret: 0, marked: None });
         self.set_caret_from_point(p);
+        self.touch_shapes();
     }
 
     fn set_caret_from_point(&mut self, p: Point) {
@@ -1318,12 +1391,20 @@ impl Editor {
 
     pub fn finish_text(&mut self) {
         let Some(edit) = self.text.take() else { return };
-        if self.elements.get(edit.idx).is_some_and(Element::is_degenerate) {
+        let removed_tail = if self.elements.get(edit.idx).is_some_and(Element::is_degenerate) {
             self.elements.remove(edit.idx);
+            self.invalidate_backdrop_from(edit.idx);
             self.selected = None;
-        }
+            edit.idx == self.elements.len()
+        } else {
+            false
+        };
         self.end_change();
-        self.touch_shapes();
+        if removed_tail {
+            self.touch_active();
+        } else {
+            self.touch_shapes();
+        }
     }
 
     pub fn text_content(&self) -> Option<&str> {
@@ -1366,9 +1447,15 @@ impl Editor {
             .map(|c| range.start + c.min(new_text.len()))
             .filter(|c| content.is_char_boundary(*c))
             .unwrap_or(end);
+        let idx = edit.idx;
         let marked = (mark && !new_text.is_empty()).then_some(range.start..end);
         self.text = Some(TextEdit { caret, marked, ..edit });
-        self.touch_active();
+        self.invalidate_backdrop_from(idx);
+        if matches!(self.workspace, Workspace::Canvas { .. }) && self.has_effect_redaction_above(idx) {
+            self.touch_shapes();
+        } else {
+            self.touch_active();
+        }
     }
 
     pub fn text_key(&mut self, key: TextKey) {
@@ -1473,7 +1560,14 @@ impl Editor {
     }
 
     pub fn render_band(&self, range: Range<usize>, active: bool, clip: Rect) -> Option<(Rect, Pixmap)> {
-        let shapes: Vec<&Shape> = self.elements.get(range)?.iter().filter_map(Element::as_shape).collect();
+        let start = range.start;
+        let shapes: Vec<(usize, &Shape)> = self
+            .elements
+            .get(range)?
+            .iter()
+            .enumerate()
+            .filter_map(|(off, el)| Some((start + off, el.as_shape()?)))
+            .collect();
         if shapes.is_empty() {
             return None;
         }
@@ -1487,12 +1581,12 @@ impl Editor {
 
     pub fn render_static_layer(&self, clip: Rect) -> Option<(Rect, Pixmap)> {
         let active = self.active_index();
-        let shapes: Vec<&Shape> = self
+        let shapes: Vec<(usize, &Shape)> = self
             .elements
             .iter()
             .enumerate()
             .filter(|(i, _)| Some(*i) != active)
-            .filter_map(|(_, el)| el.as_shape())
+            .filter_map(|(i, el)| Some((i, el.as_shape()?)))
             .collect();
         self.render_shapes(&shapes, None, clip)
     }
@@ -1501,40 +1595,41 @@ impl Editor {
         let idx = self.active_index()?;
         let shape = self.elements.get(idx)?.as_shape()?;
         let underline = self.text.as_ref().and_then(|e| Some((0, e.marked.clone()?)));
-        self.render_shapes(&[shape], underline, clip)
+        self.render_shapes(&[(idx, shape)], underline, clip)
     }
 
-    fn render_shapes(&self, shapes: &[&Shape], underline: Option<render::Underline>, clip: Rect) -> Option<(Rect, Pixmap)> {
+    fn render_shapes(
+        &self,
+        shapes: &[(usize, &Shape)],
+        underline: Option<render::Underline>,
+        clip: Rect,
+    ) -> Option<(Rect, Pixmap)> {
         if shapes.is_empty() {
             return None;
         }
         let m = self.metrics();
-        let bounds = shapes.iter().map(|s| s.bounds(m)).reduce(|a, b| a.union(&b))?;
+        let bounds = shapes.iter().map(|(_, s)| s.bounds(m)).reduce(|a, b| a.union(&b))?;
         let canvas = self.active_canvas_rect();
         let region = bounds.inflate(1.0).round_out().intersect(&canvas)?.intersect(&clip.round_out())?;
 
         match &self.workspace {
             Workspace::Capture { doc, .. } => {
-                let pixmap = render::render_layer(doc, region, shapes, m, underline)?;
+                let plain: Vec<&Shape> = shapes.iter().map(|(_, s)| *s).collect();
+                let pixmap = render::render_layer(doc, region, &plain, m, underline)?;
                 Some((region, pixmap))
             }
             Workspace::Canvas { width, height, background, backdrop } => {
-                let needs_backdrop = shapes.iter().any(|s| {
-                    matches!(s.geometry, Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. })
-                });
-                if needs_backdrop {
-                    let mut guard = backdrop.borrow_mut();
-                    if guard.is_none() {
-                        *guard = render::render_canvas_backdrop(*width, *height, *background, &self.elements);
-                    }
-                    let doc = guard.as_ref()?;
-                    let pixmap = render::render_layer(doc, region, shapes, m, underline)?;
-                    Some((region, pixmap))
-                } else {
-                    let dummy = Document::from_pixmap(Pixmap::new(1, 1)?);
-                    let pixmap = render::render_layer(&dummy, region, shapes, m, underline)?;
-                    Some((region, pixmap))
-                }
+                let pixmap = render::render_canvas_layer(
+                    (*width, *height),
+                    *background,
+                    &self.elements,
+                    backdrop,
+                    region,
+                    shapes,
+                    m,
+                    underline,
+                )?;
+                Some((region, pixmap))
             }
         }
     }

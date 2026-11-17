@@ -65,7 +65,11 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
-        Self::from_edges(x, y, x + w, y + h)
+        if w >= 0.0 && h >= 0.0 {
+            Self { x, y, w, h }
+        } else {
+            Self::from_edges(x, y, x + w, y + h)
+        }
     }
 
     pub fn from_points(a: Point, b: Point) -> Self {

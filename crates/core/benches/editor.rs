@@ -5,12 +5,17 @@
 //! event to the editor, re-rasterize the annotation layers that changed and convert
 //! them to the BGRA layout uploaded to the GPU.
 
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use bluesnap_core::pixels::split_bgrx;
+use bluesnap_core::format::{decode_bs, encode_bs};
+use bluesnap_core::pixels::{pixmap_from_rgba, split_bgrx};
 use bluesnap_core::render::{swap_red_blue, to_bgra_straight};
-use bluesnap_core::{Document, Editor, FontSet, Fonts, Point, RedactArea, RedactEffect, Rect, TextStyle, Tool};
+use bluesnap_core::{
+    Composition, Document, Editor, FontSet, Fonts, ImageId, Point, Rect, RedactArea, RedactEffect, TextStyle, Tool,
+    VisualBand,
+};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const W4K: u32 = 3840;
@@ -391,5 +396,281 @@ fn scrolling(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, startup, frames, output, redaction, tools, scrolling);
+/// Mirrors `CanvasView::sync_gpu_resources` + `LayerBandPool` + `ImageAtlasCache`:
+/// uploads each unique `ImageAsset` once, and re-rasterizes + converts (`to_bgra_straight`)
+/// only those `VisualBand::Shapes` whose `(revision, start, end, clip)` changed.
+type BandKey = (u64, usize, usize, [i32; 4]);
+
+#[derive(Default)]
+struct BandPresenter {
+    uploaded_images: HashSet<ImageId>,
+    shape_bands: Vec<Option<BandKey>>,
+}
+
+impl BandPresenter {
+    fn present(&mut self, e: &Editor, clip: Rect) -> usize {
+        let bands = e.visual_bands();
+        let mut bytes = 0;
+        for b in &bands {
+            if let VisualBand::Image(img) = b
+                && self.uploaded_images.insert(img.asset.id)
+            {
+                bytes += to_bgra_straight(img.asset.pixmap()).len();
+            }
+        }
+        let shape_count = bands.iter().filter(|b| matches!(b, VisualBand::Shapes { .. })).count();
+        self.shape_bands.truncate(shape_count);
+        while self.shape_bands.len() < shape_count {
+            self.shape_bands.push(None);
+        }
+        let clip_key = [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32];
+        let mut slot = 0;
+        for b in bands {
+            if let VisualBand::Shapes { range, revision, active } = b {
+                let key = (revision, range.start, range.end, clip_key);
+                if self.shape_bands[slot] != Some(key) {
+                    self.shape_bands[slot] = Some(key);
+                    if let Some((_, p)) = e.render_band(range, active, clip) {
+                        bytes += to_bgra_straight(&p).len();
+                    }
+                }
+                slot += 1;
+            }
+        }
+        bytes
+    }
+}
+
+/// Multi-image 4K composition with `n_images` screenshots and `n_shapes` mixed annotations.
+fn multi_image_editor(n_images: usize, img_w: u32, img_h: u32, n_shapes: usize) -> Editor {
+    let first = pixmap_from_rgba(img_w, img_h, screenshot(img_w, img_h)).unwrap();
+    let mut comp = Composition::from_slice(first, 2.0, Vec::new());
+    comp.width = W4K;
+    comp.height = H4K;
+    let mut e = Editor::from_composition(comp, fonts());
+    for k in 1..n_images {
+        let img = pixmap_from_rgba(img_w, img_h, screenshot(img_w, img_h)).unwrap();
+        let idx = e.append_slice(img, 2.0, Vec::new()).unwrap();
+        // Spread placed images across the 4K canvas.
+        let target = ((k % 2) as f32 * 1600.0 + 100.0, (k / 2) as f32 * 950.0 + 80.0);
+        let b = e.elements()[idx].bounds(bluesnap_core::shape::Metrics { scale: 2.0, fonts: &Fonts::empty() });
+        drag(&mut e, (b.x + 40.0, b.y + 40.0), (target.0 + 40.0, target.1 + 40.0));
+    }
+    e.clear_tool_or_selection();
+    let tools = [Tool::Rect, Tool::Ellipse, Tool::Arrow, Tool::Pen, Tool::Highlighter];
+    for i in 0..n_shapes {
+        let tool = tools[i % tools.len()];
+        e.toggle_tool(tool);
+        let (x, y) = (80.0 + (i % 6) as f32 * 580.0, 80.0 + (i / 6) as f32 * 240.0);
+        drag(&mut e, (x, y), (x + 360.0, y + 180.0));
+        e.toggle_tool(tool);
+    }
+    e.clear_tool_or_selection();
+    e
+}
+
+fn composition(c: &mut Criterion) {
+    let mut g = c.benchmark_group("composition");
+    g.sample_size(15);
+
+    // Plain click on an existing shape to select it (down + up without moving).
+    g.bench_function("click_select_shape/4k_50_shapes", |b| {
+        let mut e = multi_image_editor(2, 1600, 1000, 50);
+        let clip = e.screen();
+        let mut presenter = BandPresenter::default();
+        presenter.present(&e, clip);
+        b.iter(|| {
+            e.clear_tool_or_selection();
+            e.pointer_down(Point::new(80.0, 80.0)); // top-left edge of Rect #0
+            let down_bytes = presenter.present(&e, clip);
+            e.pointer_up(Point::new(80.0, 80.0));
+            let up_bytes = presenter.present(&e, clip);
+            black_box(down_bytes + up_bytes)
+        });
+    });
+
+    // Starting a new shape (`pointer_down` + degenerate `pointer_up`) over 50 static shapes.
+    g.bench_function("start_new_stroke/4k_50_shapes", |b| {
+        let mut e = multi_image_editor(2, 1600, 1000, 50);
+        e.toggle_tool(Tool::Rect);
+        let clip = e.screen();
+        let mut presenter = BandPresenter::default();
+        presenter.present(&e, clip);
+        b.iter(|| {
+            e.pointer_down(Point::new(3700.0, 2050.0));
+            let down_bytes = presenter.present(&e, clip);
+            e.pointer_up(Point::new(3700.0, 2050.0));
+            let up_bytes = presenter.present(&e, clip);
+            black_box(down_bytes + up_bytes)
+        });
+    });
+
+    // Full gesture moving a placed image (`pointer_down` + 8 moves + `pointer_up`) with 40 annotations.
+    g.bench_function("drag_placed_image_gesture/4k_4_images_40_shapes", |b| {
+        let mut e = multi_image_editor(4, 1200, 800, 40);
+        let clip = e.screen();
+        let mut presenter = BandPresenter::default();
+        presenter.present(&e, clip);
+        let mut dir = 1.0f32;
+        b.iter(|| {
+            // Find current center of image #0 so we hit it cleanly.
+            let img_bounds = e.elements()[0].as_image().unwrap().bounds;
+            let start = (img_bounds.x + img_bounds.w * 0.5, img_bounds.y + img_bounds.h * 0.5);
+            let end = (start.0 + 40.0 * dir, start.1 + 24.0 * dir);
+            dir = -dir;
+            let mut total = 0;
+            e.pointer_down(Point::new(start.0, start.1));
+            total += presenter.present(&e, clip);
+            for step in 1..=8 {
+                let t = step as f32 / 8.0;
+                e.pointer_move(Point::new(start.0 + (end.0 - start.0) * t, start.1 + (end.1 - start.1) * t), false);
+                total += presenter.present(&e, clip);
+            }
+            e.pointer_up(Point::new(end.0, end.1));
+            total += presenter.present(&e, clip);
+            black_box(total)
+        });
+    });
+
+    // Live Blur redaction on a tall 1600x12000 composition when underlying image moves slightly.
+    g.bench_function("live_blur_tall_canvas/1600x12000_small_blur", |b| {
+        let tall = pixmap_from_rgba(1600, 12_000, text_page(1600, 12_000)).unwrap();
+        let comp = Composition::from_slice(tall, 2.0, Vec::new());
+        let mut e = Editor::from_composition(comp, fonts());
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
+        drag(&mut e, (200.0, 5000.0), (500.0, 5120.0));
+        e.toggle_tool(Tool::Redact);
+        let clip = Rect::new(0.0, 4500.0, 1600.0, 1500.0);
+        let mut presenter = BandPresenter::default();
+        presenter.present(&e, clip);
+        // Select the blur redaction and vary its strength slider.
+        e.pointer_down(Point::new(350.0, 5060.0));
+        e.pointer_up(Point::new(350.0, 5060.0));
+        e.begin_continuous_edit();
+        let mut step = 0u32;
+        b.iter(|| {
+            step += 1;
+            // Also invalidate when image shifts vs slider change: test cold backdrop + blur on tall canvas!
+            e.set_redaction(|r| r.strength = 0.2 + (step % 25) as f32 * 0.03);
+            black_box(presenter.present(&e, clip))
+        });
+        e.end_continuous_edit();
+    });
+
+    // Cold live Blur redaction after image move on a tall 1600x12000 canvas.
+    g.bench_function("live_blur_after_image_move/1600x12000", |b| {
+        let tall = pixmap_from_rgba(1600, 12_000, text_page(1600, 12_000)).unwrap();
+        let comp = Composition::from_slice(tall, 2.0, Vec::new());
+        let mut e = Editor::from_composition(comp, fonts());
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
+        drag(&mut e, (200.0, 5000.0), (500.0, 5120.0));
+        e.toggle_tool(Tool::Redact);
+        let clip = Rect::new(0.0, 4500.0, 1600.0, 1500.0);
+        let mut presenter = BandPresenter::default();
+        presenter.present(&e, clip);
+        e.pointer_down(Point::new(800.0, 2000.0)); // grab underlying tall image
+        e.pointer_move(Point::new(820.0, 2000.0), false); // cross drag threshold once before timing
+        presenter.present(&e, clip);
+        let mut step = 0u32;
+        b.iter(|| {
+            step += 1;
+            e.pointer_move(Point::new(820.0 + (step % 16) as f32 * 3.0, 2000.0), false);
+            black_box(presenter.present(&e, clip))
+        });
+        e.pointer_up(Point::new(820.0, 2000.0));
+    });
+
+    // Multi-image export with a large 1600x1000 Blur redaction (`render_composition`).
+    g.bench_function("export_multi_image_blur/4k_4_images_1600x1000_blur", |b| {
+        let mut e = multi_image_editor(4, 1200, 800, 20);
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
+        drag(&mut e, (600.0, 400.0), (2200.0, 1400.0));
+        e.toggle_tool(Tool::Redact);
+        b.iter(|| black_box(e.export()));
+    });
+
+    g.finish();
+}
+
+fn bs_format(c: &mut Criterion) {
+    let mut g = c.benchmark_group("bs_format");
+    g.sample_size(10);
+
+    // Build a 4-image (4 × 1280x720 noisy screenshots) composition with 30 long pen/highlight strokes.
+    let make_scene = || {
+        let first = pixmap_from_rgba(1280, 720, screenshot(1280, 720)).unwrap();
+        let mut comp = Composition::from_slice(first, 2.0, Vec::new());
+        comp.width = 2800;
+        comp.height = 1800;
+        let mut e = Editor::from_composition(comp, fonts());
+        for _ in 1..4 {
+            let img = pixmap_from_rgba(1280, 720, screenshot(1280, 720)).unwrap();
+            e.append_slice(img, 2.0, Vec::new());
+        }
+        for s in 0..30 {
+            let tool = if s % 2 == 0 { Tool::Pen } else { Tool::Highlighter };
+            e.toggle_tool(tool);
+            let y0 = 60.0 + (s as f32) * 52.0;
+            e.pointer_down(Point::new(60.0, y0));
+            for p in 1..=250 {
+                let x = 60.0 + p as f32 * 8.0;
+                let y = y0 + (p as f32 * 0.25).sin() * 18.0;
+                e.pointer_move(Point::new(x, y), false);
+            }
+            e.pointer_up(Point::new(2060.0, y0));
+            e.toggle_tool(tool);
+        }
+        e.to_composition().unwrap()
+    };
+
+    let warm_comp = make_scene();
+    let encoded_bytes = encode_bs(&warm_comp).unwrap();
+
+    g.bench_function("encode_cold/4x720p_30_strokes", |b| {
+        b.iter_batched(make_scene, |comp| black_box(encode_bs(&comp).unwrap()), BatchSize::LargeInput);
+    });
+
+    g.bench_function("encode_resave/4x720p_30_strokes", |b| {
+        b.iter(|| black_box(encode_bs(&warm_comp).unwrap()));
+    });
+
+    g.bench_function("decode/4x720p_30_strokes", |b| {
+        b.iter(|| black_box(decode_bs(&encoded_bytes).unwrap()));
+    });
+
+    // Pure vector/stroke serialization benchmark (1 tiny image + 50 strokes × 400 points = 20,000 points).
+    let stroke_comp = {
+        let tiny = pixmap_from_rgba(16, 16, screenshot(16, 16)).unwrap();
+        let mut comp = Composition::from_slice(tiny, 1.0, Vec::new());
+        comp.width = 2400;
+        comp.height = 1600;
+        let mut e = Editor::from_composition(comp, fonts());
+        for s in 0..50 {
+            e.toggle_tool(Tool::Pen);
+            let y0 = 20.0 + s as f32 * 28.0;
+            e.pointer_down(Point::new(20.0, y0));
+            for p in 1..=400 {
+                e.pointer_move(Point::new(20.0 + p as f32 * 5.0, y0 + (p as f32 * 0.2).sin() * 10.0), false);
+            }
+            e.pointer_up(Point::new(2020.0, y0));
+            e.toggle_tool(Tool::Pen);
+        }
+        e.to_composition().unwrap()
+    };
+    let stroke_bytes = encode_bs(&stroke_comp).unwrap();
+
+    g.bench_function("encode_strokes/20k_points", |b| {
+        b.iter(|| black_box(encode_bs(&stroke_comp).unwrap()));
+    });
+    g.bench_function("decode_strokes/20k_points", |b| {
+        b.iter(|| black_box(decode_bs(&stroke_bytes).unwrap()));
+    });
+
+    g.finish();
+}
+
+criterion_group!(benches, startup, frames, output, redaction, tools, scrolling, composition, bs_format);
 criterion_main!(benches);
