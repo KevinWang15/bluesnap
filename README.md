@@ -233,22 +233,32 @@ cargo run --release -p bluesnap
 ### macOS Screen Recording permission
 
 macOS shows only the wallpaper (or plain gray) in place of windows until bluesnap
-has Screen Recording permission, and on macOS 15+ it ignores that permission for
-unsigned or ad-hoc signed apps. bluesnap shows a banner with an "Open Settings"
-button when the permission is missing. To make the permission stick, sign the app
-with a real identity:
+has Screen Recording permission. bluesnap shows a banner with an "Open Settings"
+button when the permission is missing.
 
-- CI: add the repository secrets `MACOS_CERTIFICATE_P12` (base64 of a `.p12` with a
-  "Developer ID Application" or "Apple Development" certificate and its key),
-  `MACOS_CERTIFICATE_PASSWORD` and `MACOS_SIGNING_IDENTITY` (e.g.
-  `Developer ID Application: Your Name (TEAMID)`).
-- Locally: create an "Apple Development" certificate (a free Apple ID works:
-  Xcode → Settings → Accounts → Manage Certificates → +), then
-  `codesign --force --sign "Apple Development: you@example.com (TEAMID)" bluesnap.app`.
+The complete app bundle must be code-signed, but an Apple-issued identity is not
+required for local use. CI ad-hoc signs the app when no certificate is configured;
+local builds can do the same:
 
-Then open the app, enable it under System Settings → Privacy & Security → Screen &
+```bash
+codesign --force --sign - bluesnap.app
+codesign --verify --deep --strict --verbose=2 bluesnap.app
+```
+
+A "Developer ID Application" or "Apple Development" identity is still recommended
+for distribution and can preserve permission grants across rebuilds. For local
+builds, pass that identity to `codesign` instead of `-`. CI accepts these repository
+secrets:
+
+- `MACOS_CERTIFICATE_P12`: base64 of a `.p12` containing the certificate and key
+- `MACOS_CERTIFICATE_PASSWORD`: the `.p12` password
+- `MACOS_SIGNING_IDENTITY`: for example, `Developer ID Application: Your Name (TEAMID)`
+
+Open the app, enable it under System Settings → Privacy & Security → Screen &
 System Audio Recording, and restart it from the menu bar icon (Quit, then reopen).
-If an old entry gets in the way: `tccutil reset ScreenCapture com.kevinwang15.bluesnap`.
+Ad-hoc permission grants can be tied to a build's code hash, so rebuilds may require
+re-enabling permission. If an old entry gets in the way:
+`tccutil reset ScreenCapture com.kevinwang15.bluesnap`.
 - **Linux**: builds for development (needs `libxkbcommon-x11-dev` and friends), but
   capturing isn't implemented.
 

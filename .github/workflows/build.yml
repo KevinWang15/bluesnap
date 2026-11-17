@@ -58,10 +58,10 @@ jobs:
       - name: Build release
         run: cargo build --release --locked -p bluesnap
 
-      # macOS only honors the Screen Recording permission for apps signed with a
-      # real identity. Set the MACOS_CERTIFICATE_P12 (base64 .p12),
-      # MACOS_CERTIFICATE_PASSWORD and MACOS_SIGNING_IDENTITY secrets to sign;
-      # without them the bundle is ad-hoc signed.
+      # Always sign the complete bundle; ad-hoc signing supports local permissions.
+      # Set MACOS_CERTIFICATE_P12 (base64 .p12), MACOS_CERTIFICATE_PASSWORD and
+      # MACOS_SIGNING_IDENTITY to use a real identity for distribution and stable
+      # permission grants across rebuilds.
       - name: Bundle and sign macOS app
         if: runner.os == 'macOS'
         env:
@@ -88,7 +88,7 @@ jobs:
             security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
             codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$app"
           else
-            echo "::warning::No signing certificate configured; ad-hoc signing. macOS will not grant Screen Recording to this build."
+            echo "::warning::No signing certificate configured; ad-hoc signing. Re-enable Screen Recording if macOS ties the grant to a previous build's code hash."
             codesign --force --sign - "$app"
           fi
           codesign --verify --verbose "$app"
