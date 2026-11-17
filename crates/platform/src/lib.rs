@@ -150,6 +150,9 @@ pub trait Platform {
 
     /// Turns a freshly opened window into the capture overlay: exactly covering
     /// `display` (including menu bars/taskbars), above every other window, focused.
+    /// Whether [`Platform::color_dialog`] opens a native custom color picker.
+    const HAS_COLOR_DIALOG: bool = false;
+
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
     /// Yields active application focus back to whichever app was frontmost before
@@ -237,6 +240,16 @@ pub trait Platform {
     fn start_at_login(&self) -> bool {
         false
     }
+    /// Native custom color picker dialog parented to `owner`.
+    /// Returns `Ok(None)` when cancelled or unsupported.
+    fn color_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        _initial: bluesnap_core::Color,
+    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
+        Ok(None)
+    }
+
 
     /// Makes this executable start when the user logs in, or stops that.
     fn set_start_at_login(&self, _enabled: bool) -> anyhow::Result<()> {

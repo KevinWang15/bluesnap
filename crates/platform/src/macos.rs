@@ -59,6 +59,7 @@ impl Platform for Native {
     const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
+    const HAS_COLOR_DIALOG: bool = true;
         let mtm = MainThreadMarker::new().context("init must run on the main thread")?;
         // Background utility: no Dock icon or menu bar.
         NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -342,6 +343,35 @@ impl Platform for Native {
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
         let style = crate::tray::Style {
+    fn color_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        initial: bluesnap_core::Color,
+    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
+        let (r, g, b) = if initial.is_transparent() { (255, 255, 255) } else { (initial.r, initial.g, initial.b) };
+        let script = format!(
+            "choose color default color {{{}, {}, {}}}",
+            (r as u32) * 257,
+            (g as u32) * 257,
+            (b as u32) * 257
+        );
+        let out = std::process::Command::new("osascript").args(["-e", &script]).output()?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut parts = s.trim().split(',').filter_map(|p| p.trim().parse::<u32>().ok());
+        let (Some(cr), Some(cg), Some(cb)) = (parts.next(), parts.next(), parts.next()) else {
+            return Ok(None);
+        };
+        Ok(Some(bluesnap_core::Color {
+            r: ((cr + 128) / 257).min(255) as u8,
+            g: ((cg + 128) / 257).min(255) as u8,
+            b: ((cb + 128) / 257).min(255) as u8,
+            a: 255,
+        }))
+    }
+
             icon_png: include_bytes!("../assets/tray-macos-template-36.png"),
             template: true,
             left_click_captures: false,

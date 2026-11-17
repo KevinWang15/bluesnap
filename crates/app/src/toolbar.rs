@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use bluesnap_core::{
-    ArrowStyle, Color, CounterFormat, LayerOrder, PALETTE, RedactArea, RedactEffect, Redaction, SizeLevel, THEME_BLUE,
-    TextStyle, Tool,
+    ArrowStyle, BACKGROUND_PALETTE, Color, CounterFormat, LayerOrder, PALETTE, RedactArea, RedactEffect, Redaction,
+    SizeLevel, THEME_BLUE, TextStyle, Tool,
 };
 use gpui::{
     AnyElement, AnyView, App, AppContext, Context, Div, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
@@ -698,6 +698,171 @@ pub fn text_style_menu(
     menu.into_any_element()
 }
 
+const BG_COLS: usize = 6;
+const BG_SWATCH_BTN: f32 = 26.0;
+const BG_SWATCH_GAP: f32 = 4.0;
+const BG_PAD: f32 = 8.0;
+
+pub fn background_menu_size() -> (f32, f32) {
+    let rows = BACKGROUND_PALETTE.len().div_ceil(BG_COLS);
+    let inner_w = BG_COLS as f32 * BG_SWATCH_BTN + (BG_COLS - 1) as f32 * BG_SWATCH_GAP;
+    let swatches_h = rows as f32 * BG_SWATCH_BTN + rows.saturating_sub(1) as f32 * BG_SWATCH_GAP;
+    let w = 2.0 * (BORDER + BG_PAD) + inner_w;
+    // Title (18) + gap (6) + swatches + divider (1 + 2*6) + footer (24).
+    let h = 2.0 * (BORDER + BG_PAD) + 18.0 + 6.0 + swatches_h + 13.0 + 24.0;
+    (w, h)
+}
+
+fn color_chip(color: Color, chip_px: f32) -> Div {
+    if color.is_transparent() {
+        let half = chip_px / 2.0;
+        div()
+            .size(px(chip_px))
+            .rounded(px(3.5))
+            .overflow_hidden()
+            .bg(white())
+            .border_1()
+            .border_color(rgba(0x0000_0033))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(div().size(px(half)).bg(rgb(0xCBD5E1)))
+                    .child(div().size(px(half)).bg(white())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .child(div().size(px(half)).bg(white()))
+                    .child(div().size(px(half)).bg(rgb(0xCBD5E1))),
+            )
+    } else {
+        div().size(px(chip_px)).rounded(px(3.5)).bg(hsla(color)).border_1().border_color(rgba(0x0000_0033))
+    }
+}
+
+/// Context-menu-style floating toolbar anchored under the cursor when the user
+/// right-clicks exposed background space in the Composition Editor.
+pub fn background_menu(
+    current: Color,
+    has_custom: bool,
+    x: f32,
+    y: f32,
+    cx: &mut Context<CanvasView>,
+) -> AnyElement {
+    let (w, h) = background_menu_size();
+    let mut card = div()
+        .id("background-color-menu")
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        .p(px(BG_PAD))
+        .flex()
+        .flex_col()
+        .rounded(px(8.0))
+        .bg(white())
+        .border_1()
+        .border_color(rgba(0x0000_0022))
+        .shadow_lg()
+        .occlude()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .child(
+            div()
+                .h(px(18.0))
+                .mb(px(6.0))
+                .flex()
+                .items_center()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0x333333))
+                .child("Background color"),
+        );
+
+    for (row_idx, chunk) in BACKGROUND_PALETTE.chunks(BG_COLS).enumerate() {
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(BG_SWATCH_GAP))
+            .when(row_idx > 0, |d| d.mt(px(BG_SWATCH_GAP)));
+        for &(color, label) in chunk {
+            let active = color == current;
+            row = row.child(
+                div()
+                    .id(label)
+                    .tooltip(tooltip(label))
+                    .size(px(BG_SWATCH_BTN))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .when(active, |d| d.border_2().border_color(hsla(THEME_BLUE)))
+                    .when(!active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
+                    .child(color_chip(color, 18.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        on_press(cx, move |this, _, _| this.choose_background_color(color)),
+                    ),
+            );
+        }
+        card = card.child(row);
+    }
+
+    let hex_label = if current.is_transparent() {
+        "Transparent".to_string()
+    } else {
+        format!("#{:06X}", current.to_hex())
+    };
+    let mut footer = div()
+        .h(px(24.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(color_chip(current, 14.0))
+                .child(div().text_size(px(11.5)).text_color(rgb(0x555555)).child(hex_label)),
+        );
+    if has_custom {
+        footer = footer.child(
+            div()
+                .id("bg-custom-color")
+                .tooltip(tooltip("Choose a custom background color"))
+                .px(px(7.0))
+                .h(px(22.0))
+                .flex()
+                .items_center()
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(hsla(THEME_BLUE))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgba(0x1677_FF1A)))
+                .child("Custom…")
+                .on_mouse_down(
+                    MouseButton::Left,
+                    on_press(cx, |this, window, cx| this.pick_custom_background_color(window, cx)),
+                ),
+        );
+    }
+
+    card.child(div().w_full().h(px(1.0)).my(px(6.0)).bg(rgba(0x0000_0014)))
+        .child(footer)
+        .into_any_element()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Auto {
     Ready,
@@ -879,5 +1044,12 @@ mod tests {
         assert_eq!(slider_value(100.0, (lo + hi) / 2.0), 0.5);
         assert_eq!(slider_value(100.0, lo - 50.0), 0.0);
         assert_eq!(slider_value(100.0, hi + 50.0), 1.0);
+    }
+
+    #[test]
+    fn background_menu_dimensions_fit_palette_grid_and_controls() {
+        let (w, h) = background_menu_size();
+        assert_eq!(w, 194.0);
+        assert_eq!(h, 135.0);
     }
 }

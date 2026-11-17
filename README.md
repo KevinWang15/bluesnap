@@ -81,7 +81,9 @@ Press the hotkey, then:
     corner handle to lock an image's aspect ratio), restyle it, reorder it forward or
     backward, or delete it
   - drag any edge or corner of the canvas itself to grow or crop the composition
-    workspace (with full undo across canvas resizes, image moves/resizes and shapes)
+    workspace (with full undo across canvas resizes, image moves/resizes and shapes),
+    or right-click exposed canvas background to pick a **Background color** (solid
+    swatches, transparent checkerboard, or native OS color picker), saved in `.bs`
   - click **Add image** on the far left of the toolbar to hide the editor temporarily
     and capture another screenshot; **✓** adds that capture straight into the editor
   - click **Open** (next to Add image) to load a saved `.bs` composition or image file

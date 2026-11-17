@@ -11,9 +11,9 @@ use bluesnap_core::pixels::{pixmap_from_rgba, to_rgba_straight};
 use bluesnap_core::render::draw_placed_image;
 use bluesnap_core::shape::{Geometry, Metrics, RedactShape, Shape};
 use bluesnap_core::{
-    ArrowStyle, Color, Composition, CounterFormat, Editor, Element, FontSet, Fonts, ImageAsset, LayerOrder, PALETTE,
-    Pixmap, PlacedImage, Point, Rect, RedactArea, RedactEffect, SizeLevel, Style, TextKey, TextStyle, Tool,
-    VisualBand,
+    ArrowStyle, BACKGROUND_PALETTE, Color, Composition, CounterFormat, Editor, Element, FontSet, Fonts, ImageAsset,
+    LayerOrder, PALETTE, Pixmap, PlacedImage, Point, Rect, RedactArea, RedactEffect, SizeLevel, Style, TextKey,
+    TextStyle, Tool, VisualBand,
 };
 
 fn test_fonts() -> Arc<Fonts> {
@@ -435,7 +435,11 @@ fn long_session_composition_soak_test() {
                     }
                 }
                 _ => {
-                    if !e.is_dragging() && !e.is_editing_text() && e.screen().w <= 800.0 && e.screen().h <= 800.0 {
+                    if rng(2) == 0 {
+                        let _ = e.right_click_at(p);
+                        let (bg, _) = BACKGROUND_PALETTE[rng(BACKGROUND_PALETTE.len() as u32) as usize];
+                        e.set_background_color(bg);
+                    } else if !e.is_dragging() && !e.is_editing_text() && e.screen().w <= 800.0 && e.screen().h <= 800.0 {
                         let handles = e.canvas_handles();
                         if !handles.is_empty() {
                             let h_pt = handles[rng(handles.len() as u32) as usize];
@@ -449,7 +453,7 @@ fn long_session_composition_soak_test() {
                             let _ = e.take_canvas_origin_shift();
                         }
                     } else {
-                        e.right_click();
+                        e.right_click_at(p);
                     }
                 }
             }

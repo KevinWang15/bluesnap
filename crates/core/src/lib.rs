@@ -24,6 +24,6 @@ pub use composition::{Composition, Element, ImageAsset, ImageId, LayerOrder, Pla
 pub use editor::{BrushRing, CANVAS_HANDLE_OFFSET, Editor, RightClick, SelectionMode, TextKey, VisualBand};
 pub use geom::{CursorKind, Point, Rect};
 pub use render::Document;
-pub use style::{ArrowStyle, Color, CounterFormat, PALETTE, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, TextStyle, Tool};
+pub use style::{ArrowStyle, BACKGROUND_PALETTE, Color, CounterFormat, PALETTE, REDACT_GRAY, RedactArea, RedactEffect, Redaction, SizeLevel, Style, THEME_BLUE, TextStyle, Tool};
 pub use text::{FontFamily, FontSet, FontSource, Fonts};
 pub use tiny_skia::Pixmap;

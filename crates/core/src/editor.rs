@@ -75,6 +75,9 @@ pub struct BrushRing {
 pub enum RightClick {
     /// Nothing selected yet in capture mode: the frontend should exit capture.
     Exit,
+    /// Right-clicked on exposed background space in Canvas mode: show the
+    /// background color context menu under the cursor.
+    BackgroundMenu,
     Handled,
 }
 
@@ -107,6 +110,7 @@ struct TextEdit {
 #[derive(Clone, Debug, PartialEq)]
 struct Snapshot {
     canvas: (u32, u32),
+    background: Option<Color>,
     elements: Vec<Element>,
 }
 
@@ -249,10 +253,10 @@ impl Editor {
     pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> Option<usize> {
         self.finish_text();
         self.drag = None;
+        let prev = self.current_snapshot();
         let Workspace::Canvas { width, height, background, backdrop } = &mut self.workspace else {
             return None;
         };
-        let prev = Snapshot { canvas: (*width, *height), elements: self.elements.clone() };
         let mut comp = Composition {
             width: *width,
             height: *height,
@@ -376,6 +380,18 @@ impl Editor {
                     })
                 )
             })
+        })
+    }
+
+    fn has_any_effect_redaction(&self) -> bool {
+        self.elements.iter().any(|el| {
+            matches!(
+                el,
+                Element::Shape(Shape {
+                    geometry: Geometry::Redact { effect: RedactEffect::Mosaic | RedactEffect::Blur, .. },
+                    ..
+                })
+            )
         })
     }
 
@@ -1221,19 +1237,35 @@ impl Editor {
     }
 
     pub fn right_click(&mut self) -> RightClick {
+        self.right_click_at(self.pointer)
+    }
+
+    pub fn right_click_at(&mut self, p: Point) -> RightClick {
+        if self.drag.is_some() {
+            self.pointer_up(self.pointer);
+            return RightClick::Handled;
+        }
+        self.pointer = p;
         self.touch();
         if self.text.is_some() {
             self.finish_text();
             return RightClick::Handled;
         }
         if self.selection_mode() == SelectionMode::Canvas {
-            // In the Editor, right-click exits an active drawing tool back to Select/Move.
+            // In the Editor, right-click exits an active drawing tool first.
             if self.tool.take().is_some() {
                 self.selected = None;
+                return RightClick::Handled;
+            }
+            // Right-clicking exposed background space (not hitting any placed image
+            // or annotation) opens the background color context menu.
+            if self.element_at(p, true).is_none() {
+                self.selected = None;
+                return RightClick::BackgroundMenu;
             }
             return RightClick::Handled;
         }
-        if self.drag.is_some() || !self.elements.is_empty() {
+        if !self.elements.is_empty() {
             return RightClick::Handled;
         }
         let Workspace::Capture { selection, .. } = &mut self.workspace else {
@@ -1250,6 +1282,29 @@ impl Editor {
     }
 
     // ----- commands -------------------------------------------------------
+
+    /// Sets the canvas background color in Canvas mode as one undoable step.
+    pub fn set_background_color(&mut self, color: Color) -> bool {
+        if !matches!(self.workspace, Workspace::Canvas { .. }) {
+            return false;
+        }
+        self.finish_text();
+        if self.background_color() == Some(color) {
+            return false;
+        }
+        self.begin_change();
+        if let Workspace::Canvas { background, backdrop, .. } = &mut self.workspace {
+            *background = color;
+            *backdrop.borrow_mut() = None;
+        }
+        self.end_change();
+        if self.has_any_effect_redaction() {
+            self.touch_shapes();
+        } else {
+            self.touch();
+        }
+        true
+    }
 
     pub fn toggle_tool(&mut self, tool: Tool) {
         self.finish_text();
@@ -1304,10 +1359,13 @@ impl Editor {
         self.finish_text();
         self.drag = None;
         let Some(prev) = self.history.pop_back() else { return false };
-        if let Workspace::Canvas { width, height, backdrop, .. } = &mut self.workspace {
-            let old_dims = (*width, *height);
+        if let Workspace::Canvas { width, height, background, backdrop } = &mut self.workspace {
+            let old_state = (*width, *height, *background);
             (*width, *height) = prev.canvas;
-            if old_dims != prev.canvas {
+            if let Some(bg) = prev.background {
+                *background = bg;
+            }
+            if old_state != (*width, *height, *background) {
                 *backdrop.borrow_mut() = None;
             }
         }
@@ -1337,7 +1395,7 @@ impl Editor {
     }
 
     fn current_snapshot(&self) -> Snapshot {
-        Snapshot { canvas: self.canvas_dims(), elements: self.elements.clone() }
+        Snapshot { canvas: self.canvas_dims(), background: self.background_color(), elements: self.elements.clone() }
     }
 
     fn push_snapshot(&mut self, snap: Snapshot) {
@@ -1354,7 +1412,12 @@ impl Editor {
     }
 
     fn end_change(&mut self) {
-        if self.history.back().is_some_and(|last| last.canvas == self.canvas_dims() && last.elements == self.elements) {
+        let unchanged = self.history.back().is_some_and(|last| {
+            last.canvas == self.canvas_dims()
+                && last.background == self.background_color()
+                && last.elements == self.elements
+        });
+        if unchanged {
             self.history.pop_back();
         } else {
             while self.history.len() > MAX_HISTORY {
@@ -2336,5 +2399,51 @@ mod tests {
         e.pointer_move(Point::new(canvas_bottom.x, canvas_bottom.y + 40.0), true);
         e.pointer_up(Point::new(canvas_bottom.x, canvas_bottom.y + 40.0));
         assert_eq!(e.screen(), Rect::new(0.0, 0.0, 280.0, 140.0));
+    }
+
+    #[test]
+    fn background_right_click_opens_menu_and_background_color_changes_undo_export_and_save_bs() {
+        use crate::format::{decode_bs, encode_bs};
+
+        let fonts = Arc::new(Fonts::empty());
+        let mut comp = Composition::from_slice(Pixmap::new(100, 80).unwrap(), 1.0, Vec::new());
+        // Expand canvas to 200x140 with the 100x80 image shifted to (50, 0), leaving left/bottom background space.
+        comp.width = 200;
+        comp.height = 140;
+        comp.elements[0] = comp.elements[0].translated(Point::new(50.0, 0.0));
+        let mut e = Editor::from_composition(comp, fonts.clone());
+
+        // Right-clicking on the placed image (80, 40) does NOT open the background menu.
+        assert_eq!(e.right_click_at(Point::new(80.0, 40.0)), RightClick::Handled);
+        // Right-clicking on the exposed left strip (20, 40) or bottom strip (100, 110) opens BackgroundMenu!
+        assert_eq!(e.right_click_at(Point::new(20.0, 40.0)), RightClick::BackgroundMenu);
+        assert_eq!(e.right_click_at(Point::new(100.0, 110.0)), RightClick::BackgroundMenu);
+
+        // Change background to Dark (#191919), verify export & .bs round-trip, then undo back to White.
+        let dark = Color::rgb(0x191919);
+        assert!(e.set_background_color(dark));
+        assert!(!e.set_background_color(dark), "setting identical color is a no-op");
+        assert_eq!(e.background_color(), Some(dark));
+
+        let exported = e.export().unwrap();
+        let p = exported.pixel(10, 10).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue(), p.alpha()), (0x19, 0x19, 0x19, 255));
+
+        let bs = encode_bs(&e.to_composition().unwrap()).unwrap();
+        let reopened = decode_bs(&bs).unwrap();
+        assert_eq!(reopened.background, dark);
+
+        // Transparent background also exports alpha = 0 and round-trips through .bs.
+        assert!(e.set_background_color(Color::TRANSPARENT));
+        let trans_export = e.export().unwrap();
+        assert_eq!(trans_export.pixel(10, 10).unwrap().alpha(), 0);
+        let trans_bs = decode_bs(&encode_bs(&e.to_composition().unwrap()).unwrap()).unwrap();
+        assert_eq!(trans_bs.background, Color::TRANSPARENT);
+
+        // Two undos restore Dark, then initial White (#FFFFFF).
+        assert!(e.undo());
+        assert_eq!(e.background_color(), Some(dark));
+        assert!(e.undo());
+        assert_eq!(e.background_color(), Some(Color::rgb(0xFFFFFF)));
     }
 }

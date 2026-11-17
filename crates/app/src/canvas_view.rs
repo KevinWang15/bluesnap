@@ -69,6 +69,7 @@ pub struct CanvasView {
     auto: Option<Task<()>>,
     loupe: crate::loupe::Loupe,
     text_menu: bool,
+    bg_menu: Option<Point<f32>>,
     text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
     slider: Option<f32>,
     canvas_hovered: bool,
@@ -175,6 +176,7 @@ impl CanvasView {
             auto: None,
             loupe: Default::default(),
             text_menu: false,
+            bg_menu: None,
             text_previews: None,
             slider: None,
             canvas_hovered: true,
@@ -214,6 +216,8 @@ impl CanvasView {
     /// Replaces the entire composition (e.g. when loading a `.bs` file).
     pub fn replace_composition(&mut self, comp: Composition, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.replace_composition(comp);
+        self.bg_menu = None;
+        self.text_menu = false;
         if let Surface::Editor { images, pan, zoom_override } = &mut self.surface {
             images.clear(window);
             *pan = Point { x: 0.0, y: 0.0 };
@@ -366,6 +370,7 @@ impl CanvasView {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus);
         }
+        self.bg_menu = None;
         match action {
             Action::AddImage => cx.defer(crate::editor_window::request_add_image),
             Action::OpenFile => {
@@ -725,6 +730,53 @@ impl CanvasView {
         self.text_menu = false;
     }
 
+    pub fn choose_background_color(&mut self, color: bluesnap_core::Color) {
+        self.editor.set_background_color(color);
+        self.bg_menu = None;
+    }
+
+    pub fn pick_custom_background_color(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.bg_menu = None;
+        let initial = self.editor.background_color().unwrap_or(bluesnap_core::Color::rgb(0xFFFFFF));
+        let owner = bluesnap_platform::window_ref(window).ok();
+        let entity = cx.entity();
+        cx.defer(move |cx| {
+            cx.activate(true);
+            let platform = bluesnap_platform::native();
+            cx.spawn(async move |cx| {
+                match platform.color_dialog(owner, initial) {
+                    Ok(Some(color)) => {
+                        cx.update(|cx| {
+                            entity.update(cx, |this, cx| {
+                                this.editor.set_background_color(color);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::error!("color dialog failed: {e:#}"),
+                }
+            })
+            .detach();
+        });
+    }
+
+    fn bg_menu_origin(&self, anchor: Point<f32>, window: &Window) -> (f32, f32) {
+        let (w, h) = toolbar::background_menu_size();
+        let win = window.viewport_size();
+        let win_w = f32::from(win.width);
+        let win_h = f32::from(win.height);
+        let x = anchor.x.min(win_w - w - 8.0).max(8.0);
+        let below = anchor.y + 2.0;
+        let y = if below + h <= win_h - 8.0 {
+            below
+        } else {
+            (anchor.y - h - 2.0).max(self.top_bar + 4.0)
+        };
+        (x, y)
+    }
+
     fn text_menu(
         &mut self,
         current: bluesnap_core::TextStyle,
@@ -937,9 +989,10 @@ impl CanvasView {
                 }
                 self.editor.pointer_down(p);
             }
-            MouseButton::Right => {
-                if self.editor.right_click() == RightClick::Exit {
-                    return self.finish(Finish::Cancel, window, cx);
+            MouseButton::Right => match self.editor.right_click_at(p) {
+                RightClick::Exit => return self.finish(Finish::Cancel, window, cx),
+                RightClick::BackgroundMenu => {
+                    self.bg_menu = Some(Point { x: f32::from(ev.position.x), y: f32::from(ev.position.y) });
                 }
             }
             _ => return,
@@ -959,6 +1012,9 @@ impl CanvasView {
         }
         let before = (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered);
         self.editor.pointer_move(self.viewport.to_image(ev.position), ev.modifiers.shift);
+        if ev.button == MouseButton::Left && self.bg_menu.take().is_some() {
+            return cx.notify();
+        }
         self.canvas_hovered = canvas_hovered;
         if (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered) != before {
             cx.notify();
@@ -978,7 +1034,10 @@ impl CanvasView {
             {
                 pan.x -= shift.x * zoom;
                 pan.y -= shift.y * zoom;
-            }
+                RightClick::Handled => {
+                    self.bg_menu = None;
+                }
+            },
             cx.notify();
         }
     }
@@ -997,7 +1056,8 @@ impl CanvasView {
                 *zoom_override = Some((cur * factor).clamp(0.05, native_zoom * 4.0));
                 cx.notify();
             }
-            return;
+            self.bg_menu = None;
+            return cx.notify();
         }
         if let Surface::Editor { pan, .. } = &mut self.surface {
             if shift && dx == 0.0 {
@@ -1020,6 +1080,7 @@ impl CanvasView {
         }
         match ks.key.as_str() {
             "escape" if self.text_menu => self.text_menu = false,
+        self.bg_menu = None;
             "i" if !editing && self.loupe_target(window).is_some() => self.copy_color(window, cx),
             "escape" if editing => self.editor.finish_text(),
             "escape" if !self.is_capture() && self.editor.clear_tool_or_selection() => {}
@@ -1056,6 +1117,7 @@ impl CanvasView {
                     *pan = Point { x: 0.0, y: 0.0 };
                 }
             }
+            "escape" if self.bg_menu.is_some() => self.bg_menu = None,
             "=" | "+" if cmd && !self.is_capture() => {
                 let (fit, _) = self.fit_zoom(window);
                 let max_z = Viewport::native(window.scale_factor()).zoom * 4.0;
@@ -1152,7 +1214,7 @@ impl CanvasView {
                 (Some(active), active.map(|a| (a, handles)), None, None, Vec::new(), screenshot.visible(v, window_bounds))
             }
             Surface::Editor { .. } => {
-                let canvas_bg = e.background_color().map(hsla).unwrap_or_else(white);
+                let canvas_bg = e.background_color().unwrap_or(bluesnap_core::Color::rgb(0xFFFFFF));
                 let handles = e.canvas_handles().into_iter().map(|p| v.point_to_window(p)).collect();
                 (None, None, Some(rgb(0xE5E7EB).into()), Some(canvas_bg), handles, Vec::new())
             }
@@ -1349,7 +1411,7 @@ struct Scene {
     entity: Entity<CanvasView>,
     focus: FocusHandle,
     backdrop: Option<Hsla>,
-    canvas_surface: Option<Hsla>,
+    canvas_surface: Option<bluesnap_core::Color>,
     top_bar: Option<Pixels>,
     canvas_bounds: Bounds<Pixels>,
     canvas_handles: Vec<Point<Pixels>>,
@@ -1372,9 +1434,42 @@ impl Scene {
     fn paint(self, bounds: Bounds<Pixels>, hitbox: Hitbox, window: &mut Window, cx: &mut App) {
         let blue = hsla(THEME_BLUE);
         if let Some(backdrop) = self.backdrop {
+        if let (Some(anchor), Some(current_bg)) = (self.bg_menu, self.editor.background_color()) {
+            let (mx, my) = self.bg_menu_origin(anchor, window);
+            let has_custom = bluesnap_platform::Native::HAS_COLOR_DIALOG;
+            root = root.child(toolbar::background_menu(current_bg, has_custom, mx, my, cx));
+        }
             window.paint_quad(fill(bounds, backdrop));
-            if let Some(surface) = self.canvas_surface {
-                window.paint_quad(fill(self.canvas_bounds, surface));
+            if let Some(bg) = self.canvas_surface {
+                if bg.is_transparent() {
+                    window.paint_quad(fill(self.canvas_bounds, white()));
+                    let vis = self.canvas_bounds.intersect(&bounds);
+                    if vis.size.width > px(0.) && vis.size.height > px(0.) {
+                        window.with_content_mask(Some(ContentMask { bounds: vis }), |window| {
+                            let cell = 14.0f32;
+                            let ox = f32::from(self.canvas_bounds.origin.x);
+                            let oy = f32::from(self.canvas_bounds.origin.y);
+                            let c0 = ((f32::from(vis.left()) - ox) / cell).floor().max(0.0) as i32;
+                            let c1 = ((f32::from(vis.right()) - ox) / cell).ceil().max(0.0) as i32;
+                            let r0 = ((f32::from(vis.top()) - oy) / cell).floor().max(0.0) as i32;
+                            let r1 = ((f32::from(vis.bottom()) - oy) / cell).ceil().max(0.0) as i32;
+                            let checker: Hsla = rgb(0xCBD5E1).into();
+                            for r in r0..r1 {
+                                for c in c0..c1 {
+                                    if (r + c) % 2 == 0 {
+                                        let q = Bounds::new(
+                                            point(px(ox + c as f32 * cell), px(oy + r as f32 * cell)),
+                                            size(px(cell), px(cell)),
+                                        );
+                                        window.paint_quad(fill(q, checker));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    window.paint_quad(fill(self.canvas_bounds, hsla(bg)));
+                }
             }
             let frame = self.canvas_bounds.dilate(px(1.));
             window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), rgba(0x0000_0029), BorderStyle::Solid));

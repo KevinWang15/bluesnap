@@ -30,8 +30,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW, GetOpenFileNameW, GetSaveFileNameW,
+    OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
@@ -232,6 +232,7 @@ impl Platform for Native {
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
         let _ = display; // gpui's fullscreen mode already covers exactly this monitor.
+    const HAS_COLOR_DIALOG: bool = true;
         // Always on top, above the taskbar. Allowed to focus because the process
         // just received the hotkey input.
         set_topmost_and_focus(window)
@@ -491,6 +492,39 @@ impl Platform for Native {
             let (rc, work) = (info.rcMonitor, info.rcWork);
             let display = DisplayInfo {
                 id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
+    fn color_dialog(
+        &self,
+        owner: Option<WindowRef>,
+        initial: bluesnap_core::Color,
+    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
+        static CUSTOM_COLORS: OnceLock<Mutex<[u32; 16]>> = OnceLock::new();
+        let mut custom = *CUSTOM_COLORS
+            .get_or_init(|| Mutex::new([0x00FF_FFFF; 16]))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dialog_owner = DialogOwner::acquire(owner);
+        let (r, g, b) = if initial.is_transparent() { (255, 255, 255) } else { (initial.r, initial.g, initial.b) };
+        let mut cc: CHOOSECOLORW = unsafe { zeroed() };
+        cc.lStructSize = size_of::<CHOOSECOLORW>() as u32;
+        cc.hwndOwner = dialog_owner.hwnd;
+        cc.rgbResult = (r as u32) | ((g as u32) << 8) | ((b as u32) << 16);
+        cc.lpCustColors = custom.as_mut_ptr();
+        cc.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ANYCOLOR;
+        let ok = unsafe { ChooseColorW(&mut cc) };
+        drop(dialog_owner);
+        *CUSTOM_COLORS.get().expect("initialized").lock().unwrap_or_else(|e| e.into_inner()) = custom;
+        if ok == FALSE {
+            return Ok(None);
+        }
+        Ok(Some(bluesnap_core::Color {
+            r: (cc.rgbResult & 0xFF) as u8,
+            g: ((cc.rgbResult >> 8) & 0xFF) as u8,
+            b: ((cc.rgbResult >> 16) & 0xFF) as u8,
+            a: 255,
+        }))
+    }
+
                 bounds: NativeRect {
                     x: rc.left as f64,
                     y: rc.top as f64,

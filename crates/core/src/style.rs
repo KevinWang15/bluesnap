@@ -12,8 +12,14 @@ pub struct Color {
 }
 
 impl Color {
+    pub const TRANSPARENT: Self = Self { r: 0, g: 0, b: 0, a: 0 };
+
     pub const fn rgb(hex: u32) -> Self {
         Self { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8, a: 255 }
+    }
+
+    pub const fn is_transparent(self) -> bool {
+        self.a == 0
     }
 
     pub const fn to_hex(self) -> u32 {
@@ -43,6 +49,22 @@ pub const PALETTE: [Color; 6] = [
     Color::rgb(0x1677FF), // blue
     Color::rgb(0x000000), // black
     Color::rgb(0xFFFFFF), // white
+];
+
+/// Preset canvas background colors offered in the Editor's right-click context menu.
+pub const BACKGROUND_PALETTE: [(Color, &str); 12] = [
+    (Color::rgb(0xFFFFFF), "White (#FFFFFF)"),
+    (Color::rgb(0xF1F5F9), "Light gray (#F1F5F9)"),
+    (Color::rgb(0xCBD5E1), "Gray (#CBD5E1)"),
+    (Color::rgb(0x334155), "Slate (#334155)"),
+    (Color::rgb(0x191919), "Dark (#191919)"),
+    (Color::rgb(0x000000), "Black (#000000)"),
+    (Color::TRANSPARENT, "Transparent"),
+    (Color::rgb(0xDBEAFE), "Soft blue (#DBEAFE)"),
+    (Color::rgb(0xDCFCE7), "Soft green (#DCFCE7)"),
+    (Color::rgb(0xFEF3C7), "Soft amber (#FEF3C7)"),
+    (Color::rgb(0xFFE4E6), "Soft rose (#FFE4E6)"),
+    (Color::rgb(0x1677FF), "Blue (#1677FF)"),
 ];
 
 /// Opacity of highlighter strokes.
