@@ -48,6 +48,9 @@ pub struct AppState {
     pub overlay: Option<AnyWindowHandle>,
     /// The open multi-image Composition Editor window, if any.
     pub(crate) editor: Option<gpui::WindowHandle<canvas_view::CanvasView>>,
+    /// OS window handle of `editor`, cached so visibility/dialog calls never
+    /// need to borrow `Window` re-entrantly.
+    pub(crate) editor_ref: Option<bluesnap_platform::WindowRef>,
     /// True while the Editor window is temporarily hidden during an `"Add image"` capture.
     pub(crate) editor_hidden: bool,
     /// The running scrolling capture, if any.
@@ -124,6 +127,7 @@ fn main() {
             fonts,
             overlay: None,
             editor: None,
+            editor_ref: None,
             editor_hidden: false,
             scrolling: None,
             startup_toast: None,
@@ -324,7 +328,11 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                     cx.update(editor_window::open_or_focus).ok();
                 }
                 TrayCommand::OpenBsFile => {
-                    cx.update(|cx| editor_window::prompt_open_file(true, cx)).ok();
+                    cx.update(|cx| {
+                        let owner = cx.global::<AppState>().editor_ref;
+                        editor_window::prompt_open_file(true, owner, cx);
+                    })
+                    .ok();
                 }
                 TrayCommand::EditSettings => {
                     cx.update(|cx| match Config::path() {

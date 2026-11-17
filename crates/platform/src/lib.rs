@@ -191,9 +191,12 @@ pub trait Platform {
     }
 
     /// Native Save dialog offering `PNG Image (.png)` and `BlueSnap Editable (.bs)`.
+    /// `owner` is the parent Editor window when saving from the Editor, or `None`
+    /// when saving after a capture overlay closes.
     /// Returns `Ok(None)` when delegating to gpui's fallback file dialog.
     fn save_dialog(
         &self,
+        _owner: Option<WindowRef>,
         _dir: &std::path::Path,
         _stem: &str,
     ) -> anyhow::Result<Option<Option<(std::path::PathBuf, SaveFormat)>>> {
@@ -202,7 +205,12 @@ pub trait Platform {
 
     /// Native Open dialog for `.bs` files (or `.bs` + common images when `bs_only` is `false`).
     /// Returns `Ok(None)` when delegating to gpui's fallback file dialog.
-    fn open_dialog(&self, _dir: &std::path::Path, _bs_only: bool) -> anyhow::Result<Option<Option<std::path::PathBuf>>> {
+    fn open_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        _dir: &std::path::Path,
+        _bs_only: bool,
+    ) -> anyhow::Result<Option<Option<std::path::PathBuf>>> {
         Ok(None)
     }
 

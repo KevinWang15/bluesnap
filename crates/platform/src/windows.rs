@@ -30,10 +30,11 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SW_HIDE, SW_SHOW, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TRANSPARENT,
+    CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetCursorPos,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SW_HIDE,
+    SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::{
@@ -72,6 +73,75 @@ fn raw_win32_hwnd(raw: RawWindowHandle) -> anyhow::Result<HWND> {
 
 fn win32_hwnd(window: &dyn HasWindowHandle) -> anyhow::Result<HWND> {
     raw_win32_hwnd(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw())
+}
+
+/// Ensures Win32 common file dialogs (`GetSaveFileNameW` / `GetOpenFileNameW`)
+/// always appear in front of the user:
+/// - when `owner` is `Some` (e.g. the Editor window), brings it forward and
+///   parents the modal dialog directly to it;
+/// - when `owner` is `None` (e.g. right after the fullscreen capture overlay
+///   closed, or from the tray menu), creates a zero-pixel topmost foreground
+///   owner window on the cursor's monitor so Windows never buries an unowned
+///   dialog behind other apps, and destroys it on drop.
+struct DialogOwner {
+    hwnd: HWND,
+    destroy_on_drop: bool,
+}
+
+impl DialogOwner {
+    fn acquire(owner: Option<WindowRef>) -> Self {
+        if let Some(win_ref) = owner
+            && let Ok(hwnd) = raw_win32_hwnd(win_ref.0)
+        {
+            unsafe {
+                SetForegroundWindow(hwnd);
+            }
+            return Self { hwnd, destroy_on_drop: false };
+        }
+        with_per_monitor_dpi(|| unsafe {
+            let mut cursor = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut cursor);
+            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+            let mut info: MONITORINFO = zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            let (x, y) = if GetMonitorInfoW(monitor, &mut info) != FALSE {
+                (info.rcWork.left + 120, info.rcWork.top + 80)
+            } else {
+                (120, 80)
+            };
+            let class = wide("STATIC");
+            let title = wide("");
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                x,
+                y,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_SHOW);
+                SetForegroundWindow(hwnd);
+            }
+            Self { hwnd, destroy_on_drop: !hwnd.is_null() }
+        })
+    }
+}
+
+impl Drop for DialogOwner {
+    fn drop(&mut self) {
+        if self.destroy_on_drop && !self.hwnd.is_null() {
+            unsafe {
+                DestroyWindow(self.hwnd);
+            }
+        }
+    }
 }
 
 fn set_topmost_and_focus(window: &dyn HasWindowHandle) -> anyhow::Result<()> {
@@ -199,9 +269,11 @@ impl Platform for Native {
     fn set_window_visible(&self, window: WindowRef, visible: bool) -> anyhow::Result<()> {
         let hwnd = raw_win32_hwnd(window.0)?;
         unsafe {
-            ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE });
             if visible {
+                ShowWindow(hwnd, if IsIconic(hwnd) != FALSE { SW_RESTORE } else { SW_SHOW });
                 SetForegroundWindow(hwnd);
+            } else {
+                ShowWindow(hwnd, SW_HIDE);
             }
         }
         Ok(())
@@ -209,9 +281,11 @@ impl Platform for Native {
 
     fn save_dialog(
         &self,
+        owner: Option<WindowRef>,
         dir: &std::path::Path,
         stem: &str,
     ) -> anyhow::Result<Option<Option<(PathBuf, SaveFormat)>>> {
+        let dialog_owner = DialogOwner::acquire(owner);
         let filter: Vec<u16> = "PNG Image (*.png)\0*.png\0BlueSnap Editable (*.bs)\0*.bs\0\0".encode_utf16().collect();
         let def_ext = wide("png");
         let init_dir: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
@@ -221,6 +295,7 @@ impl Platform for Native {
         }
         let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
         ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = dialog_owner.hwnd;
         ofn.lpstrFilter = filter.as_ptr();
         ofn.nFilterIndex = 1;
         ofn.lpstrFile = file_buf.as_mut_ptr();
@@ -229,6 +304,7 @@ impl Platform for Native {
         ofn.lpstrDefExt = def_ext.as_ptr();
         ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         let ok = unsafe { GetSaveFileNameW(&mut ofn) };
+        drop(dialog_owner);
         if ok == FALSE {
             return Ok(Some(None));
         }
@@ -247,7 +323,13 @@ impl Platform for Native {
         Ok(Some(Some((final_path, format))))
     }
 
-    fn open_dialog(&self, dir: &std::path::Path, bs_only: bool) -> anyhow::Result<Option<Option<PathBuf>>> {
+    fn open_dialog(
+        &self,
+        owner: Option<WindowRef>,
+        dir: &std::path::Path,
+        bs_only: bool,
+    ) -> anyhow::Result<Option<Option<PathBuf>>> {
+        let dialog_owner = DialogOwner::acquire(owner);
         let filter_str = if bs_only {
             "BlueSnap Editable (*.bs)\0*.bs\0All Files (*.*)\0*.*\0\0"
         } else {
@@ -258,6 +340,7 @@ impl Platform for Native {
         let mut file_buf = vec![0u16; 32768];
         let mut ofn: OPENFILENAMEW = unsafe { zeroed() };
         ofn.lStructSize = size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = dialog_owner.hwnd;
         ofn.lpstrFilter = filter.as_ptr();
         ofn.nFilterIndex = 1;
         ofn.lpstrFile = file_buf.as_mut_ptr();
@@ -265,6 +348,7 @@ impl Platform for Native {
         ofn.lpstrInitialDir = init_dir.as_ptr();
         ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
         let ok = unsafe { GetOpenFileNameW(&mut ofn) };
+        drop(dialog_owner);
         if ok == FALSE {
             return Ok(Some(None));
         }

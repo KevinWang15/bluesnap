@@ -9,10 +9,10 @@ use std::time::Duration;
 use anyhow::Context as _;
 use bluesnap_core::pixels::pixmap_from_rgba;
 use bluesnap_core::{Composition, Editor};
-use bluesnap_platform::Platform;
+use bluesnap_platform::{Platform, WindowRef};
 use gpui::{
-    App, AppContext, Bounds, DisplayId, PathPromptOptions, TitlebarOptions, WindowBounds, WindowHandle, WindowKind,
-    WindowOptions, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, DisplayId, PathPromptOptions, TitlebarOptions, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, px, size,
 };
 
 use crate::AppState;
@@ -28,7 +28,7 @@ const DEFAULT_EMPTY_CANVAS: (u32, u32) = (1200, 800);
 /// Adds `slice` to the open Editor session, or creates and opens a new Editor
 /// session sized to `slice` if none is open.
 pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
-    restore_if_hidden(cx);
+    let was_hidden = cx.global::<AppState>().editor_hidden;
     let CapturedSlice { image, scale, shapes, display } = slice;
     let mut pending = Some((image, shapes));
     if let Some(existing) = live_editor(cx) {
@@ -36,14 +36,21 @@ pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
             if let Some((image, shapes)) = pending.take() {
                 view.append_slice(image, scale, shapes, window, cx);
             }
-            window.focus(view.focus_handle());
-            window.activate_window();
+            if !was_hidden {
+                window.focus(view.focus_handle());
+                window.activate_window();
+            }
         });
         if updated.is_ok() {
-            cx.activate(true);
+            if was_hidden {
+                restore_if_hidden(cx);
+            } else {
+                cx.activate(true);
+            }
             return;
         }
     }
+    cx.global_mut::<AppState>().editor_hidden = false;
     if let Some((image, shapes)) = pending {
         let comp = Composition::from_slice(image, scale, shapes);
         if let Err(e) = open_window_with(comp, display, "bluesnap editor", cx) {
@@ -55,7 +62,10 @@ pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
 /// Opens an empty Editor window, or brings the existing Editor window forward
 /// (invoked from the tray / menu bar `"Open Editor"` item).
 pub fn open_or_focus(cx: &mut App) {
-    restore_if_hidden(cx);
+    if cx.global::<AppState>().editor_hidden && live_editor(cx).is_some() {
+        restore_if_hidden(cx);
+        return;
+    }
     if let Some(existing) = live_editor(cx) {
         let ok = existing
             .update(cx, |view, window, _| {
@@ -107,34 +117,51 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
     let (w, h) = rgba.dimensions();
     let pixmap = pixmap_from_rgba(w, h, rgba.into_raw()).context("invalid image dimensions")?;
 
-    restore_if_hidden(cx);
+    let was_hidden = cx.global::<AppState>().editor_hidden;
     if let Some(existing) = live_editor(cx) {
-        let scale = existing.read_with(cx, |v, _| v.editor().scale()).unwrap_or(1.0);
-        if existing
+        let mut pending = Some(pixmap);
+        let ok = existing
             .update(cx, |view, window, cx| {
-                view.append_slice(pixmap.clone(), scale, Vec::new(), window, cx);
-                window.focus(view.focus_handle());
-                window.activate_window();
+                let scale = view.editor().scale();
+                if let Some(img) = pending.take() {
+                    view.append_slice(img, scale, Vec::new(), window, cx);
+                }
+                if !was_hidden {
+                    window.focus(view.focus_handle());
+                    window.activate_window();
+                }
             })
-            .is_ok()
-        {
-            cx.activate(true);
+            .is_ok();
+        if ok {
+            if was_hidden {
+                restore_if_hidden(cx);
+            } else {
+                cx.activate(true);
+            }
             return Ok(());
         }
+        if let Some(pixmap) = pending {
+            cx.global_mut::<AppState>().editor_hidden = false;
+            let comp = Composition::from_slice(pixmap, 1.0, Vec::new());
+            return open_window_with(comp, None, &title, cx);
+        }
+    } else {
+        cx.global_mut::<AppState>().editor_hidden = false;
+        let comp = Composition::from_slice(pixmap, 1.0, Vec::new());
+        return open_window_with(comp, None, &title, cx);
     }
-    let comp = Composition::from_slice(pixmap, 1.0, Vec::new());
-    open_window_with(comp, None, &title, cx)
+    Ok(())
 }
 
 /// Prompts the user to pick a `.bs` (or image) file and opens it in the Editor.
-pub fn prompt_open_file(bs_only: bool, cx: &mut App) {
+pub fn prompt_open_file(bs_only: bool, owner: Option<WindowRef>, cx: &mut App) {
     let dir = cx.global::<AppState>().config.save_dir();
     cx.activate(true);
     let platform = bluesnap_platform::native();
     cx.spawn(async move |cx| {
-        let native_choice = cx
-            .update(|_| platform.open_dialog(&dir, bs_only))
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("{e:#}")));
+        // Run `open_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
+        // while the OS modal file dialog runs its message loop.
+        let native_choice = platform.open_dialog(owner, &dir, bs_only);
 
         let picked = match native_choice {
             Ok(Some(res)) => res,
@@ -187,19 +214,21 @@ pub fn prompt_open_file(bs_only: bool, cx: &mut App) {
 /// Hides the Editor window temporarily and triggers a `CaptureMode::ForEditor`
 /// capture so the user can add another screenshot without capturing the Editor.
 pub fn request_add_image(cx: &mut App) {
+    let win_ref = cx.global::<AppState>().editor_ref;
     let platform = bluesnap_platform::native();
-    if let Some(handle) = live_editor(cx)
-        && let Ok(Ok(win_ref)) = handle.update(cx, |_, window, _| bluesnap_platform::window_ref(window))
-    {
-        if let Err(e) = platform.set_window_visible(win_ref, false) {
-            log::warn!("could not hide editor window before capture: {e:#}");
-        } else {
-            cx.global_mut::<AppState>().editor_hidden = true;
-        }
-    }
-
     cx.spawn(async move |cx| {
-        // Let the OS compositor finish unmapping the hidden Editor window.
+        // Let mouse-up / input capture release finish before hiding the window.
+        cx.background_executor().timer(Duration::from_millis(16)).await;
+        // Run `set_window_visible` outside `cx.update` so Win32/AppKit activation
+        // callbacks never re-enter GPUI while `RefCell<App>` is borrowed.
+        if let Some(win_ref) = win_ref {
+            if let Err(e) = platform.set_window_visible(win_ref, false) {
+                log::warn!("could not hide editor window before capture: {e:#}");
+            } else {
+                cx.update(|cx| cx.global_mut::<AppState>().editor_hidden = true).ok();
+            }
+        }
+        // Let DWM / compositor finish unmapping the hidden Editor window.
         cx.background_executor().timer(Duration::from_millis(60)).await;
         cx.update(|cx| capture::start_with_mode(CaptureMode::ForEditor, cx)).ok();
     })
@@ -211,50 +240,79 @@ pub fn restore_if_hidden(cx: &mut App) {
     if !std::mem::replace(&mut cx.global_mut::<AppState>().editor_hidden, false) {
         return;
     }
+    let win_ref = cx.global::<AppState>().editor_ref;
+    let handle = live_editor(cx);
     let platform = bluesnap_platform::native();
-    if let Some(handle) = live_editor(cx) {
-        handle
-            .update(cx, |view, window, _| {
-                if let Ok(win_ref) = bluesnap_platform::window_ref(window)
-                    && let Err(e) = platform.set_window_visible(win_ref, true)
-                {
-                    log::warn!("could not restore editor window: {e:#}");
-                }
-                window.focus(view.focus_handle());
-                window.activate_window();
+    cx.spawn(async move |cx| {
+        // Run `set_window_visible(true)` outside `cx.update` so Win32 `WM_SHOWWINDOW`
+        // (`draw_window` -> `on_request_frame`) can borrow `App` cleanly.
+        if let Some(win_ref) = win_ref
+            && let Err(e) = platform.set_window_visible(win_ref, true)
+        {
+            log::warn!("could not restore editor window: {e:#}");
+        }
+        if let Some(handle) = handle {
+            cx.update(|cx| {
+                handle
+                    .update(cx, |view, window, _| {
+                        window.focus(view.focus_handle());
+                        window.activate_window();
+                    })
+                    .ok();
+                cx.activate(true);
             })
             .ok();
-        cx.activate(true);
-    }
+        }
+    })
+    .detach();
 }
 
 fn show_composition(comp: Composition, title: &str, cx: &mut App) -> anyhow::Result<()> {
-    restore_if_hidden(cx);
+    let was_hidden = cx.global::<AppState>().editor_hidden;
     if let Some(existing) = live_editor(cx) {
         let title_owned = title.to_string();
+        let mut pending = Some(comp);
         if existing
             .update(cx, |view, window, cx| {
-                view.replace_composition(comp.clone(), window, cx);
+                if let Some(c) = pending.take() {
+                    view.replace_composition(c, window, cx);
+                }
                 window.set_window_title(&title_owned);
-                window.focus(view.focus_handle());
-                window.activate_window();
+                if !was_hidden {
+                    window.focus(view.focus_handle());
+                    window.activate_window();
+                }
             })
             .is_ok()
         {
-            cx.activate(true);
+            if was_hidden {
+                restore_if_hidden(cx);
+            } else {
+                cx.activate(true);
+            }
             return Ok(());
         }
+        if let Some(comp) = pending {
+            cx.global_mut::<AppState>().editor_hidden = false;
+            return open_window_with(comp, None, title, cx);
+        }
+    } else {
+        cx.global_mut::<AppState>().editor_hidden = false;
+        return open_window_with(comp, None, title, cx);
     }
-    open_window_with(comp, None, title, cx)
+    Ok(())
 }
 
 fn live_editor(cx: &mut App) -> Option<WindowHandle<CanvasView>> {
     let handle = cx.global::<AppState>().editor?;
-    if handle.read_with(cx, |_, _| ()).is_ok() {
+    let any = AnyWindowHandle::from(handle);
+    if cx.windows().contains(&any) {
         Some(handle)
     } else {
-        cx.global_mut::<AppState>().editor = None;
-        cx.global_mut::<AppState>().editor_hidden = false;
+        let state = cx.global_mut::<AppState>();
+        state.editor = None;
+        state.editor_ref = None;
+        state.editor_hidden = false;
         None
     }
 }
@@ -285,12 +343,15 @@ fn open_window_with(comp: Composition, display: Option<DisplayId>, title: &str, 
         ..Default::default()
     };
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new_editor(editor, cx)))?;
-    cx.global_mut::<AppState>().editor = Some(handle);
-    cx.global_mut::<AppState>().editor_hidden = false;
-    handle.update(cx, |view, window, _| {
+    let win_ref = handle.update(cx, |view, window, _| {
         window.focus(view.focus_handle());
         window.activate_window();
+        bluesnap_platform::window_ref(window).ok()
     })?;
+    let state = cx.global_mut::<AppState>();
+    state.editor = Some(handle);
+    state.editor_ref = win_ref;
+    state.editor_hidden = false;
     cx.activate(true);
     log::info!("opened editor window ({width}x{height})");
     Ok(())

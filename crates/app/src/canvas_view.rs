@@ -147,6 +147,7 @@ impl CanvasView {
                     log::debug!("editor window released");
                     let state = cx.global_mut::<AppState>();
                     state.editor = None;
+                    state.editor_ref = None;
                     state.editor_hidden = false;
                 })
                 .detach();
@@ -364,8 +365,11 @@ impl CanvasView {
             window.focus(&self.focus);
         }
         match action {
-            Action::AddImage => crate::editor_window::request_add_image(cx),
-            Action::OpenFile => crate::editor_window::prompt_open_file(false, cx),
+            Action::AddImage => cx.defer(crate::editor_window::request_add_image),
+            Action::OpenFile => {
+                let owner = bluesnap_platform::window_ref(window).ok();
+                cx.defer(move |cx| crate::editor_window::prompt_open_file(false, owner, cx));
+            }
             Action::Tool(tool) => self.editor.toggle_tool(tool),
             Action::Undo => {
                 self.editor.undo();
@@ -422,28 +426,33 @@ impl CanvasView {
             };
             let entity = cx.entity().downgrade();
             let handle = window.window_handle();
-            output::save_with_dialog(
-                image,
-                comp,
-                false,
-                Some(Box::new(move |path, cx| {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-                    let is_bs = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bs"));
-                    handle
-                        .update(cx, |_, window, cx| {
-                            if is_bs {
-                                window.set_window_title(&format!("bluesnap editor — {name}"));
-                            }
-                            if let Some(view) = entity.upgrade() {
-                                view.update(cx, |this, cx| {
-                                    this.show_toast(Toast::new(toast::Kind::Done, format!("Saved {name}")), window, cx);
-                                });
-                            }
-                        })
-                        .ok();
-                })),
-                cx,
-            );
+            let owner = bluesnap_platform::window_ref(window).ok();
+            cx.defer(move |cx| {
+                output::save_with_dialog(
+                    image,
+                    comp,
+                    owner,
+                    None,
+                    false,
+                    Some(Box::new(move |path, cx| {
+                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+                        let is_bs = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("bs"));
+                        handle
+                            .update(cx, |_, window, cx| {
+                                if is_bs {
+                                    window.set_window_title(&format!("bluesnap editor — {name}"));
+                                }
+                                if let Some(view) = entity.upgrade() {
+                                    view.update(cx, |this, cx| {
+                                        this.show_toast(Toast::new(toast::Kind::Done, format!("Saved {name}")), window, cx);
+                                    });
+                                }
+                            })
+                            .ok();
+                    })),
+                    cx,
+                );
+            });
             return;
         }
 
@@ -490,13 +499,30 @@ impl CanvasView {
             }
             Finish::Save => {
                 let pair = self.editor.export().zip(self.editor.to_composition());
+                let closing = bluesnap_platform::window_ref(window).ok();
                 self.drop_gpu_images(window);
                 window.remove_window();
                 if mode == Some(CaptureMode::ForEditor) {
                     cx.defer(crate::editor_window::restore_if_hidden);
                 }
                 if let Some((image, comp)) = pair {
-                    output::save_with_dialog(image, comp, mode != Some(CaptureMode::ForEditor), None, cx);
+                    // Defer until after `window.remove_window()` drops `Window`
+                    // so `DestroyWindow(overlay_hwnd)` is queued ahead of the
+                    // modal `GetSaveFileNameW` task on Windows.
+                    cx.defer(move |cx| {
+                        let owner = (mode == Some(CaptureMode::ForEditor))
+                            .then(|| cx.global::<AppState>().editor_ref)
+                            .flatten();
+                        output::save_with_dialog(
+                            image,
+                            comp,
+                            owner,
+                            closing,
+                            mode != Some(CaptureMode::ForEditor),
+                            None,
+                            cx,
+                        );
+                    });
                 } else if mode == Some(CaptureMode::Standard) {
                     bluesnap_platform::native().restore_previous_app();
                 }
@@ -1016,7 +1042,8 @@ impl CanvasView {
                 self.editor.undo();
             }
             "o" if cmd && !self.is_capture() => {
-                crate::editor_window::prompt_open_file(false, cx);
+                let owner = bluesnap_platform::window_ref(window).ok();
+                cx.defer(move |cx| crate::editor_window::prompt_open_file(false, owner, cx));
             }
             "0" if cmd && !self.is_capture() => {
                 if let Surface::Editor { pan, zoom_override, .. } = &mut self.surface {

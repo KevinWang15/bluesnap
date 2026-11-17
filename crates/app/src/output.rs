@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use bluesnap_core::render::to_rgba_straight;
 use bluesnap_core::{Composition, Pixmap};
-use bluesnap_platform::{Platform, SaveFormat};
+use bluesnap_platform::{Platform, SaveFormat, WindowRef};
 use gpui::App;
 
 use crate::AppState;
@@ -41,9 +41,16 @@ pub type OnSaved = Box<dyn FnOnce(PathBuf, &mut App) + 'static>;
 
 /// Prompts for a save path offering both `.png` (image) and `.bs` (editable
 /// BSON composition), then writes the chosen format off the UI thread.
+///
+/// `owner` is `Some` when saving from a persistent window (the Editor) so the
+/// native dialog is modal to it, or `None` when saving after a capture overlay
+/// closes. `closing` is an optional overlay window to hide immediately before
+/// opening the modal dialog so a topmost overlay can never cover the dialog.
 pub fn save_with_dialog(
     image: Pixmap,
     composition: Composition,
+    owner: Option<WindowRef>,
+    closing: Option<WindowRef>,
     hide_after: bool,
     on_saved: Option<OnSaved>,
     cx: &mut App,
@@ -55,9 +62,12 @@ pub fn save_with_dialog(
 
     let platform = bluesnap_platform::native();
     cx.spawn(async move |cx| {
-        let native_choice = cx
-            .update(|_| platform.save_dialog(&dir, &stem))
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("{e:#}")));
+        if let Some(closing) = closing {
+            let _ = platform.set_window_visible(closing, false);
+        }
+        // Run `save_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
+        // while Win32 / AppKit runs its modal dialog message loop.
+        let native_choice = platform.save_dialog(owner, &dir, &stem);
 
         let chosen: Option<(PathBuf, SaveFormat)> = match native_choice {
             Ok(Some(res)) => res,

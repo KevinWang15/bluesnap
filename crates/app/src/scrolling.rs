@@ -506,7 +506,10 @@ impl ScrollingCapture {
                         let annotated = self.annotate(raw.clone(), cx);
                         let shapes = std::mem::take(&mut self.shapes);
                         let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
-                        output::save_with_dialog(annotated, comp, false, None, cx);
+                        cx.defer(move |cx| {
+                            let owner = cx.global::<AppState>().editor_ref;
+                            output::save_with_dialog(annotated, comp, owner, None, false, None, cx);
+                        });
                     }
                     return;
                 }
@@ -527,7 +530,9 @@ impl ScrollingCapture {
                     let annotated = self.annotate(raw.clone(), cx);
                     let shapes = std::mem::take(&mut self.shapes);
                     let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
-                    output::save_with_dialog(annotated, comp, true, None, cx);
+                    cx.defer(move |cx| {
+                        output::save_with_dialog(annotated, comp, None, None, true, None, cx);
+                    });
                 }
             }
         }

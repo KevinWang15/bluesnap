@@ -230,11 +230,15 @@ impl Platform for Native {
 
     fn save_dialog(
         &self,
+        _owner: Option<WindowRef>,
         dir: &std::path::Path,
         stem: &str,
     ) -> anyhow::Result<Option<Option<(PathBuf, SaveFormat)>>> {
         let mtm = MainThreadMarker::new().context("save_dialog must run on the main thread")?;
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
         let panel = NSSavePanel::savePanel(mtm);
+        panel.setLevel(ABOVE_OVERLAY);
         if let Some(dir_str) = dir.to_str() {
             let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(dir_str), true);
             panel.setDirectoryURL(Some(&url));
@@ -269,9 +273,17 @@ impl Platform for Native {
         Ok(Some(Some((final_path, format))))
     }
 
-    fn open_dialog(&self, dir: &std::path::Path, _bs_only: bool) -> anyhow::Result<Option<Option<PathBuf>>> {
+    fn open_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        dir: &std::path::Path,
+        _bs_only: bool,
+    ) -> anyhow::Result<Option<Option<PathBuf>>> {
         let mtm = MainThreadMarker::new().context("open_dialog must run on the main thread")?;
+        #[allow(deprecated)]
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
         let panel = NSOpenPanel::openPanel(mtm);
+        panel.setLevel(ABOVE_OVERLAY);
         panel.setCanChooseFiles(true);
         panel.setCanChooseDirectories(false);
         panel.setAllowsMultipleSelection(false);
