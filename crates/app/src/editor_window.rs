@@ -228,8 +228,8 @@ pub fn request_add_image(cx: &mut App) {
                 cx.update(|cx| cx.global_mut::<AppState>().editor_hidden = true).ok();
             }
         }
-        // Let DWM / compositor finish unmapping the hidden Editor window.
-        cx.background_executor().timer(Duration::from_millis(60)).await;
+        // Let WindowServer / DWM finish any remaining frame flip before grabbing pixels.
+        cx.background_executor().timer(Duration::from_millis(30)).await;
         cx.update(|cx| capture::start_with_mode(CaptureMode::ForEditor, cx)).ok();
     })
     .detach();

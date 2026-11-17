@@ -11,7 +11,8 @@ use objc2::rc::Retained;
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel,
-    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowStyleMask, NSWorkspace,
+    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowAnimationBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -222,7 +223,9 @@ impl Platform for Native {
         if visible {
             ns_window.makeKeyAndOrderFront(None);
             ns_window.makeFirstResponder(Some(&view));
+            ns_window.setAnimationBehavior(NSWindowAnimationBehavior::DocumentWindow);
         } else {
+            ns_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
             ns_window.orderOut(None);
         }
         Ok(())

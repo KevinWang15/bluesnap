@@ -12,10 +12,9 @@ use std::sync::Arc;
 use tiny_skia::Pixmap;
 
 use crate::composition::{
-    Composition, Element, LayerOrder, PlacedImage, clamp_resized_rect, renumber_counters_in,
-    reorder_element,
+    Composition, Element, LayerOrder, PlacedImage, renumber_counters_in, reorder_element,
 };
-use crate::geom::{CursorKind, Handle, Point, Rect};
+use crate::geom::{CursorKind, Handle, Point, Rect, resize_rect_with_handle};
 use crate::pixels::crop;
 use crate::render::{self, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
@@ -423,6 +422,10 @@ impl Editor {
 
     pub fn is_resizing_canvas(&self) -> bool {
         matches!(self.drag, Some(Drag::CanvasResize { .. }))
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Outer resize handle positions of the canvas in `SelectionMode::Canvas`.
@@ -985,7 +988,11 @@ impl Editor {
                 }
             }
             Drag::SelResize { handle, orig, start } => {
-                let r = orig.resized(*handle, p - *start);
+                let r = if constrain {
+                    resize_rect_with_handle(*orig, *handle, p - *start, true, 4.0)
+                } else {
+                    orig.resized(*handle, p - *start)
+                };
                 let clamped = r.intersect(&screen).unwrap_or_else(|| Rect::new(r.x, r.y, 1.0, 1.0).clamp_within(&screen));
                 if let Workspace::Capture { selection, .. } = &mut self.workspace {
                     *selection = Some(clamped);
@@ -999,7 +1006,8 @@ impl Editor {
             }
             Drag::CanvasResize { handle, orig, current, start } => {
                 let min_side = (MIN_CANVAS_LOGICAL * content_scale).max(8.0);
-                *current = clamp_resized_rect(*orig, *handle, p - *start, min_side).round();
+                let r = resize_rect_with_handle(*orig, *handle, p - *start, constrain, min_side);
+                *current = Rect::new(r.x.round(), r.y.round(), r.w.round().max(min_side), r.h.round().max(min_side));
             }
             Drag::Create { idx, start } => {
                 shape_drag = true;
@@ -1059,9 +1067,17 @@ impl Editor {
 
     pub fn constrain_changed(&mut self, constrain: bool) {
         self.constrain = constrain;
-        if matches!(self.drag, Some(Drag::Create { .. } | Drag::ElementHandle { .. })) {
+        if matches!(
+            self.drag,
+            Some(Drag::Create { .. } | Drag::ElementHandle { .. } | Drag::CanvasResize { .. } | Drag::SelResize { .. })
+        ) {
+            let active_shape = matches!(self.drag, Some(Drag::Create { .. } | Drag::ElementHandle { .. }));
             self.pointer_move(self.pointer, constrain);
-            self.touch_active();
+            if active_shape {
+                self.touch_active();
+            } else {
+                self.touch();
+            }
         }
     }
 
@@ -2177,5 +2193,53 @@ mod tests {
         drag(&mut e, (86.0, 80.0), (120.0, 80.0));
         let (_, handles) = e.selected_frame().unwrap();
         assert_eq!(handles, vec![Point::new(80.0, 80.0), Point::new(120.0, 80.0)]);
+    }
+
+    #[test]
+    fn shift_locks_aspect_ratio_on_bottom_and_side_dots_for_canvas_and_images_and_cursors_match() {
+        let fonts = Arc::new(Fonts::empty());
+        let img = Pixmap::new(200, 100).unwrap();
+        let comp = Composition::from_slice(img, 1.0, Vec::new());
+        let mut e = Editor::from_composition(comp, fonts);
+
+        // Check all 8 outer canvas dots report their exact resize cursor (including 4 diagonals).
+        let outer = e.screen().inflate(CANVAS_HANDLE_OFFSET);
+        assert_eq!(
+            Handle::ALL.map(|h| {
+                e.pointer_move(outer.handle_point(h), false);
+                e.cursor()
+            }),
+            [
+                CursorKind::ResizeNwSe,
+                CursorKind::ResizeNs,
+                CursorKind::ResizeNeSw,
+                CursorKind::ResizeEw,
+                CursorKind::ResizeNwSe,
+                CursorKind::ResizeNs,
+                CursorKind::ResizeNeSw,
+                CursorKind::ResizeEw,
+            ]
+        );
+
+        // Select the 200x100 placed image and drag its Bottom dot down by +50 with Shift held.
+        click(&mut e, 100.0, 50.0);
+        let bottom_dot = Point::new(100.0, 100.0);
+        e.pointer_move(bottom_dot, true);
+        assert_eq!(e.cursor(), CursorKind::ResizeNs);
+        e.pointer_down(bottom_dot);
+        e.pointer_move(Point::new(100.0, 150.0), true);
+        e.pointer_up(Point::new(100.0, 150.0));
+        let img_bounds = e.elements()[0].as_image().unwrap().bounds;
+        assert_eq!(img_bounds, Rect::new(-50.0, 0.0, 300.0, 150.0));
+
+        // Deselect image, then Shift-drag the canvas's own Bottom dot down by +40:
+        // 200x100 (2:1) grows to 280x140!
+        e.clear_tool_or_selection();
+        let canvas_bottom = outer.handle_point(Handle::Bottom);
+        e.pointer_move(canvas_bottom, true);
+        e.pointer_down(canvas_bottom);
+        e.pointer_move(Point::new(canvas_bottom.x, canvas_bottom.y + 40.0), true);
+        e.pointer_up(Point::new(canvas_bottom.x, canvas_bottom.y + 40.0));
+        assert_eq!(e.screen(), Rect::new(0.0, 0.0, 280.0, 140.0));
     }
 }

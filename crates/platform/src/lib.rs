@@ -190,6 +190,12 @@ pub trait Platform {
         Ok(())
     }
 
+    /// Sets the active canvas cursor for `window` when `Some` (supplying native
+    /// diagonal resize cursors `IDC_SIZENWSE` / `IDC_SIZENESW` and `IDC_SIZEALL`
+    /// that gpui 0.2.2 omits on Windows), or yields back to gpui when `None`
+    /// (e.g. while hovering floating toolbar buttons).
+    fn set_canvas_cursor(&self, _window: WindowRef, _cursor: Option<bluesnap_core::CursorKind>) {}
+
     /// Native Save dialog offering `PNG Image (.png)` and `BlueSnap Editable (.bs)`.
     /// `owner` is the parent Editor window when saving from the Editor, or `None`
     /// when saving after a capture overlay closes.

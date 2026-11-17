@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tiny_skia::Pixmap;
 
-use crate::geom::{Handle, Point, Rect};
+use crate::geom::{Handle, Point, Rect, resize_rect_with_handle};
 use crate::shape::{EditHandle, Geometry, Metrics, Shape};
 use crate::style::Color;
 
@@ -97,54 +97,13 @@ impl PlacedImage {
     }
 
     /// Resizes `self.bounds` by dragging `handle` by `delta`. When `constrain`
-    /// (`Shift`) is held on a corner handle, preserves the current aspect ratio
-    /// anchored at the opposite corner.
+    /// (`Shift`) is held on any of the 8 handles, preserves the current aspect
+    /// ratio.
     pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool) -> Self {
         let EditHandle::Bounds(h) = handle else { return self.clone() };
-        let r = self.bounds;
-        let next = if constrain && h.is_corner() && r.w > 0.0 && r.h > 0.0 {
-            let aspect = r.w / r.h;
-            let anchor = match h {
-                Handle::TopLeft => Point::new(r.right(), r.bottom()),
-                Handle::TopRight => Point::new(r.x, r.bottom()),
-                Handle::BottomRight => Point::new(r.x, r.y),
-                Handle::BottomLeft => Point::new(r.right(), r.y),
-                _ => unreachable!(),
-            };
-            let moving = r.handle_point(h) + delta;
-            let d = moving - anchor;
-            let (mut w, mut hh) = (d.x.abs().max(MIN_IMAGE_SIDE), d.y.abs().max(MIN_IMAGE_SIDE));
-            if w / hh >= aspect {
-                hh = (w / aspect).max(MIN_IMAGE_SIDE);
-                w = hh * aspect;
-            } else {
-                w = (hh * aspect).max(MIN_IMAGE_SIDE);
-                hh = w / aspect;
-            }
-            let sx = if d.x == 0.0 { if matches!(h, Handle::TopLeft | Handle::BottomLeft) { -1.0 } else { 1.0 } } else { d.x.signum() };
-            let sy = if d.y == 0.0 { if matches!(h, Handle::TopLeft | Handle::TopRight) { -1.0 } else { 1.0 } } else { d.y.signum() };
-            Rect::from_points(anchor, Point::new(anchor.x + sx * w, anchor.y + sy * hh))
-        } else {
-            clamp_resized_rect(r, h, delta, MIN_IMAGE_SIDE)
-        };
+        let next = resize_rect_with_handle(self.bounds, h, delta, constrain, MIN_IMAGE_SIDE);
         Self { asset: self.asset.clone(), bounds: next }
     }
-}
-
-/// Resizes `orig` via `h` without flipping or collapsing below `min_side`.
-pub(crate) fn clamp_resized_rect(orig: Rect, h: Handle, delta: Point, min_side: f32) -> Rect {
-    let (mut l, mut t, mut r, mut b) = (orig.x, orig.y, orig.right(), orig.bottom());
-    match h {
-        Handle::TopLeft | Handle::Left | Handle::BottomLeft => l = (l + delta.x).min(r - min_side),
-        Handle::TopRight | Handle::Right | Handle::BottomRight => r = (r + delta.x).max(l + min_side),
-        _ => {}
-    }
-    match h {
-        Handle::TopLeft | Handle::Top | Handle::TopRight => t = (t + delta.y).min(b - min_side),
-        Handle::BottomLeft | Handle::Bottom | Handle::BottomRight => b = (b + delta.y).max(t + min_side),
-        _ => {}
-    }
-    Rect::from_edges(l, t, r, b)
 }
 
 /// One item on the canvas in Z-order (index `0` is at the bottom).
@@ -207,7 +166,7 @@ impl Element {
     pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool) -> Element {
         match self {
             Element::Image(img) => Element::Image(img.with_handle_moved(handle, delta, constrain)),
-            Element::Shape(s) => Element::Shape(s.with_handle_moved(handle, delta)),
+            Element::Shape(s) => Element::Shape(s.with_handle_moved(handle, delta, constrain)),
         }
     }
 

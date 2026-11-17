@@ -71,6 +71,7 @@ pub struct CanvasView {
     text_menu: bool,
     text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
     slider: Option<f32>,
+    canvas_hovered: bool,
 }
 
 fn short_error(e: &anyhow::Error) -> String {
@@ -176,6 +177,7 @@ impl CanvasView {
             text_menu: false,
             text_previews: None,
             slider: None,
+            canvas_hovered: true,
         }
     }
 
@@ -945,17 +947,20 @@ impl CanvasView {
         cx.notify();
     }
 
-    fn mouse_move(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+    fn mouse_move(&mut self, ev: &MouseMoveEvent, canvas_hovered: bool, cx: &mut Context<Self>) {
         if self.editor.is_picking() && self.is_capture() {
+            self.canvas_hovered = canvas_hovered;
             cx.notify();
         }
         if self.slider.is_some() {
             self.drag_slider(ev.position.x);
+            self.canvas_hovered = canvas_hovered;
             return cx.notify();
         }
-        let before = (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring());
+        let before = (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered);
         self.editor.pointer_move(self.viewport.to_image(ev.position), ev.modifiers.shift);
-        if (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring()) != before {
+        self.canvas_hovered = canvas_hovered;
+        if (self.editor.revision(), self.editor.cursor(), self.editor.brush_ring(), self.canvas_hovered) != before {
             cx.notify();
         }
     }
@@ -1178,6 +1183,8 @@ impl CanvasView {
                 let color = e.text_ink().unwrap_or(THEME_BLUE);
                 (v.to_window(r), hsla(color))
             }),
+            editor_cursor: e.cursor(),
+            dragging: e.is_dragging(),
             cursor: match e.cursor() {
                 CursorKind::Default => CursorStyle::Arrow,
                 CursorKind::Crosshair => CursorStyle::Crosshair,
@@ -1355,6 +1362,8 @@ struct Scene {
     text_frame: Option<Bounds<Pixels>>,
     brush_ring: Option<(Point<Pixels>, gpui::Size<Pixels>, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
+    editor_cursor: CursorKind,
+    dragging: bool,
     cursor: CursorStyle,
     editing_text: bool,
 }
@@ -1443,7 +1452,14 @@ impl Scene {
             window.paint_quad(fill(bar, backdrop));
         }
 
-        window.set_cursor_style(self.cursor, &hitbox);
+        let in_top_bar = self.top_bar.is_some_and(|h| window.mouse_position().y < h) && !self.dragging;
+        let effective_kind = if in_top_bar { CursorKind::Default } else { self.editor_cursor };
+        let effective_style = if in_top_bar { CursorStyle::Arrow } else { self.cursor };
+        window.set_cursor_style(effective_style, &hitbox);
+        if let Ok(win_ref) = bluesnap_platform::window_ref(window) {
+            let native_cursor = (hitbox.is_hovered(window) || self.dragging).then_some(effective_kind);
+            bluesnap_platform::native().set_canvas_cursor(win_ref, native_cursor);
+        }
         if self.editing_text {
             window.handle_input(&self.focus, ElementInputHandler::new(bounds, self.entity.clone()), cx);
         }
@@ -1456,15 +1472,17 @@ impl Scene {
             }
         });
         let entity = self.entity.clone();
+        let wheel_hitbox = hitbox.clone();
         window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+            if phase == DispatchPhase::Bubble && wheel_hitbox.is_hovered(window) {
                 entity.update(cx, |this, cx| this.scroll_wheel(ev, window, cx));
             }
         });
         let entity = self.entity.clone();
-        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
+        window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble {
-                entity.update(cx, |this, cx| this.mouse_move(ev, cx));
+                let hovered = hitbox.is_hovered(window);
+                entity.update(cx, |this, cx| this.mouse_move(ev, hovered, cx));
             }
         });
         let entity = self.entity;

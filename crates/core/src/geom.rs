@@ -242,6 +242,74 @@ pub enum CursorKind {
     ResizeEw,
 }
 
+/// Resizes `orig` by moving `h` by `delta`, enforcing a minimum side of `min_side`.
+/// When `constrain` (`Shift`) is `true`, all 8 handles preserve `orig`'s aspect ratio:
+/// - corner handles anchor the opposite corner,
+/// - edge handles (`Top`, `Bottom`, `Left`, `Right`) anchor the opposite edge and
+///   expand/shrink symmetrically around the perpendicular center so the dragged
+///   edge midpoint stays directly under the pointer.
+pub fn resize_rect_with_handle(orig: Rect, h: Handle, delta: Point, constrain: bool, min_side: f32) -> Rect {
+    let min_side = min_side.max(1.0);
+    if !constrain || orig.w <= 0.0 || orig.h <= 0.0 {
+        let (mut l, mut t, mut r, mut b) = (orig.x, orig.y, orig.right(), orig.bottom());
+        match h {
+            Handle::TopLeft | Handle::Left | Handle::BottomLeft => l = (l + delta.x).min(r - min_side),
+            Handle::TopRight | Handle::Right | Handle::BottomRight => r = (r + delta.x).max(l + min_side),
+            _ => {}
+        }
+        match h {
+            Handle::TopLeft | Handle::Top | Handle::TopRight => t = (t + delta.y).min(b - min_side),
+            Handle::BottomLeft | Handle::Bottom | Handle::BottomRight => b = (b + delta.y).max(t + min_side),
+            _ => {}
+        }
+        return Rect::from_edges(l, t, r, b);
+    }
+
+    let aspect = orig.w / orig.h;
+    let min_w = min_side.max(min_side * aspect);
+    let min_h = min_w / aspect;
+    match h {
+        Handle::TopLeft | Handle::TopRight | Handle::BottomRight | Handle::BottomLeft => {
+            let (anchor, sx, sy) = match h {
+                Handle::TopLeft => (Point::new(orig.right(), orig.bottom()), -1.0, -1.0),
+                Handle::TopRight => (Point::new(orig.x, orig.bottom()), 1.0, -1.0),
+                Handle::BottomRight => (Point::new(orig.x, orig.y), 1.0, 1.0),
+                Handle::BottomLeft => (Point::new(orig.right(), orig.y), -1.0, 1.0),
+                _ => unreachable!(),
+            };
+            let moving = orig.handle_point(h) + delta;
+            let raw_w = ((moving.x - anchor.x) * sx).max(min_w);
+            let raw_h = ((moving.y - anchor.y) * sy).max(min_h);
+            let (w, hh) = if raw_w / raw_h >= aspect {
+                (raw_w, raw_w / aspect)
+            } else {
+                (raw_h * aspect, raw_h)
+            };
+            Rect::from_points(anchor, Point::new(anchor.x + sx * w, anchor.y + sy * hh))
+        }
+        Handle::Bottom => {
+            let hh = (orig.h + delta.y).max(min_h);
+            let w = hh * aspect;
+            Rect::new(orig.center().x - w / 2.0, orig.y, w, hh)
+        }
+        Handle::Top => {
+            let hh = (orig.h - delta.y).max(min_h);
+            let w = hh * aspect;
+            Rect::new(orig.center().x - w / 2.0, orig.bottom() - hh, w, hh)
+        }
+        Handle::Right => {
+            let w = (orig.w + delta.x).max(min_w);
+            let hh = w / aspect;
+            Rect::new(orig.x, orig.center().y - hh / 2.0, w, hh)
+        }
+        Handle::Left => {
+            let w = (orig.w - delta.x).max(min_w);
+            let hh = w / aspect;
+            Rect::new(orig.right() - w, orig.center().y - hh / 2.0, w, hh)
+        }
+    }
+}
+
 /// Distance from `p` to the segment `a`-`b`.
 pub fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
     let ab = b - a;
@@ -278,5 +346,26 @@ mod tests {
         // Equidistant between `Top` (5, 0) and `TopRight` (10, 0): corner wins.
         assert_eq!(r.handle_at(Point::new(7.5, 0.0), 6.0), Some(Handle::TopRight));
         assert_eq!(r.handle_at(Point::new(50.0, 50.0), 6.0), None);
+    }
+
+    #[test]
+    fn constrained_resize_locks_aspect_ratio_on_all_eight_handles() {
+        let orig = Rect::new(100.0, 50.0, 200.0, 100.0); // aspect = 2:1, center = (200, 100)
+        for h in Handle::ALL {
+            let delta = match h {
+                Handle::Bottom | Handle::BottomRight => Point::new(20.0, 50.0),
+                Handle::Top | Handle::TopLeft => Point::new(-20.0, -50.0),
+                Handle::Right | Handle::TopRight => Point::new(60.0, -10.0),
+                Handle::Left | Handle::BottomLeft => Point::new(-60.0, 10.0),
+            };
+            let next = resize_rect_with_handle(orig, h, delta, true, 8.0);
+            assert!(((next.w / next.h) - 2.0).abs() < 1e-4, "{h:?} -> {next:?}");
+        }
+        // Dragging Bottom down by 50 pins Top at y=50 and expands width symmetrically around x=200.
+        let b = resize_rect_with_handle(orig, Handle::Bottom, Point::new(17.0, 50.0), true, 8.0);
+        assert_eq!(b, Rect::new(50.0, 50.0, 300.0, 150.0));
+        // Dragging Right out by 40 pins Left at x=100 and expands height symmetrically around y=100.
+        let r = resize_rect_with_handle(orig, Handle::Right, Point::new(40.0, -9.0), true, 8.0);
+        assert_eq!(r, Rect::new(100.0, 40.0, 240.0, 120.0));
     }
 }

@@ -1,6 +1,6 @@
 //! Annotation shapes: geometry, hit testing and editing handles.
 
-use crate::geom::{Handle, Point, Rect, distance_to_segment};
+use crate::geom::{Handle, Point, Rect, distance_to_segment, resize_rect_with_handle};
 use crate::style::{ArrowStyle, CounterFormat, RedactEffect, Style, TextBackdrop, TextStyle, Tool};
 use crate::text::{FontSet, Fonts, TextLayout};
 
@@ -191,19 +191,30 @@ impl Shape {
         }
     }
 
-    /// Copy of `self` with `handle` dragged by `delta`.
-    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point) -> Shape {
+    /// Copy of `self` with `handle` dragged by `delta`. When `constrain` (`Shift`)
+    /// is `true`, all 8 box handles preserve aspect ratio and arrow endpoints snap
+    /// to 45° angles.
+    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool) -> Shape {
+        let resize_box = |r: &Rect, h: Handle| {
+            if constrain {
+                resize_rect_with_handle(*r, h, delta, true, 4.0)
+            } else {
+                r.resized(h, delta)
+            }
+        };
         let geometry = match (&self.geometry, handle) {
-            (Geometry::Rect(r), EditHandle::Bounds(h)) => Geometry::Rect(r.resized(h, delta)),
-            (Geometry::Ellipse(r), EditHandle::Bounds(h)) => Geometry::Ellipse(r.resized(h, delta)),
+            (Geometry::Rect(r), EditHandle::Bounds(h)) => Geometry::Rect(resize_box(r, h)),
+            (Geometry::Ellipse(r), EditHandle::Bounds(h)) => Geometry::Ellipse(resize_box(r, h)),
             (Geometry::Redact { area: RedactShape::Rect(r), effect, strength }, EditHandle::Bounds(h)) => {
-                Geometry::Redact { area: RedactShape::Rect(r.resized(h, delta)), effect: *effect, strength: *strength }
+                Geometry::Redact { area: RedactShape::Rect(resize_box(r, h)), effect: *effect, strength: *strength }
             }
             (Geometry::Arrow { from, to, style }, EditHandle::ArrowFrom) => {
-                Geometry::Arrow { from: *from + delta, to: *to, style: *style }
+                let next_from = if constrain { snap_45(*to, *from + delta) } else { *from + delta };
+                Geometry::Arrow { from: next_from, to: *to, style: *style }
             }
             (Geometry::Arrow { from, to, style }, EditHandle::ArrowTo) => {
-                Geometry::Arrow { from: *from, to: *to + delta, style: *style }
+                let next_to = if constrain { snap_45(*from, *to + delta) } else { *to + delta };
+                Geometry::Arrow { from: *from, to: next_to, style: *style }
             }
             (g, _) => g.clone(),
         };
@@ -259,6 +270,17 @@ pub fn counter_font_size(diameter: f32) -> f32 {
 
 pub fn arrow_head_len(stroke: f32) -> f32 {
     10.0 + stroke * 3.0
+}
+
+fn snap_45(anchor: Point, p: Point) -> Point {
+    let d = p - anchor;
+    let len = d.length();
+    if len == 0.0 {
+        return p;
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let angle = (d.y.atan2(d.x) / step).round() * step;
+    Point::new(anchor.x + len * angle.cos(), anchor.y + len * angle.sin())
 }
 
 /// The line an arrow is drawn along, from its start to its tip.
@@ -392,7 +414,7 @@ mod tests {
             geometry: Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(10.0, 10.0), style: ArrowStyle::Elbow },
             style: Style::default(),
         };
-        let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0));
+        let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0), false);
         let style = ArrowStyle::Elbow;
         assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0), style });
     }
@@ -465,7 +487,9 @@ mod tests {
         };
         assert!(s.hit(Point::new(100.0, 50.0), metrics(&fonts)));
         assert_eq!(s.handles().len(), 8);
-        let moved = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(20.0, 0.0));
+        let moved = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(20.0, 0.0), false);
         assert_eq!(moved.bounds(metrics(&fonts)), Rect::new(0.0, 0.0, 220.0, 100.0));
+        let constrained = s.with_handle_moved(EditHandle::Bounds(Handle::Bottom), Point::new(0.0, 50.0), true);
+        assert_eq!(constrained.bounds(metrics(&fonts)), Rect::new(-50.0, 0.0, 300.0, 150.0));
     }
 }

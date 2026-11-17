@@ -1,16 +1,24 @@
 //! Windows backend: GDI capture, `EnumWindows` + DWM for window bounds.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
+use bluesnap_core::CursorKind;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FALSE, HWND, LPARAM, POINT, RECT, TRUE};
-use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
+};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
@@ -30,11 +38,13 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetCursorPos,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CallWindowProcW, CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_WNDPROC,
+    GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCURSOR, HTCLIENT,
+    HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENWSE, IDC_SIZENS, IDC_SIZEWE,
+    IsIconic, IsWindowVisible, LoadCursorW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WM_NCDESTROY, WM_SETCURSOR, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::{
@@ -69,6 +79,59 @@ fn raw_win32_hwnd(raw: RawWindowHandle) -> anyhow::Result<HWND> {
         bail!("not a Win32 window");
     };
     Ok(handle.hwnd.get() as HWND)
+}
+
+type CursorOverrideMap = HashMap<isize, (WNDPROC, Option<usize>)>;
+
+/// Per-window client-area cursor overrides (`hwnd` -> `(orig_wndproc, override_hcursor)`),
+/// supplying `IDC_SIZENWSE`, `IDC_SIZENESW`, and `IDC_SIZEALL` on Windows where gpui 0.2.2
+/// falls back to `IDC_ARROW`.
+static CURSOR_OVERRIDES: OnceLock<Mutex<CursorOverrideMap>> = OnceLock::new();
+
+fn win32_cursor_handle(kind: CursorKind) -> usize {
+    let id = match kind {
+        CursorKind::Default => IDC_ARROW,
+        CursorKind::Crosshair => IDC_CROSS,
+        CursorKind::Move => IDC_SIZEALL,
+        CursorKind::Text => IDC_IBEAM,
+        CursorKind::ResizeNwSe => IDC_SIZENWSE,
+        CursorKind::ResizeNeSw => IDC_SIZENESW,
+        CursorKind::ResizeNs => IDC_SIZENS,
+        CursorKind::ResizeEw => IDC_SIZEWE,
+    };
+    unsafe { LoadCursorW(null_mut(), id) as usize }
+}
+
+unsafe extern "system" fn cursor_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let key = hwnd as isize;
+    if msg == WM_NCDESTROY {
+        let orig = CURSOR_OVERRIDES
+            .get()
+            .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).remove(&key))
+            .and_then(|(proc, _)| proc);
+        return match orig {
+            Some(proc) => unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) },
+            None => 0,
+        };
+    }
+    let entry = CURSOR_OVERRIDES
+        .get()
+        .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).get(&key).copied());
+    if let Some((orig, override_cursor)) = entry {
+        if msg == WM_SETCURSOR
+            && (lparam as usize & 0xFFFF) == HTCLIENT as usize
+            && let Some(raw_cursor) = override_cursor
+        {
+            unsafe {
+                SetCursor(raw_cursor as HCURSOR);
+            }
+            return 1;
+        }
+        if let Some(proc) = orig {
+            return unsafe { CallWindowProcW(Some(proc), hwnd, msg, wparam, lparam) };
+        }
+    }
+    0
 }
 
 fn win32_hwnd(window: &dyn HasWindowHandle) -> anyhow::Result<HWND> {
@@ -272,11 +335,67 @@ impl Platform for Native {
             if visible {
                 ShowWindow(hwnd, if IsIconic(hwnd) != FALSE { SW_RESTORE } else { SW_SHOW });
                 SetForegroundWindow(hwnd);
+                let disable: i32 = FALSE;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                    (&disable as *const i32).cast(),
+                    size_of::<i32>() as u32,
+                );
             } else {
+                // Disable Windows 10/11 DWM's ~250ms fade-and-shrink close/hide
+                // transition before `SW_HIDE`, then wait two DWM vblanks so the
+                // flip-model desktop frontbuffer has no translucent ghost of the
+                // Editor when `BitBlt` captures the screen.
+                let disable: i32 = TRUE;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                    (&disable as *const i32).cast(),
+                    size_of::<i32>() as u32,
+                );
                 ShowWindow(hwnd, SW_HIDE);
+                let _ = DwmFlush();
+                let _ = DwmFlush();
             }
         }
         Ok(())
+    }
+
+    fn set_canvas_cursor(&self, window: WindowRef, cursor: Option<CursorKind>) {
+        let Ok(hwnd) = raw_win32_hwnd(window.0) else { return };
+        let key = hwnd as isize;
+        let wanted = cursor.map(win32_cursor_handle).filter(|&h| h != 0);
+        let map = CURSOR_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = if let Some(entry) = guard.get_mut(&key) {
+            std::mem::replace(&mut entry.1, wanted)
+        } else {
+            if wanted.is_none() {
+                return;
+            }
+            let prev_proc_raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+            if prev_proc_raw == 0 {
+                return;
+            }
+            let prev_proc: WNDPROC = unsafe { std::mem::transmute::<isize, WNDPROC>(prev_proc_raw) };
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, cursor_wndproc as *const () as usize as isize);
+            }
+            guard.insert(key, (prev_proc, wanted));
+            None
+        };
+        drop(guard);
+
+        if prev != wanted {
+            unsafe {
+                if let Some(h) = wanted {
+                    SetCursor(h as HCURSOR);
+                } else {
+                    let _ = PostMessageW(hwnd, WM_SETCURSOR, hwnd as usize, HTCLIENT as isize);
+                }
+            }
+        }
     }
 
     fn save_dialog(
