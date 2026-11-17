@@ -273,6 +273,12 @@ pub fn style_bar_size(tool: Tool) -> (f32, f32) {
     style_bar_size_ex(tool, false)
 }
 
+/// Height of the tallest style bar any capture tool shows: the room the
+/// capture overlay keeps beside its toolbar so picking a tool never moves it.
+pub fn tallest_style_bar() -> f32 {
+    Tool::ALL.iter().map(|&tool| style_bar_size(tool).1).fold(0.0, f32::max)
+}
+
 /// Slots & size of the standalone layer-actions bar shown when an `Element::Image`
 /// is selected in the Composition Editor (`Bring Forward | Send Backward | Delete`).
 pub fn image_bar_slots() -> Vec<Slot> {

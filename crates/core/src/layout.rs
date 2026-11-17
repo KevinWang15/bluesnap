@@ -12,9 +12,21 @@ pub struct PanelLayout {
 /// Puts the toolbar under the selection, right-aligned with it. Falls back to above
 /// the selection, then to inside its bottom edge, when there is no room on screen.
 /// The style bar sits on the far side of the toolbar from the selection.
-pub fn place_panels(sel: Rect, screen: Rect, toolbar: (f32, f32), style_bar: Option<(f32, f32)>, gap: f32) -> PanelLayout {
+///
+/// Room is always set aside for a style bar `reserve` tall (the tallest one any
+/// tool shows), whether or not `style_bar` is showing now, so picking a tool
+/// never makes both bars jump to the other side of the selection.
+pub fn place_panels(
+    sel: Rect,
+    screen: Rect,
+    toolbar: (f32, f32),
+    style_bar: Option<(f32, f32)>,
+    reserve: f32,
+    gap: f32,
+) -> PanelLayout {
     let (tw, th) = toolbar;
-    let extra = style_bar.map_or(0.0, |(_, h)| h + gap);
+    let reserved = style_bar.map_or(reserve, |(_, h)| h.max(reserve));
+    let extra = if reserved > 0.0 { reserved + gap } else { 0.0 };
     let x = (sel.right() - tw).min(screen.right() - tw).max(screen.x);
 
     let below = sel.bottom() + gap;
@@ -112,18 +124,43 @@ mod tests {
 
     #[test]
     fn toolbar_goes_below_when_room() {
-        let l = place_panels(Rect::new(100.0, 100.0, 500.0, 300.0), SCREEN, (300.0, 40.0), Some((200.0, 30.0)), 8.0);
+        let l = place_panels(Rect::new(100.0, 100.0, 500.0, 300.0), SCREEN, (300.0, 40.0), Some((200.0, 30.0)), 0.0, 8.0);
         assert_eq!(l.toolbar, Rect::new(300.0, 408.0, 300.0, 40.0));
         assert_eq!(l.style_bar, Some(Rect::new(300.0, 456.0, 200.0, 30.0)));
     }
 
     #[test]
     fn toolbar_flips_above_then_inside() {
-        let l = place_panels(Rect::new(100.0, 300.0, 500.0, 480.0), SCREEN, (300.0, 40.0), None, 8.0);
+        let l = place_panels(Rect::new(100.0, 300.0, 500.0, 480.0), SCREEN, (300.0, 40.0), None, 0.0, 8.0);
         assert_eq!(l.toolbar.y, 252.0);
-        let full = place_panels(SCREEN, SCREEN, (300.0, 40.0), None, 8.0);
+        let full = place_panels(SCREEN, SCREEN, (300.0, 40.0), None, 0.0, 8.0);
         assert_eq!(full.toolbar.y, 752.0);
         assert_eq!(full.toolbar.x, 700.0);
+    }
+
+    #[test]
+    fn showing_the_style_bar_never_moves_the_toolbar() {
+        let (toolbar, style, gap) = ((300.0, 40.0), (200.0, 30.0), 8.0);
+        // Selection bottoms that leave room below for the toolbar alone but not
+        // both bars, both bars, or neither; and the same near the top edge.
+        let cases = [
+            Rect::new(100.0, 300.0, 500.0, 420.0), // 72 px below: toolbar fits, toolbar + style bar don't
+            Rect::new(100.0, 300.0, 500.0, 300.0), // plenty below
+            Rect::new(100.0, 30.0, 500.0, 750.0),  // no room above or below: inside
+            Rect::new(100.0, 60.0, 500.0, 715.0),  // 52 px above: toolbar fits, both don't
+        ];
+        for sel in cases {
+            let hidden = place_panels(sel, SCREEN, toolbar, None, style.1, gap);
+            let shown = place_panels(sel, SCREEN, toolbar, Some(style), style.1, gap);
+            assert_eq!(hidden.toolbar, shown.toolbar, "{sel:?}");
+            // The style bar fits on screen and doesn't cover the toolbar.
+            let s = shown.style_bar.unwrap();
+            assert!(s.y >= SCREEN.y && s.bottom() <= SCREEN.bottom(), "{sel:?}: {s:?}");
+            assert!(s.bottom() <= shown.toolbar.y || s.y >= shown.toolbar.bottom(), "{sel:?}");
+        }
+        // The first case is the reported one: everything goes above, even before a tool is picked.
+        let l = place_panels(cases[0], SCREEN, toolbar, None, style.1, gap);
+        assert_eq!(l.toolbar.y, 300.0 - gap - 40.0);
     }
 
     #[test]

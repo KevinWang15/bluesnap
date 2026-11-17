@@ -1213,6 +1213,7 @@ impl CanvasView {
                 screen,
                 toolbar::panel_size(groups, 0.0),
                 style,
+                toolbar::tallest_style_bar(),
                 PANEL_GAP,
             );
             let at = |r: PxRect| Point { x: r.x, y: r.y };
