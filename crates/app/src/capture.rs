@@ -134,14 +134,17 @@ fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
         window_background: WindowBackgroundAppearance::Opaque,
         ..Default::default()
     };
+    // Activate the app after screen capture and before opening the overlay so
+    // macOS grants key-window and IME (`NSTextInputContext`) focus immediately.
+    cx.activate(true);
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new(editor, surface, cx)))?;
     stages.push(("open window", started.elapsed()));
     handle.update(cx, |view, window, _| {
+        window.focus(view.focus_handle());
+        window.activate_window();
         if let Err(e) = platform.configure_overlay(window, &capture.display) {
             log::warn!("overlay setup: {e:#}");
         }
-        window.focus(view.focus_handle());
-        window.activate_window();
         stages.push(("configure", started.elapsed()));
         let stages = std::mem::take(&mut stages);
         window.on_next_frame(move |window, _| {

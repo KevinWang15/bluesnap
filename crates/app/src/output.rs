@@ -88,7 +88,12 @@ pub fn save_with_dialog(
             }
         };
 
-        let Some((path, format)) = chosen else { return };
+        let Some((path, format)) = chosen else {
+            if hide_after {
+                cx.update(|_| platform.restore_previous_app()).ok();
+            }
+            return;
+        };
         let write_path = path.clone();
         let result = cx
             .background_executor()
@@ -110,7 +115,7 @@ pub fn save_with_dialog(
             Err(e) => log::error!("saving {} failed: {e:#}", path.display()),
         }
         if hide_after {
-            cx.update(|cx| cx.hide()).ok();
+            cx.update(|_| platform.restore_previous_app()).ok();
         }
     })
     .detach();

@@ -152,6 +152,11 @@ pub trait Platform {
     /// `display` (including menu bars/taskbars), above every other window, focused.
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
+    /// Yields active application focus back to whichever app was frontmost before
+    /// the capture overlay opened (macOS; no-op on Windows where closing the
+    /// overlay automatically restores focus to the underlying window).
+    fn restore_previous_app(&self) {}
+
     /// Puts a normal window (like settings opened from the capture overlay)
     /// above the overlay, and focuses it.
     fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {

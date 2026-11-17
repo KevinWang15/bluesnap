@@ -8,10 +8,10 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use objc2::rc::Retained;
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSSavePanel, NSScreen,
-    NSView, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel,
+    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -39,6 +39,9 @@ const ABOVE_OVERLAY: isize = 102;
 // A prewarm and an explicit recognition must not initialize Vision concurrently.
 static VISION_LOCK: Mutex<()> = Mutex::new(());
 static VISION_PREWARMED: OnceLock<()> = OnceLock::new();
+/// Frontmost application before a screenshot capture started, so closing the
+/// capture overlay returns keyboard focus straight to the user's app.
+static PREVIOUS_APP: Mutex<Option<Retained<NSRunningApplication>>> = Mutex::new(None);
 
 /// The bundle identifier, so the login item reads as bluesnap's.
 const LAUNCH_AGENT_LABEL: &str = "com.kevinwang15.bluesnap";
@@ -68,6 +71,12 @@ impl Platform for Native {
 
     fn capture_display_under_cursor(&self) -> anyhow::Result<Capture> {
         let started = Instant::now();
+        let current_app = NSRunningApplication::currentApplication();
+        let prev_app = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .filter(|app| **app != *current_app);
+        *PREVIOUS_APP.lock().unwrap_or_else(|e| e.into_inner()) = prev_app;
+
         let cursor = CGEvent::location(CGEvent::new(None).as_deref());
         let mut id: CGDirectDisplayID = 0;
         let mut count = 0u32;
@@ -110,11 +119,15 @@ impl Platform for Native {
     }
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
-        let ns_window = ns_window(window)?;
+        let mtm = MainThreadMarker::new().context("configure_overlay must run on the main thread")?;
+        let (view, ns_window) = ns_view_and_window(window)?;
 
-        // gpui creates a titled panel; a titled window keeps its traffic lights and is
-        // pushed below the menu bar. Borderless covers the whole display.
-        ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+        // gpui creates a titled non-activating panel; a titled window keeps its
+        // traffic lights and is pushed below the menu bar. Borderless (without
+        // `NonactivatingPanel`) covers the whole display and lets the overlay own
+        // keyboard and CJK IME (`NSTextInputContext`) focus.
+        ns_window.setStyleMask(NSWindowStyleMask::Borderless);
+        ns_window.setInitialFirstResponder(Some(&view));
         // GPUI leaves this disabled for pop-up windows; window picking needs hover events.
         ns_window.setAcceptsMouseMovedEvents(true);
         ns_window.setHidesOnDeactivate(false);
@@ -127,14 +140,35 @@ impl Platform for Native {
             size: CGSize { width: b.width, height: b.height },
         };
         ns_window.setFrame_display(frame, true);
+        #[allow(deprecated)] // Direct activation from a global hotkey; `activate()` alone is cooperative on macOS 14+.
+        NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
         ns_window.makeKeyAndOrderFront(None);
+        // `setStyleMask` rebuilds the frame view hierarchy and resets `firstResponder`
+        // to the window itself; since `GPUIView` does not override `acceptsFirstResponder`,
+        // restore `view` explicitly so `keyDown:` reaches `GPUIView` instead of `NSBeep()`.
+        ns_window.makeFirstResponder(Some(&view));
         Ok(())
     }
 
+    fn restore_previous_app(&self) {
+        let Some(prev) = PREVIOUS_APP.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        if prev.isTerminated() {
+            return;
+        }
+        if let Some(mtm) = MainThreadMarker::new() {
+            NSApplication::sharedApplication(mtm).yieldActivationToApplication(&prev);
+        }
+        #[allow(deprecated)] // Needed on macOS < 14; pairs with `yieldActivationToApplication` on macOS 14+.
+        prev.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps);
+    }
+
     fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
-        let ns_window = ns_window(window)?;
+        let (view, ns_window) = ns_view_and_window(window)?;
         ns_window.setLevel(ABOVE_OVERLAY);
         ns_window.makeKeyAndOrderFront(None);
+        ns_window.makeFirstResponder(Some(&view));
         Ok(())
     }
 
@@ -184,9 +218,10 @@ impl Platform for Native {
     }
 
     fn set_window_visible(&self, window: WindowRef, visible: bool) -> anyhow::Result<()> {
-        let ns_window = raw_ns_window(window.0)?;
+        let (view, ns_window) = raw_ns_view_and_window(window.0)?;
         if visible {
             ns_window.makeKeyAndOrderFront(None);
+            ns_window.makeFirstResponder(Some(&view));
         } else {
             ns_window.orderOut(None);
         }
@@ -388,17 +423,24 @@ unsafe extern "C" {
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
 }
 
-fn raw_ns_window(raw: RawWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
+fn raw_ns_view_and_window(raw: RawWindowHandle) -> anyhow::Result<(Retained<NSView>, Retained<objc2_app_kit::NSWindow>)> {
     let RawWindowHandle::AppKit(handle) = raw else {
         bail!("not an AppKit window");
     };
     // SAFETY: the handle comes from a live window on the main thread.
     let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
-    view.window().context("view has no window")
+    let win = view.window().context("view has no window")?;
+    Ok((view.retain(), win))
 }
 
-fn ns_window(window: &dyn HasWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
-    raw_ns_window(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw())
+fn raw_ns_window(raw: RawWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
+    Ok(raw_ns_view_and_window(raw)?.1)
+}
+
+fn ns_view_and_window(
+    window: &dyn HasWindowHandle,
+) -> anyhow::Result<(Retained<NSView>, Retained<objc2_app_kit::NSWindow>)> {
+    raw_ns_view_and_window(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw())
 }
 
 fn prewarm_vision() -> anyhow::Result<()> {

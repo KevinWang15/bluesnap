@@ -118,8 +118,8 @@ fn permission_banner(url: &'static str, cx: &mut Context<CanvasView>) -> impl In
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            cx.open_url(url);
                             this.finish(Finish::Cancel, window, cx);
+                            cx.open_url(url);
                         }),
                     ),
             ),
@@ -360,6 +360,9 @@ impl CanvasView {
     }
 
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
         match action {
             Action::AddImage => crate::editor_window::request_add_image(cx),
             Action::OpenFile => crate::editor_window::prompt_open_file(false, cx),
@@ -470,11 +473,17 @@ impl CanvasView {
             Finish::Cancel => {
                 self.drop_gpu_images(window);
                 window.remove_window();
+                if mode == Some(CaptureMode::Standard) {
+                    bluesnap_platform::native().restore_previous_app();
+                }
             }
             Finish::Copy => {
                 let image = self.editor.export();
                 self.drop_gpu_images(window);
                 window.remove_window();
+                if mode == Some(CaptureMode::Standard) {
+                    bluesnap_platform::native().restore_previous_app();
+                }
                 if let Some(image) = image {
                     output::copy_to_clipboard(image, cx);
                 }
@@ -488,6 +497,8 @@ impl CanvasView {
                 }
                 if let Some((image, comp)) = pair {
                     output::save_with_dialog(image, comp, mode != Some(CaptureMode::ForEditor), None, cx);
+                } else if mode == Some(CaptureMode::Standard) {
+                    bluesnap_platform::native().restore_previous_app();
                 }
             }
         }
@@ -511,6 +522,7 @@ impl CanvasView {
         self.finished = true;
         self.drop_gpu_images(window);
         window.remove_window();
+        bluesnap_platform::native().restore_previous_app();
         cx.defer(move |cx| {
             if let Err(e) = crate::scrolling::start(display, screen, rect, shapes, mode, cx) {
                 log::error!("could not start scrolling capture: {e:#}");
@@ -604,6 +616,8 @@ impl CanvasView {
                     window.remove_window();
                     if was_for_editor {
                         cx.defer(crate::editor_window::restore_if_hidden);
+                    } else {
+                        bluesnap_platform::native().restore_previous_app();
                     }
                     return;
                 }
@@ -875,6 +889,9 @@ impl CanvasView {
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus);
+        }
         if std::mem::take(&mut self.text_menu) {
             return cx.notify();
         }
