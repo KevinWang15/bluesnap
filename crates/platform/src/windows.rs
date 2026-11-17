@@ -14,8 +14,8 @@ use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUN
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
     ClientToScreen, CombineRgn, CreateRectRgn, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
-    HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, RGN_DIFF, ROP_CODE, ReleaseDC, SRCCOPY,
-    SelectObject, SetWindowRgn,
+    HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_DIFF,
+    ROP_CODE, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
@@ -82,6 +82,7 @@ fn set_topmost_and_focus(window: &dyn HasWindowHandle) -> anyhow::Result<()> {
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
+    const TRAY_LOCATION: &'static str = "system tray";
     const OVERLAY_FULLSCREEN: bool = true;
 
     fn init(&self) -> anyhow::Result<()> {
@@ -193,6 +194,35 @@ impl Platform for Native {
 
     fn escape_pressed(&self) -> bool {
         (unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } as u16 & 0x8000) != 0
+    }
+
+    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, PixelRect)> {
+        with_per_monitor_dpi(|| {
+            let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+            let mut info: MONITORINFO = unsafe { zeroed() };
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(monitor, &mut info) } == FALSE {
+                bail!("GetMonitorInfoW failed: {}", std::io::Error::last_os_error());
+            }
+            let (rc, work) = (info.rcMonitor, info.rcWork);
+            let display = DisplayInfo {
+                id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
+                bounds: NativeRect {
+                    x: rc.left as f64,
+                    y: rc.top as f64,
+                    width: (rc.right - rc.left) as f64,
+                    height: (rc.bottom - rc.top) as f64,
+                },
+                scale_factor: monitor_scale(monitor),
+            };
+            let work_rect = PixelRect {
+                x: work.left - rc.left,
+                y: work.top - rc.top,
+                width: (work.right - work.left).max(1),
+                height: (work.bottom - work.top).max(1),
+            };
+            Ok((display, work_rect))
+        })
     }
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {

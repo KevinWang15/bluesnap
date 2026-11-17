@@ -115,6 +115,7 @@ impl Demo {
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
+    const TRAY_LOCATION: &'static str = "system tray";
     const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
@@ -159,6 +160,12 @@ impl Platform for Native {
 
     fn create_tray(&self, _hotkey: &str, _on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
         bail!("tray icon is not implemented on Linux yet")
+    }
+
+    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, crate::PixelRect)> {
+        let demo = demo()?;
+        let work = crate::PixelRect { x: 0, y: 0, width: demo.screen.width as i32, height: demo.screen.height as i32 };
+        Ok((demo.display(), work))
     }
 
     fn permission_settings_url(&self) -> Option<&'static str> {

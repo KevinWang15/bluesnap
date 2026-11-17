@@ -47,6 +47,8 @@ pub struct AppState {
     pub overlay: Option<AnyWindowHandle>,
     /// The running scrolling capture, if any.
     pub scrolling: Option<gpui::WeakEntity<scrolling::ScrollingCapture>>,
+    /// The 3-second launch corner toast, if still visible.
+    pub(crate) startup_toast: Option<AnyWindowHandle>,
     /// Global hotkey manager; kept alive for the lifetime of the app and shared
     /// with scrolling capture so it can register a session-scoped `Escape` cancel.
     pub(crate) hotkeys: Option<Rc<GlobalHotKeyManager>>,
@@ -74,7 +76,7 @@ fn main() {
 
         // Without the capture hotkey the tray menu still works, so a conflict
         // only warns while keeping the manager alive for session hotkeys (`Esc`).
-        let hotkeys = init_hotkeys(&config.hotkey, cx);
+        let (hotkeys, hotkey_active) = init_hotkeys(&config.hotkey, cx);
         // Points the login item at this copy, in case the app was moved or updated.
         if platform.start_at_login()
             && let Err(e) = platform.set_start_at_login(true)
@@ -88,6 +90,7 @@ fn main() {
                 None
             }
         };
+        let tray_ready = tray.is_some();
 
         // Loading fonts reads a few MB from disk; do it once, up front.
         let [sans, rounded, mono] = FontFamily::ALL.map(|f| FontSet::from_sources(&platform.fonts(f)));
@@ -98,6 +101,7 @@ fn main() {
         text_field::bind_keys(cx);
         ai_settings::bind_keys(cx);
         let ai = Arc::new(ai_settings::load());
+        let startup_hotkey = hotkey_active.then(|| config.hotkey.clone());
         cx.set_global(AppState {
             config,
             ai,
@@ -105,9 +109,13 @@ fn main() {
             fonts,
             overlay: None,
             scrolling: None,
+            startup_toast: None,
             hotkeys,
             tray,
         });
+        if tray_ready && !demo::enabled() {
+            toast::show_startup(startup_hotkey.as_deref(), cx);
+        }
         start_demo_capture(cx);
     });
 }
@@ -170,7 +178,7 @@ fn open_keepalive_window(cx: &mut App) {
     }
 }
 
-fn init_hotkeys(spec: &str, cx: &mut App) -> Option<Rc<GlobalHotKeyManager>> {
+fn init_hotkeys(spec: &str, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, bool) {
     let report = |e: anyhow::Error, cx: &mut App| {
         let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
         show_error(format!("{e:#}\n\nChange `hotkey` in {path}, then quit and restart bluesnap."), cx);
@@ -179,7 +187,7 @@ fn init_hotkeys(spec: &str, cx: &mut App) -> Option<Rc<GlobalHotKeyManager>> {
         Ok(m) => Rc::new(m),
         Err(e) => {
             report(e, cx);
-            return None;
+            return (None, false);
         }
     };
     let capture_id = match spec
@@ -200,6 +208,7 @@ fn init_hotkeys(spec: &str, cx: &mut App) -> Option<Rc<GlobalHotKeyManager>> {
             None
         }
     };
+    let hotkey_active = capture_id.is_some();
 
     // The handler runs inside the OS event dispatch; hop onto a gpui task.
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -220,7 +229,7 @@ fn init_hotkeys(spec: &str, cx: &mut App) -> Option<Rc<GlobalHotKeyManager>> {
         }
     })
     .detach();
-    Some(manager)
+    (Some(manager), hotkey_active)
 }
 
 fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<Tray> {

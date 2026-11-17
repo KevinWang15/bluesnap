@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, bail};
 use objc2::rc::Retained;
 use objc2::{AllocAnyThread, MainThreadMarker};
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSView, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSScreen, NSView, NSWindowStyleMask};
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreateImage, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
@@ -47,6 +47,8 @@ fn launch_agent_path() -> Option<PathBuf> {
 
 impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Cmd+A";
+    const TRAY_LOCATION: &'static str = "menu bar";
+    const NOTIFY_TOP_RIGHT: bool = true;
     const OVERLAY_FULLSCREEN: bool = false;
 
     fn init(&self) -> anyhow::Result<()> {
@@ -181,6 +183,39 @@ impl Platform for Native {
     fn escape_pressed(&self) -> bool {
         // CombinedSessionState = 0, kVK_Escape = 0x35 (53).
         unsafe { CGEventSourceKeyState(0, 0x35) }
+    }
+
+    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, PixelRect)> {
+        let mtm = MainThreadMarker::new().context("notification_area must run on the main thread")?;
+        let screen = NSScreen::screens(mtm).firstObject().context("no screen available")?;
+        let id = CGMainDisplayID();
+        let bounds = CGDisplayBounds(id);
+        anyhow::ensure!(bounds.size.width > 0.0 && bounds.size.height > 0.0, "empty display bounds");
+        let scale = screen.backingScaleFactor().max(1.0);
+        let frame = screen.frame();
+        let vis = screen.visibleFrame();
+        // Cocoa screen frames use a bottom-left origin; convert `visibleFrame`
+        // (which excludes the menu bar and Dock) to top-left display-local pixels.
+        let left = (vis.origin.x - frame.origin.x).max(0.0);
+        let top = ((frame.origin.y + frame.size.height) - (vis.origin.y + vis.size.height)).max(0.0);
+        let px = |v: f64| (v * scale).round() as i32;
+        let work = PixelRect {
+            x: px(left),
+            y: px(top),
+            width: px(vis.size.width).max(1),
+            height: px(vis.size.height).max(1),
+        };
+        let display = DisplayInfo {
+            id,
+            bounds: NativeRect {
+                x: bounds.origin.x,
+                y: bounds.origin.y,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            scale_factor: scale as f32,
+        };
+        Ok((display, work))
     }
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {

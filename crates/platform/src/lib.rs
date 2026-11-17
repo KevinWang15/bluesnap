@@ -100,6 +100,14 @@ pub trait Platform {
     /// Hotkey used when the config file doesn't set one, in `global-hotkey` syntax.
     const DEFAULT_HOTKEY: &'static str;
 
+    /// Human-readable name of the OS area where the background icon lives
+    /// (`"system tray"` on Windows, `"menu bar"` on macOS).
+    const TRAY_LOCATION: &'static str;
+
+    /// Whether corner notifications belong at the top-right (`true`, macOS)
+    /// rather than the bottom-right (`false`, Windows).
+    const NOTIFY_TOP_RIGHT: bool = false;
+
     /// Whether the overlay should be opened in gpui's fullscreen mode. On Windows
     /// that is a borderless window exactly covering the monitor; a regular
     /// frameless window there keeps invisible resize borders, which shrink the
@@ -150,6 +158,10 @@ pub trait Platform {
     fn escape_pressed(&self) -> bool {
         false
     }
+
+    /// Primary display and its usable work area (excluding taskbars, menu bars,
+    /// and docks, in `DisplayInfo`-local image pixels) for corner notifications.
+    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, PixelRect)>;
 
     /// Adds the tray (Windows) or menu bar (macOS) icon. `hotkey` is shown in its menu.
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray>;

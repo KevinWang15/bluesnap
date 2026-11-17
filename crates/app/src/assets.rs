@@ -21,7 +21,7 @@ icons![
     // The arrow style bar ("arrow" is the straight one).
     "arrow-elbow", "arrow-curved",
     // Toasts.
-    "spinner", "warning", "info",
+    "app", "spinner", "warning", "info",
 ];
 
 impl AssetSource for Assets {

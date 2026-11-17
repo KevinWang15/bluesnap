@@ -1,7 +1,7 @@
 //! Taking a screenshot: capture the display under the cursor and open the
 //! editing overlay on it.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bluesnap_core::{Document, Editor, Rect};
@@ -23,6 +23,22 @@ pub fn start_capture(cx: &mut App) {
     }
     if cx.global::<AppState>().overlay.is_some() {
         log::debug!("hotkey ignored: a capture is already open");
+        return;
+    }
+    if crate::toast::dismiss_startup(cx) {
+        // Let the OS unmap the startup toast before capturing the screen.
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(40)).await;
+            cx.update(|cx| {
+                if cx.global::<AppState>().overlay.is_none()
+                    && let Err(e) = open_overlay(cx)
+                {
+                    log::error!("capture failed: {e:#}");
+                }
+            })
+            .ok();
+        })
+        .detach();
         return;
     }
     if let Err(e) = open_overlay(cx) {
