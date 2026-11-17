@@ -19,6 +19,7 @@ mod toast;
 mod toolbar;
 mod viewport;
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use anyhow::Context as _;
 use bluesnap_core::{FontFamily, FontSet, Fonts};
 use bluesnap_platform::{Native, Platform, Tray, TrayCommand};
 use futures::StreamExt;
-use global_hotkey::hotkey::HotKey;
+use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
     AnyWindowHandle, App, AppContext, Application, Bounds, Context, Global, IntoElement, ParentElement, Render,
@@ -46,13 +47,18 @@ pub struct AppState {
     pub overlay: Option<AnyWindowHandle>,
     /// The running scrolling capture, if any.
     pub scrolling: Option<gpui::WeakEntity<scrolling::ScrollingCapture>>,
-    /// Unregisters the hotkey when dropped, so it must live as long as the app.
-    _hotkeys: Option<GlobalHotKeyManager>,
+    /// Global hotkey manager; kept alive for the lifetime of the app and shared
+    /// with scrolling capture so it can register a session-scoped `Escape` cancel.
+    pub(crate) hotkeys: Option<Rc<GlobalHotKeyManager>>,
     /// Removes the tray / menu bar icon when dropped.
     tray: Option<Tray>,
 }
 
 impl Global for AppState {}
+
+pub(crate) fn escape_hotkey() -> HotKey {
+    HotKey::new(None, Code::Escape)
+}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -66,18 +72,9 @@ fn main() {
         }
         open_keepalive_window(cx);
 
-        // Without the hotkey the tray menu still works, so this isn't fatal.
-        let hotkeys = match register_hotkey(&config.hotkey, cx) {
-            Ok(manager) => {
-                log::info!("ready: press {} to capture", config.hotkey);
-                Some(manager)
-            }
-            Err(e) => {
-                let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
-                show_error(format!("{e:#}\n\nChange `hotkey` in {path}, then quit and restart bluesnap."), cx);
-                None
-            }
-        };
+        // Without the capture hotkey the tray menu still works, so a conflict
+        // only warns while keeping the manager alive for session hotkeys (`Esc`).
+        let hotkeys = init_hotkeys(&config.hotkey, cx);
         // Points the login item at this copy, in case the app was moved or updated.
         if platform.start_at_login()
             && let Err(e) = platform.set_start_at_login(true)
@@ -108,7 +105,7 @@ fn main() {
             fonts,
             overlay: None,
             scrolling: None,
-            _hotkeys: hotkeys,
+            hotkeys,
             tray,
         });
         start_demo_capture(cx);
@@ -173,28 +170,57 @@ fn open_keepalive_window(cx: &mut App) {
     }
 }
 
-fn register_hotkey(spec: &str, cx: &mut App) -> anyhow::Result<GlobalHotKeyManager> {
-    let hotkey: HotKey = spec.parse().with_context(|| format!("invalid hotkey {spec:?}"))?;
-    let manager = GlobalHotKeyManager::new().context("global hotkeys unavailable")?;
-    manager
-        .register(hotkey)
-        .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
+fn init_hotkeys(spec: &str, cx: &mut App) -> Option<Rc<GlobalHotKeyManager>> {
+    let report = |e: anyhow::Error, cx: &mut App| {
+        let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
+        show_error(format!("{e:#}\n\nChange `hotkey` in {path}, then quit and restart bluesnap."), cx);
+    };
+    let manager = match GlobalHotKeyManager::new().context("global hotkeys unavailable") {
+        Ok(m) => Rc::new(m),
+        Err(e) => {
+            report(e, cx);
+            return None;
+        }
+    };
+    let capture_id = match spec
+        .parse::<HotKey>()
+        .with_context(|| format!("invalid hotkey {spec:?}"))
+        .and_then(|hotkey| {
+            manager
+                .register(hotkey)
+                .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
+            Ok(hotkey.id())
+        }) {
+        Ok(id) => {
+            log::info!("ready: press {spec} to capture");
+            Some(id)
+        }
+        Err(e) => {
+            report(e, cx);
+            None
+        }
+    };
 
     // The handler runs inside the OS event dispatch; hop onto a gpui task.
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         tx.unbounded_send(event).ok();
     }));
-    let id = hotkey.id();
+    let escape_id = escape_hotkey().id();
     cx.spawn(async move |cx| {
         while let Some(event) = rx.next().await {
-            if event.id == id && event.state == HotKeyState::Pressed {
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
+            if Some(event.id) == capture_id {
                 cx.update(capture::start_capture).ok();
+            } else if event.id == escape_id {
+                cx.update(scrolling::cancel_active).ok();
             }
         }
     })
     .detach();
-    Ok(manager)
+    Some(manager)
 }
 
 fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<Tray> {

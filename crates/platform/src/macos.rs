@@ -21,9 +21,17 @@ use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use crate::{Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
+use crate::{
+    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand,
+    WindowRef,
+};
 
 pub struct Native;
+
+/// gpui puts pop-up windows at `NSPopUpMenuWindowLevel` (101); helper bars and
+/// dialogs that must sit above the overlay/dim layer use one level higher.
+const POPUP_LEVEL: isize = 101;
+const ABOVE_OVERLAY: isize = 102;
 
 // A prewarm and an explicit recognition must not initialize Vision concurrently.
 static VISION_LOCK: Mutex<()> = Mutex::new(());
@@ -119,8 +127,6 @@ impl Platform for Native {
     }
 
     fn raise_above_overlay(&self, window: &dyn HasWindowHandle) -> anyhow::Result<()> {
-        // gpui puts the overlay (a pop-up window) at NSPopUpWindowLevel, 101.
-        const ABOVE_OVERLAY: isize = 102;
         let ns_window = ns_window(window)?;
         ns_window.setLevel(ABOVE_OVERLAY);
         ns_window.makeKeyAndOrderFront(None);
@@ -142,12 +148,13 @@ impl Platform for Native {
 
     fn place_floating_window(
         &self,
-        window: &dyn HasWindowHandle,
+        window: WindowRef,
         display: &DisplayInfo,
         rect: PixelRect,
         hole: Option<PixelRect>,
+        above: Option<WindowRef>,
     ) -> anyhow::Result<()> {
-        let ns_window = ns_window(window)?;
+        let ns_window = raw_ns_window(window.0)?;
         ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         ns_window.setHidesOnDeactivate(false);
         // The dim layer has nothing to click; letting all input through is simplest.
@@ -156,6 +163,7 @@ impl Platform for Native {
         // hole, over the content being captured.
         ns_window.setHasShadow(false);
         ns_window.setAcceptsMouseMovedEvents(true);
+        ns_window.setLevel(if above.is_some() { ABOVE_OVERLAY } else { POPUP_LEVEL });
         let s = display.scale_factor as f64;
         let b = display.bounds;
         let primary_height = CGDisplayBounds(CGMainDisplayID()).size.height;
@@ -168,6 +176,11 @@ impl Platform for Native {
         ns_window.setFrame_display(frame, true);
         ns_window.orderFrontRegardless();
         Ok(())
+    }
+
+    fn escape_pressed(&self) -> bool {
+        // CombinedSessionState = 0, kVK_Escape = 0x35 (53).
+        unsafe { CGEventSourceKeyState(0, 0x35) }
     }
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
@@ -255,7 +268,7 @@ impl Platform for Native {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    // Not exposed by objc2-core-graphics.
+    // Not exposed by objc2-core-graphics with our minimal feature set.
     fn CGBitmapContextCreate(
         data: *mut c_void,
         width: usize,
@@ -265,16 +278,20 @@ unsafe extern "C" {
         space: Option<&CGColorSpace>,
         bitmap_info: u32,
     ) -> Option<NonNull<CGContext>>;
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
 }
 
-fn ns_window(window: &dyn HasWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
-    let handle = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+fn raw_ns_window(raw: RawWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
+    let RawWindowHandle::AppKit(handle) = raw else {
         bail!("not an AppKit window");
     };
     // SAFETY: the handle comes from a live window on the main thread.
     let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
     view.window().context("view has no window")
+}
+
+fn ns_window(window: &dyn HasWindowHandle) -> anyhow::Result<Retained<objc2_app_kit::NSWindow>> {
+    raw_ns_window(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw())
 }
 
 fn prewarm_vision() -> anyhow::Result<()> {

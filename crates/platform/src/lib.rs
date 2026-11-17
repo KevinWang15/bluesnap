@@ -9,6 +9,16 @@
 pub use bluesnap_core::{FontFamily, FontSource};
 use raw_window_handle::HasWindowHandle;
 
+/// An opaque handle to an already-open OS window, extracted from gpui's
+/// `Window` so [`Platform::place_floating_window`] can run after releasing
+/// gpui's borrow on `App` (OS resize/show callbacks re-enter gpui).
+#[derive(Clone, Copy, Debug)]
+pub struct WindowRef(#[cfg_attr(target_os = "linux", allow(dead_code))] pub(crate) raw_window_handle::RawWindowHandle);
+
+pub fn window_ref(window: &dyn HasWindowHandle) -> anyhow::Result<WindowRef> {
+    Ok(WindowRef(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw()))
+}
+
 /// Rectangle in captured-image pixels (origin at the image's top-left).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PixelRect {
@@ -121,16 +131,25 @@ pub trait Platform {
     fn capture_region(&self, display: &DisplayInfo, rect: PixelRect) -> anyhow::Result<Image>;
 
     /// Places a helper window (the scrolling-capture dim layer or bar) exactly at
-    /// `rect` (in `display`'s image pixels), above other windows, without taking
-    /// focus. Mouse input inside `hole` (relative to `rect`) goes to the windows
-    /// below, so the user can scroll the captured app through it.
+    /// `rect` (in `display`'s image pixels), above normal windows, without taking
+    /// focus. When `hole` is `Some` (the dim layer), the window ignores all mouse
+    /// input so clicks anywhere on or outside `hole` pass straight through to the
+    /// desktop and apps below instead of raising the dim layer. When `above` is
+    /// `Some` (the scrolling bar), the OS keeps this window ordered above `above`.
     fn place_floating_window(
         &self,
-        window: &dyn HasWindowHandle,
+        window: WindowRef,
         display: &DisplayInfo,
         rect: PixelRect,
         hole: Option<PixelRect>,
+        above: Option<WindowRef>,
     ) -> anyhow::Result<()>;
+
+    /// Whether the physical Escape key is currently held down, used as a fallback
+    /// cancel check when global hotkey registration is unavailable or blocked.
+    fn escape_pressed(&self) -> bool {
+        false
+    }
 
     /// Adds the tray (Windows) or menu bar (macOS) icon. `hotkey` is shown in its menu.
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray>;

@@ -148,10 +148,11 @@ impl Platform for Native {
 
     fn place_floating_window(
         &self,
-        _window: &dyn HasWindowHandle,
+        _window: crate::WindowRef,
         _display: &DisplayInfo,
         _rect: crate::PixelRect,
         _hole: Option<crate::PixelRect>,
+        _above: Option<crate::WindowRef>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

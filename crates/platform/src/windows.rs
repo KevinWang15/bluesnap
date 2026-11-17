@@ -24,12 +24,18 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetCursorPos, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos,
+    EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TRANSPARENT,
 };
 
-use crate::{Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand};
+use crate::{
+    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, TextLine, Tray, TrayCommand,
+    WindowRef,
+};
 
 pub struct Native;
 
@@ -53,11 +59,15 @@ fn with_per_monitor_dpi<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
-fn win32_hwnd(window: &dyn HasWindowHandle) -> anyhow::Result<HWND> {
-    let RawWindowHandle::Win32(handle) = window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw() else {
+fn raw_win32_hwnd(raw: RawWindowHandle) -> anyhow::Result<HWND> {
+    let RawWindowHandle::Win32(handle) = raw else {
         bail!("not a Win32 window");
     };
     Ok(handle.hwnd.get() as HWND)
+}
+
+fn win32_hwnd(window: &dyn HasWindowHandle) -> anyhow::Result<HWND> {
+    raw_win32_hwnd(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw())
 }
 
 fn set_topmost_and_focus(window: &dyn HasWindowHandle) -> anyhow::Result<()> {
@@ -106,17 +116,35 @@ impl Platform for Native {
 
     fn place_floating_window(
         &self,
-        window: &dyn HasWindowHandle,
+        window: WindowRef,
         display: &DisplayInfo,
         rect: PixelRect,
         hole: Option<PixelRect>,
+        above: Option<WindowRef>,
     ) -> anyhow::Result<()> {
-        let hwnd = win32_hwnd(window)?;
+        let hwnd = raw_win32_hwnd(window.0)?;
+        let owner = above.map(|w| raw_win32_hwnd(w.0)).transpose()?;
         with_per_monitor_dpi(|| {
             let (x, y) = (display.bounds.x as i32 + rect.x, display.bounds.y as i32 + rect.y);
-            let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
             unsafe {
-                if SetWindowPos(hwnd, HWND_TOPMOST, x, y, rect.width, rect.height, flags) == FALSE {
+                // Helper windows never take focus from the scrolled app, and the dim
+                // layer (`hole.is_some()`) ignores all mouse input so clicking the
+                // dimmed area passes straight through instead of raising the dim layer.
+                let mut ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE as isize;
+                if hole.is_some() {
+                    ex_style |= (WS_EX_LAYERED | WS_EX_TRANSPARENT) as isize;
+                }
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style);
+
+                // Make the bar owned by the dim layer so Win32 enforces as a window-
+                // manager invariant that the bar stays above the dim layer in Z-order.
+                if let Some(owner) = owner {
+                    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner as isize);
+                }
+
+                if SetWindowPos(hwnd, HWND_TOPMOST, x, y, rect.width, rect.height, SWP_NOACTIVATE | SWP_FRAMECHANGED)
+                    == FALSE
+                {
                     bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
                 }
                 // gpui keeps invisible resize borders around frameless windows; grow the
@@ -129,19 +157,9 @@ impl Platform for Native {
                 let (left, top) = (origin.x - outer.left, origin.y - outer.top);
                 let right = outer.right - (origin.x + client.right);
                 let bottom = outer.bottom - (origin.y + client.bottom);
-                if (left, top, right, bottom) != (0, 0, 0, 0) {
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        x - left,
-                        y - top,
-                        rect.width + left + right,
-                        rect.height + top + bottom,
-                        SWP_NOACTIVATE,
-                    );
-                }
                 // Clip the window to its client area (the invisible borders would
-                // otherwise swallow clicks next to it), minus the pass-through hole.
+                // otherwise swallow clicks next to it), minus the pass-through hole,
+                // before `SWP_SHOWWINDOW` makes the window visible.
                 let region = CreateRectRgn(left, top, left + rect.width, top + rect.height);
                 if !region.is_null() {
                     if let Some(h) = hole {
@@ -156,9 +174,25 @@ impl Platform for Native {
                         DeleteObject(region);
                     }
                 }
+                if SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    x - left,
+                    y - top,
+                    rect.width + left + right,
+                    rect.height + top + bottom,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                ) == FALSE
+                {
+                    bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+                }
             }
             Ok(())
         })
+    }
+
+    fn escape_pressed(&self) -> bool {
+        (unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } as u16 & 0x8000) != 0
     }
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {

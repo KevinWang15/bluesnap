@@ -4,6 +4,7 @@
 //! preview beside the selection grows upward as content is stitched, and a small
 //! bar shows status and actions.
 
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,11 +14,12 @@ use bluesnap_core::shape::Shape;
 use bluesnap_core::stitch::{Progress, Stitcher};
 use bluesnap_core::{Color, Rect as PxRect, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
+use global_hotkey::GlobalHotKeyManager;
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, Context, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString, Styled, StyledImage, Task, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div, point,
-    prelude::FluentBuilder, px, rgba, size, svg,
+    AnyWindowHandle, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString, Styled, StyledImage,
+    Task, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
+    point, prelude::FluentBuilder, px, rgba, size, svg,
 };
 
 use crate::output::{self, Finish};
@@ -26,6 +28,9 @@ use crate::{AppState, document};
 
 /// Time between captures. Fast enough that normal wheel/trackpad scrolling keeps an overlap.
 const INTERVAL: Duration = Duration::from_millis(60);
+/// Delay before the first capture so the closing selection overlay leaves the screen.
+const SETTLE_SLICE: Duration = Duration::from_millis(50);
+const SETTLE_SLICES: usize = 4;
 /// Border around the hole and gap to the bar / preview, in logical pixels.
 const BORDER: f32 = 2.0;
 const GAP: f32 = 8.0;
@@ -37,12 +42,65 @@ const STATUS_WIDTH: f32 = 330.0;
 const MAX_ROWS: u32 = 30_000;
 const MAX_BYTES: u64 = 300 << 20;
 
+/// Session-scoped global `Escape` hotkey registration: unregisters on drop so
+/// `Escape` returns to normal apps the instant scrolling capture ends.
+struct EscapeGuard(Option<Rc<GlobalHotKeyManager>>);
+
+impl EscapeGuard {
+    fn register(cx: &App) -> Self {
+        let Some(manager) = cx.try_global::<AppState>().and_then(|s| s.hotkeys.clone()) else {
+            return Self(None);
+        };
+        if let Err(e) = manager.register(crate::escape_hotkey()) {
+            log::debug!("global Escape hotkey unavailable for scrolling capture (polling fallback active): {e:#}");
+            return Self(None);
+        }
+        Self(Some(manager))
+    }
+}
+
+impl Drop for EscapeGuard {
+    fn drop(&mut self) {
+        if let Some(manager) = self.0.take() {
+            manager.unregister(crate::escape_hotkey()).ok();
+        }
+    }
+}
+
+/// Rising-edge detector for [`Platform::escape_pressed`] so an `Escape` key
+/// still held from a prior interaction does not immediately cancel a newly
+/// started scrolling capture.
+struct EscapeEdge {
+    was_down: bool,
+}
+
+impl EscapeEdge {
+    fn new(initially_down: bool) -> Self {
+        Self { was_down: initially_down }
+    }
+
+    fn poll(&mut self, down: bool) -> bool {
+        let pressed = down && !self.was_down;
+        self.was_down = down;
+        pressed
+    }
+}
+
+/// Cancels the active scrolling capture, if any (invoked by global `Escape`).
+pub fn cancel_active(cx: &mut App) {
+    if let Some(session) = cx.global_mut::<AppState>().scrolling.take() {
+        session.update(cx, |s, cx| s.finish(Finish::Cancel, cx)).ok();
+    }
+}
+
 /// Dims the screen around the captured region (the "hole", in logical pixels),
 /// outlines it, and renders the live stitched preview beside it. The platform
-/// makes the hole click-through, so the app underneath can be scrolled.
+/// makes the entire dim layer click-through so clicking anywhere outside (or
+/// inside) the hole passes straight through without raising it above the bar.
 struct Dim {
     hole: Bounds<gpui::Pixels>,
     preview: Option<(PxRect, Arc<RenderImage>)>,
+    session: Option<WeakEntity<ScrollingCapture>>,
 }
 
 impl Dim {
@@ -100,10 +158,13 @@ pub struct ScrollingCapture {
     height: u32,
     frame: WindowHandle<Dim>,
     bar: Option<AnyWindowHandle>,
+    focus: FocusHandle,
+    stopped: bool,
     /// Annotations made before the capture started, relative to the region's
     /// top-left: the stitched image starts with the region, so they keep
     /// their place on its content however far it's scrolled.
     shapes: Vec<Shape>,
+    _escape: Option<EscapeGuard>,
     _task: Option<Task<()>>,
 }
 
@@ -122,7 +183,10 @@ fn helper_window_options(bounds: Bounds<gpui::Pixels>, display: gpui::DisplayId,
         titlebar: None,
         // Keyboard focus stays with the app being scrolled.
         focus: false,
-        show: true,
+        // On Windows and macOS, `place_floating_window` shows the window after
+        // configuring click-through, Z-order, and region clipping — avoiding
+        // focus theft (`SW_SHOWNORMAL` on Windows) and unstyled flashes.
+        show: !cfg!(any(target_os = "windows", target_os = "macos")),
         kind: WindowKind::PopUp,
         is_movable: false,
         is_resizable: false,
@@ -137,6 +201,7 @@ fn helper_window_options(bounds: Bounds<gpui::Pixels>, display: gpui::DisplayId,
 /// size in image pixels is `screen`), keeping `shapes` (annotations relative
 /// to `rect`) on the result.
 pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: Vec<Shape>, cx: &mut App) -> anyhow::Result<()> {
+    cancel_active(cx);
     let platform = bluesnap_platform::native();
     let gpui_display = cx
         .displays()
@@ -176,26 +241,62 @@ pub fn start(display: DisplayInfo, screen: (i32, i32), rect: PixelRect, shapes: 
     );
     let frame = cx.open_window(
         helper_window_options(logical_bounds(origin, screen_rect, scale), gpui_display.id(), true),
-        |_, cx| cx.new(|_| Dim { hole, preview: None }),
+        |_, cx| {
+            cx.new(|cx| {
+                cx.on_release(|dim: &mut Dim, cx| {
+                    if let Some(session) = dim.session.take() {
+                        cx.defer(move |cx| {
+                            session.update(cx, |s, cx| s.finish(Finish::Cancel, cx)).ok();
+                        });
+                    }
+                })
+                .detach();
+                Dim { hole, preview: None, session: None }
+            })
+        },
     )?;
-    frame.update(cx, |_, window, _| {
-        if let Err(e) = platform.place_floating_window(window, &display, screen_rect, Some(rect)) {
+
+    let setup = (|| -> anyhow::Result<_> {
+        let frame_ref = frame.update(cx, |_, window, _| bluesnap_platform::window_ref(window))??;
+        let bar = cx.open_window(
+            helper_window_options(logical_bounds(origin, bar_rect, scale), gpui_display.id(), false),
+            |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), screen, rect, frame, shapes, cx)),
+        )?;
+        let (bar_ref, entity) = bar.update(cx, |this, window, cx| -> anyhow::Result<_> {
+            this.bar = Some(window.window_handle());
+            Ok((bluesnap_platform::window_ref(window)?, cx.entity().downgrade()))
+        })??;
+        frame.update(cx, |dim, _, _| dim.session = Some(entity.clone()))?;
+        Ok((frame_ref, bar, bar_ref, entity))
+    })();
+    let (frame_ref, bar, bar_ref, entity) = match setup {
+        Ok(ok) => ok,
+        Err(e) => {
+            frame.update(cx, |_, window, _| window.remove_window()).ok();
+            return Err(e);
+        }
+    };
+
+    cx.global_mut::<AppState>().scrolling = Some(entity);
+    // Run `place_floating_window` on the UI foreground executor: on Windows this
+    // queues right after `DestroyWindow` of the closing selection overlay (so the
+    // OS restores focus to the scrolled app), and on all platforms `App` is not
+    // borrowed while OS resize/show callbacks re-enter gpui.
+    cx.spawn(async move |cx| {
+        let alive = bar.read_with(cx, |this, _| !this.stopped).unwrap_or(false)
+            && frame.read_with(cx, |_, _| true).unwrap_or(false);
+        if !alive {
+            return;
+        }
+        if let Err(e) = platform.place_floating_window(frame_ref, &display, screen_rect, Some(rect), None) {
             log::warn!("scrolling dim layer setup: {e:#}");
         }
-    })?;
-
-    let bar = cx.open_window(
-        helper_window_options(logical_bounds(origin, bar_rect, scale), gpui_display.id(), false),
-        |_, cx| cx.new(|cx| ScrollingCapture::new(display.clone(), screen, rect, frame, shapes, cx)),
-    )?;
-    bar.update(cx, |this, window, _| {
-        if let Err(e) = platform.place_floating_window(window, &this.display, bar_rect, None) {
+        if let Err(e) = platform.place_floating_window(bar_ref, &display, bar_rect, None, Some(frame_ref)) {
             log::warn!("scrolling bar setup: {e:#}");
         }
-        this.bar = Some(window.window_handle());
-    })?;
-    let entity = bar.update(cx, |_, _, cx| cx.entity().downgrade())?;
-    cx.global_mut::<AppState>().scrolling = Some(entity);
+    })
+    .detach();
+
     log::info!("scrolling capture of {}x{} started", rect.width, rect.height);
     Ok(())
 }
@@ -215,18 +316,58 @@ impl ScrollingCapture {
         shapes: Vec<Shape>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus = cx.focus_handle();
+        let escape = EscapeGuard::register(cx);
+        let id = cx.entity_id();
+        cx.on_release(move |this, cx| {
+            this._task = None;
+            this._escape = None;
+            if !std::mem::replace(&mut this.stopped, true) {
+                if cx.try_global::<AppState>().and_then(|s| s.scrolling.as_ref()).is_some_and(|s| s.entity_id() == id) {
+                    cx.global_mut::<AppState>().scrolling = None;
+                }
+                let frame = this.frame;
+                cx.defer(move |cx| {
+                    frame
+                        .update(cx, |dim, window, _| {
+                            dim.session = None;
+                            dim.set_preview(None, window);
+                            window.remove_window();
+                        })
+                        .ok();
+                });
+            }
+        })
+        .detach();
+
         let stitcher = Arc::new(Mutex::new(None));
         let task = cx.spawn({
             let (display, stitcher) = (display.clone(), stitcher.clone());
             async move |this, cx| {
-                // Let the overlay finish closing before the first frame.
-                cx.background_executor().timer(Duration::from_millis(200)).await;
+                let mut esc = EscapeEdge::new(bluesnap_platform::native().escape_pressed());
+                // Let the overlay finish closing before the first frame, while
+                // already watching `Escape` so cancel feels instantaneous.
+                for _ in 0..SETTLE_SLICES {
+                    cx.background_executor().timer(SETTLE_SLICE).await;
+                    if esc.poll(bluesnap_platform::native().escape_pressed()) {
+                        this.update(cx, |this, cx| this.finish(Finish::Cancel, cx)).ok();
+                        return;
+                    }
+                }
                 loop {
+                    if esc.poll(bluesnap_platform::native().escape_pressed()) {
+                        this.update(cx, |this, cx| this.finish(Finish::Cancel, cx)).ok();
+                        break;
+                    }
                     let (display, stitcher) = (display.clone(), stitcher.clone());
                     let step = cx
                         .background_executor()
                         .spawn(async move { capture_and_stitch(&display, screen, rect, &stitcher) })
                         .await;
+                    if esc.poll(bluesnap_platform::native().escape_pressed()) {
+                        this.update(cx, |this, cx| this.finish(Finish::Cancel, cx)).ok();
+                        break;
+                    }
                     if this.update(cx, |this, cx| this.on_progress(step, cx)).is_err() {
                         break; // the bar was closed
                     }
@@ -243,7 +384,10 @@ impl ScrollingCapture {
             height: 0,
             frame,
             bar: None,
+            focus,
+            stopped: false,
             shapes,
+            _escape: Some(escape),
             _task: Some(task),
         }
     }
@@ -287,23 +431,32 @@ impl ScrollingCapture {
         }
     }
 
-    /// Stops capturing and closes the dim layer and bar; returns the stitched image.
+    /// Stops capturing and closes the bar and dim layer; returns the stitched image.
     fn stop(&mut self, cx: &mut Context<Self>) -> Option<bluesnap_core::Pixmap> {
+        if std::mem::replace(&mut self.stopped, true) {
+            return None;
+        }
         self._task = None;
+        self._escape = None;
         let image = self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Stitcher::finish);
-        cx.global_mut::<AppState>().scrolling = None;
+        let id = cx.entity_id();
+        if cx.try_global::<AppState>().and_then(|s| s.scrolling.as_ref()).is_some_and(|s| s.entity_id() == id) {
+            cx.global_mut::<AppState>().scrolling = None;
+        }
         let (frame, bar) = (self.frame, self.bar);
-        // Close after this update returns: the bar's own window is borrowed now.
+        // Close after this update returns (the bar's own window may be borrowed now),
+        // removing the owned bar window before its owner dim window on Windows.
         cx.defer(move |cx| {
+            if let Some(bar) = bar {
+                bar.update(cx, |_, window, _| window.remove_window()).ok();
+            }
             frame
                 .update(cx, |dim, window, _| {
+                    dim.session = None;
                     dim.set_preview(None, window);
                     window.remove_window();
                 })
                 .ok();
-            if let Some(bar) = bar {
-                bar.update(cx, |_, window, _| window.remove_window()).ok();
-            }
         });
         log::info!("scrolling capture of {}x{} finished", self.rect.width, self.height);
         image
@@ -312,6 +465,9 @@ impl ScrollingCapture {
     /// Ends the session; `Copy` and `Save` deliver the stitched image, with
     /// the annotations drawn on it.
     pub fn finish(&mut self, how: Finish, cx: &mut Context<Self>) {
+        if self.stopped {
+            return;
+        }
         let image = self.stop(cx);
         let image = match how {
             Finish::Cancel => None,
@@ -333,6 +489,9 @@ impl ScrollingCapture {
 
     /// Ends the session and opens the stitched image in an editor window.
     fn edit(&mut self, cx: &mut Context<Self>) {
+        if self.stopped {
+            return;
+        }
         let Some(image) = self.stop(cx) else { return log::warn!("scrolling capture produced no image") };
         let (scale, id) = (self.display.scale_factor, self.display.id);
         let display = cx.displays().into_iter().find(|d| u32::from(d.id()) == id).map(|d| d.id());
@@ -432,7 +591,22 @@ impl Render for ScrollingCapture {
             crate::demo::report("scrolling-bar", window.scale_factor(), items);
         }
         let status_color = if self.warning { hsla(Color::rgb(0xD4380D)) } else { hsla(Color::rgb(0x333333)) };
-        let mut bar = toolbar::panel().size_full().text_size(px(13.0)).child(
+        let mut bar = toolbar::panel()
+            .size_full()
+            .text_size(px(13.0))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| match ev.keystroke.key.as_str() {
+                "escape" => {
+                    cx.stop_propagation();
+                    this.finish(Finish::Cancel, cx);
+                }
+                "enter" => {
+                    cx.stop_propagation();
+                    this.finish(Finish::Copy, cx);
+                }
+                _ => {}
+            }))
+            .child(
             div()
                 .w(px(STATUS_WIDTH))
                 .flex()
@@ -456,5 +630,29 @@ impl Render for ScrollingCapture {
             }
         }
         bar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EscapeEdge;
+
+    #[test]
+    fn escape_edge_ignores_already_held_key_and_fires_on_new_press() {
+        let mut edge = EscapeEdge::new(true);
+        assert!(!edge.poll(true), "still held from startup must not cancel");
+        assert!(!edge.poll(false), "releasing must not cancel");
+        assert!(edge.poll(true), "fresh press must cancel");
+        assert!(!edge.poll(true), "holding must not re-fire");
+        assert!(!edge.poll(false));
+        assert!(edge.poll(true), "second press must fire");
+    }
+
+    #[test]
+    fn escape_hotkey_has_stable_id_and_matches_spec() {
+        let hk = crate::escape_hotkey();
+        let parsed: global_hotkey::hotkey::HotKey = "Escape".parse().unwrap();
+        assert_eq!(hk.id(), parsed.id());
+        assert_eq!(hk.id(), crate::escape_hotkey().id());
     }
 }
