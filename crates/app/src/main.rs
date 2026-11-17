@@ -13,6 +13,7 @@ mod editor_window;
 mod gpu_image;
 mod loupe;
 mod output;
+mod run_mode;
 mod scrolling;
 mod text_field;
 mod toast;
@@ -36,14 +37,22 @@ use gpui::{
 };
 
 use crate::config::Config;
+use crate::run_mode::RunMode;
 
 pub struct AppState {
+    pub(crate) mode: RunMode,
     pub config: Config,
     /// The optional AI endpoints (see [`ai_settings`]).
     pub ai: Arc<bluesnap_ai::AiSettings>,
     /// The open AI settings window, if any.
     pub ai_window: Option<AnyWindowHandle>,
     pub(crate) fonts: Arc<Fonts>,
+    /// Invisible 1×1 window keeping GPUI's event loop alive across transient
+    /// window transitions and async clipboard/save jobs.
+    pub(crate) keepalive: Option<AnyWindowHandle>,
+    /// Active background delivery / modal dialog jobs that must finish before
+    /// a standalone editor session exits.
+    pub(crate) pending_jobs: usize,
     /// The open capture overlay, if any. Cleared when its view is released.
     pub overlay: Option<AnyWindowHandle>,
     /// The open multi-image Composition Editor window, if any.
@@ -74,11 +83,7 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     record_panics();
     let config = Config::load();
-    let cli_files: Vec<PathBuf> = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .filter(|p| p.exists() || !p.as_os_str().to_string_lossy().starts_with('-'))
-        .collect();
+    let mode = RunMode::from_env();
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
 
     let app = Application::new().with_assets(assets::Assets);
@@ -87,26 +92,34 @@ fn main() {
     });
     app.run(move |cx: &mut App| {
         let platform = bluesnap_platform::native();
-        if let Err(e) = platform.init() {
+        if let Err(e) = platform.init(mode.app_role()) {
             log::error!("platform setup failed: {e:#}");
         }
-        open_keepalive_window(cx);
+        if let Err(e) = platform.register_file_associations(mode.overwrites_file_association()) {
+            log::warn!("could not register .bs file association: {e:#}");
+        }
+        let keepalive = open_keepalive_window(cx);
 
-        // Without the capture hotkey the tray menu still works, so a conflict
-        // only warns while keeping the manager alive for session hotkeys (`Esc`).
-        let (hotkeys, hotkey_active) = init_hotkeys(&config.hotkey, cx);
-        // Points the login item at this copy, in case the app was moved or updated.
-        if platform.start_at_login()
+        // In daemon mode, registers the global capture shortcut (warning on conflict);
+        // in standalone `.bs` editor mode, skips global shortcut registration while
+        // still wiring the manager for session-scoped `Esc` during scrolling capture.
+        let (hotkeys, hotkey_active) = init_hotkeys(mode.capture_hotkey(&config.hotkey), cx);
+        if mode.refreshes_login_item()
+            && platform.start_at_login()
             && let Err(e) = platform.set_start_at_login(true)
         {
             log::warn!("could not update the login item: {e:#}");
         }
-        let tray = match create_tray(&platform, &config.hotkey, cx) {
-            Ok(tray) => Some(tray),
-            Err(e) => {
-                log::warn!("no tray icon: {e:#}");
-                None
+        let tray = if mode.uses_tray() {
+            match create_tray(&platform, &config.hotkey, cx) {
+                Ok(tray) => Some(tray),
+                Err(e) => {
+                    log::warn!("no tray icon: {e:#}");
+                    None
+                }
             }
+        } else {
+            None
         };
         let tray_ready = tray.is_some();
 
@@ -121,10 +134,13 @@ fn main() {
         let ai = Arc::new(ai_settings::load());
         let startup_hotkey = hotkey_active.then(|| config.hotkey.clone());
         cx.set_global(AppState {
+            mode: mode.clone(),
             config,
             ai,
             ai_window: None,
             fonts,
+            keepalive,
+            pending_jobs: 0,
             overlay: None,
             editor: None,
             editor_ref: None,
@@ -134,13 +150,15 @@ fn main() {
             hotkeys,
             tray,
         });
+        run_mode::install_lifecycle(cx);
 
-        let mut opened_initial_file = false;
-        for path in &cli_files {
-            opened_initial_file = true;
+        for path in mode.initial_files() {
             if let Err(e) = editor_window::open_file(path, cx) {
                 show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
             }
+        }
+        if mode.exits_when_idle() {
+            cx.defer(run_mode::exit_if_idle);
         }
         cx.spawn(async move |cx| {
             while let Some(urls) = url_rx.next().await {
@@ -158,10 +176,12 @@ fn main() {
         })
         .detach();
 
-        if tray_ready && !demo::enabled() && !opened_initial_file {
+        if tray_ready && mode.shows_startup_toast() {
             toast::show_startup(startup_hotkey.as_deref(), cx);
         }
-        start_demo_capture(cx);
+        if mode.runs_demo_capture() {
+            start_demo_capture(cx);
+        }
     });
 }
 
@@ -232,8 +252,8 @@ fn record_panics() {
 }
 
 /// gpui quits on Windows when its last window closes. An invisible window keeps
-/// the app alive between captures.
-fn open_keepalive_window(cx: &mut App) {
+/// the app alive across transient window transitions and async delivery jobs.
+fn open_keepalive_window(cx: &mut App) -> Option<AnyWindowHandle> {
     struct Empty;
     impl Render for Empty {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -251,12 +271,16 @@ fn open_keepalive_window(cx: &mut App) {
         is_minimizable: false,
         ..Default::default()
     };
-    if let Err(e) = cx.open_window(options, |_, cx| cx.new(|_| Empty)) {
-        log::error!("could not open keep-alive window: {e:#}");
+    match cx.open_window(options, |_, cx| cx.new(|_| Empty)) {
+        Ok(handle) => Some(handle.into()),
+        Err(e) => {
+            log::error!("could not open keep-alive window: {e:#}");
+            None
+        }
     }
 }
 
-fn init_hotkeys(spec: &str, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, bool) {
+fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, bool) {
     let report = |e: anyhow::Error, cx: &mut App| {
         let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
         show_error(format!("{e:#}\n\nChange `hotkey` in {path}, then quit and restart bluesnap."), cx);
@@ -264,28 +288,34 @@ fn init_hotkeys(spec: &str, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, b
     let manager = match GlobalHotKeyManager::new().context("global hotkeys unavailable") {
         Ok(m) => Rc::new(m),
         Err(e) => {
-            report(e, cx);
+            if capture_spec.is_some() {
+                report(e, cx);
+            } else {
+                log::debug!("session hotkeys unavailable in standalone mode: {e:#}");
+            }
             return (None, false);
         }
     };
-    let capture_id = match spec
-        .parse::<HotKey>()
-        .with_context(|| format!("invalid hotkey {spec:?}"))
-        .and_then(|hotkey| {
-            manager
-                .register(hotkey)
-                .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
-            Ok(hotkey.id())
-        }) {
-        Ok(id) => {
-            log::info!("ready: press {spec} to capture");
-            Some(id)
+    let capture_id = capture_spec.and_then(|spec| {
+        match spec
+            .parse::<HotKey>()
+            .with_context(|| format!("invalid hotkey {spec:?}"))
+            .and_then(|hotkey| {
+                manager
+                    .register(hotkey)
+                    .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
+                Ok(hotkey.id())
+            }) {
+            Ok(id) => {
+                log::info!("ready: press {spec} to capture");
+                Some(id)
+            }
+            Err(e) => {
+                report(e, cx);
+                None
+            }
         }
-        Err(e) => {
-            report(e, cx);
-            None
-        }
-    };
+    });
     let hotkey_active = capture_id.is_some();
 
     // The handler runs inside the OS event dispatch; hop onto a gpui task.

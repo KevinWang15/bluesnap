@@ -15,7 +15,7 @@ use gpui::{
     WindowHandle, WindowKind, WindowOptions, px, size,
 };
 
-use crate::AppState;
+use crate::{AppState, run_mode};
 use crate::canvas_view::CanvasView;
 use crate::capture::{self, CaptureMode, CapturedSlice};
 use crate::toast::{self, Toast};
@@ -157,56 +157,61 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
 pub fn prompt_open_file(bs_only: bool, owner: Option<WindowRef>, cx: &mut App) {
     let dir = cx.global::<AppState>().config.save_dir();
     cx.activate(true);
+    run_mode::begin_job(cx);
     let platform = bluesnap_platform::native();
     cx.spawn(async move |cx| {
-        // Run `open_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
-        // while the OS modal file dialog runs its message loop.
-        let native_choice = platform.open_dialog(owner, &dir, bs_only);
+        async {
+            // Run `open_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
+            // while the OS modal file dialog runs its message loop.
+            let native_choice = platform.open_dialog(owner, &dir, bs_only);
 
-        let picked = match native_choice {
-            Ok(Some(res)) => res,
-            Ok(None) => {
-                let rx = match cx.update(|cx| {
-                    cx.prompt_for_paths(PathPromptOptions {
-                        files: true,
-                        directories: false,
-                        multiple: false,
-                        prompt: Some(if bs_only { "Open .bs File".into() } else { "Open .bs or Image".into() }),
-                    })
-                }) {
-                    Ok(rx) => rx,
-                    Err(_) => return,
-                };
-                match rx.await {
-                    Ok(Ok(Some(mut paths))) => paths.pop(),
-                    _ => None,
+            let picked = match native_choice {
+                Ok(Some(res)) => res,
+                Ok(None) => {
+                    let rx = match cx.update(|cx| {
+                        cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some(if bs_only { "Open .bs File".into() } else { "Open .bs or Image".into() }),
+                        })
+                    }) {
+                        Ok(rx) => rx,
+                        Err(_) => return,
+                    };
+                    match rx.await {
+                        Ok(Ok(Some(mut paths))) => paths.pop(),
+                        _ => None,
+                    }
                 }
-            }
-            Err(e) => {
-                log::error!("open dialog failed: {e:#}");
-                None
-            }
-        };
+                Err(e) => {
+                    log::error!("open dialog failed: {e:#}");
+                    None
+                }
+            };
 
-        let Some(path) = picked else { return };
-        cx.update(|cx| {
-            if let Err(e) = open_file(&path, cx) {
-                log::error!("could not open {}: {e:#}", path.display());
-                if let Some(ed) = live_editor(cx) {
-                    ed.update(cx, |view, window, cx| {
-                        view.show_toast(
-                            Toast::new(toast::Kind::Error, "Could not open file").detail(format!("{e:#}")),
-                            window,
-                            cx,
-                        );
-                    })
-                    .ok();
-                } else {
-                    crate::show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
+            let Some(path) = picked else { return };
+            cx.update(|cx| {
+                if let Err(e) = open_file(&path, cx) {
+                    log::error!("could not open {}: {e:#}", path.display());
+                    if let Some(ed) = live_editor(cx) {
+                        ed.update(cx, |view, window, cx| {
+                            view.show_toast(
+                                Toast::new(toast::Kind::Error, "Could not open file").detail(format!("{e:#}")),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    } else {
+                        crate::show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
+                    }
                 }
-            }
-        })
-        .ok();
+            })
+            .ok();
+        }
+        .await;
+        cx.update(run_mode::end_job).ok();
     })
     .detach();
 }

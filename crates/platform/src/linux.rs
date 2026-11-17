@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, bail};
 use raw_window_handle::HasWindowHandle;
 
-use crate::{Capture, DisplayInfo, FontFamily, FontSource, Platform, TextLine, Tray, TrayCommand};
+use crate::{AppRole, Capture, DisplayInfo, FontFamily, FontSource, Platform, TextLine, Tray, TrayCommand};
 
 pub struct Native;
 
@@ -118,7 +118,7 @@ impl Platform for Native {
     const TRAY_LOCATION: &'static str = "system tray";
     const OVERLAY_FULLSCREEN: bool = false;
 
-    fn init(&self) -> anyhow::Result<()> {
+    fn init(&self, _role: AppRole) -> anyhow::Result<()> {
         Ok(())
     }
 

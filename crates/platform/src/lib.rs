@@ -109,6 +109,15 @@ impl SaveFormat {
     }
 }
 
+/// Role of the running process, controlling OS application policy at startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppRole {
+    /// Resident background tray / menu bar utility.
+    BackgroundUtility,
+    /// Standalone `.bs` Composition Editor window without a tray icon.
+    StandaloneEditor,
+}
+
 /// Keeps the tray / menu bar icon alive; dropping it removes the icon.
 pub struct Tray {
     _icon: Box<dyn std::any::Any>,
@@ -141,8 +150,19 @@ pub trait Platform {
     /// separate Space with an animation, so the overlay is sized by hand instead.
     const OVERLAY_FULLSCREEN: bool;
 
+    /// Whether [`Platform::color_dialog`] opens a native custom color picker.
+    const HAS_COLOR_DIALOG: bool = false;
+
     /// One-time setup once the UI event loop is running (permissions, app policy).
-    fn init(&self) -> anyhow::Result<()>;
+    fn init(&self, role: AppRole) -> anyhow::Result<()>;
+
+    /// Best-effort per-user registration of `.bs` files with this executable.
+    /// When `overwrite_existing` is `false` (e.g. a standalone `bluesnap file.bs`
+    /// invocation), existing Bluesnap registrations are left untouched so a
+    /// temporary binary doesn't hijack an installed copy's path.
+    fn register_file_associations(&self, _overwrite_existing: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Captures the display under the mouse cursor, plus the window layout on it.
     /// Must run before the overlay window is shown so the overlay isn't captured.
@@ -150,9 +170,6 @@ pub trait Platform {
 
     /// Turns a freshly opened window into the capture overlay: exactly covering
     /// `display` (including menu bars/taskbars), above every other window, focused.
-    /// Whether [`Platform::color_dialog`] opens a native custom color picker.
-    const HAS_COLOR_DIALOG: bool = false;
-
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()>;
 
     /// Yields active application focus back to whichever app was frontmost before
@@ -223,6 +240,16 @@ pub trait Platform {
         Ok(None)
     }
 
+    /// Native custom color picker dialog parented to `owner`.
+    /// Returns `Ok(None)` when cancelled or unsupported.
+    fn color_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        _initial: bluesnap_core::Color,
+    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
+        Ok(None)
+    }
+
     /// Whether the physical Escape key is currently held down, used as a fallback
     /// cancel check when global hotkey registration is unavailable or blocked.
     fn escape_pressed(&self) -> bool {
@@ -240,16 +267,6 @@ pub trait Platform {
     fn start_at_login(&self) -> bool {
         false
     }
-    /// Native custom color picker dialog parented to `owner`.
-    /// Returns `Ok(None)` when cancelled or unsupported.
-    fn color_dialog(
-        &self,
-        _owner: Option<WindowRef>,
-        _initial: bluesnap_core::Color,
-    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
-        Ok(None)
-    }
-
 
     /// Makes this executable start when the user logs in, or stops that.
     fn set_start_at_login(&self, _enabled: bool) -> anyhow::Result<()> {

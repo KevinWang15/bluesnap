@@ -22,12 +22,56 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>bs</string>
+            </array>
+            <key>CFBundleTypeIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundleTypeName</key>
+            <string>BlueSnap Editable Screenshot</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>com.kevinwang15.bluesnap.bs</string>
+            </array>
+        </dict>
+    </array>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
-    <!-- Menu bar app: no Dock icon or app menu. -->
+    <!-- Menu bar app by default; standalone .bs editor switches to Regular at runtime. -->
     <key>LSUIElement</key>
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+                <string>public.content</string>
+            </array>
+            <key>UTTypeDescription</key>
+            <string>BlueSnap Editable Screenshot</string>
+            <key>UTTypeIconFile</key>
+            <string>AppIcon</string>
+            <key>UTTypeIdentifier</key>
+            <string>com.kevinwang15.bluesnap.bs</string>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>bs</string>
+                </array>
+            </dict>
+        </dict>
+    </array>
 </dict>
 </plist>

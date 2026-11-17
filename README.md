@@ -86,7 +86,9 @@ Press the hotkey, then:
     swatches, transparent checkerboard, or native OS color picker), saved in `.bs`
   - click **Add image** on the far left of the toolbar to hide the editor temporarily
     and capture another screenshot; **✓** adds that capture straight into the editor
-  - click **Open** (next to Add image) to load a saved `.bs` composition or image file
+  - click **Open** (next to Add image) to load a saved `.bs` composition or image file,
+    or double-click any `.bs` file in Explorer / Finder (`bluesnap <file.bs>` opens a
+    standalone editor session without conflicting with a running tray instance)
 - the scrolling-screenshot button (a page with a down arrow) captures more than fits
   on screen: the overlay closes, a blue frame marks the selection, a live preview
   beside its bottom edge grows upward (shrinking in width once it nears the top of

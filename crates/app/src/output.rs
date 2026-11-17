@@ -9,7 +9,7 @@ use bluesnap_core::{Composition, Pixmap};
 use bluesnap_platform::{Platform, SaveFormat, WindowRef};
 use gpui::App;
 
-use crate::AppState;
+use crate::{AppState, run_mode};
 
 /// How a capture or edit session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,19 +22,26 @@ pub enum Finish {
 /// Copies `image` as a plain raster image to the system clipboard.
 pub fn copy_to_clipboard(image: Pixmap, cx: &mut App) {
     // Off the UI thread: large images take tens of milliseconds to hand over.
-    cx.background_executor()
-        .spawn(async move {
-            let data = arboard::ImageData {
-                width: image.width() as usize,
-                height: image.height() as usize,
-                bytes: to_rgba_straight(&image).into(),
-            };
-            match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
-                Ok(()) => log::info!("copied {}x{} to clipboard", image.width(), image.height()),
-                Err(e) => log::error!("copy to clipboard failed: {e}"),
-            }
-        })
-        .detach();
+    // Hold a job guard so standalone `.bs` editor sessions don't quit before
+    // the OS clipboard write completes.
+    run_mode::begin_job(cx);
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .spawn(async move {
+                let data = arboard::ImageData {
+                    width: image.width() as usize,
+                    height: image.height() as usize,
+                    bytes: to_rgba_straight(&image).into(),
+                };
+                match arboard::Clipboard::new().and_then(|mut c| c.set_image(data)) {
+                    Ok(()) => log::info!("copied {}x{} to clipboard", image.width(), image.height()),
+                    Err(e) => log::error!("copy to clipboard failed: {e}"),
+                }
+            })
+            .await;
+        cx.update(run_mode::end_job).ok();
+    })
+    .detach();
 }
 
 pub type OnSaved = Box<dyn FnOnce(PathBuf, &mut App) + 'static>;
@@ -59,74 +66,81 @@ pub fn save_with_dialog(
     let stem = chrono::Local::now().format("Screenshot %Y-%m-%d %H.%M.%S").to_string();
     // Native dialogs on macOS require the background app to be active.
     cx.activate(true);
+    run_mode::begin_job(cx);
 
     let platform = bluesnap_platform::native();
     cx.spawn(async move |cx| {
-        if let Some(closing) = closing {
-            let _ = platform.set_window_visible(closing, false);
-        }
-        // Run `save_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
-        // while Win32 / AppKit runs its modal dialog message loop.
-        let native_choice = platform.save_dialog(owner, &dir, &stem);
+        async {
+            if let Some(closing) = closing {
+                let _ = platform.set_window_visible(closing, false);
+            }
+            // Run `save_dialog` outside `cx.update` so `RefCell<App>` is NOT borrowed
+            // while Win32 / AppKit runs its modal dialog message loop.
+            let native_choice = platform.save_dialog(owner, &dir, &stem);
 
-        let chosen: Option<(PathBuf, SaveFormat)> = match native_choice {
-            Ok(Some(res)) => res,
-            Ok(None) => {
-                // Fallback for platforms without a custom filter dialog (Linux).
-                let suggested = format!("{stem}.png");
-                let rx = match cx.update(|cx| cx.prompt_for_new_path(&dir, Some(&suggested))) {
-                    Ok(rx) => rx,
-                    Err(_) => return,
-                };
-                match rx.await {
-                    Ok(Ok(Some(path))) => {
-                        let fmt = SaveFormat::from_path(&path).unwrap_or(SaveFormat::Png);
-                        let path = if path.extension().is_some() { path } else { path.with_extension(fmt.extension()) };
-                        Some((path, fmt))
+            let chosen: Option<(PathBuf, SaveFormat)> = match native_choice {
+                Ok(Some(res)) => res,
+                Ok(None) => {
+                    // Fallback for platforms without a custom filter dialog (Linux).
+                    let suggested = format!("{stem}.png");
+                    let rx = match cx.update(|cx| cx.prompt_for_new_path(&dir, Some(&suggested))) {
+                        Ok(rx) => rx,
+                        Err(_) => return,
+                    };
+                    match rx.await {
+                        Ok(Ok(Some(path))) => {
+                            let fmt = SaveFormat::from_path(&path).unwrap_or(SaveFormat::Png);
+                            let path = if path.extension().is_some() { path } else { path.with_extension(fmt.extension()) };
+                            Some((path, fmt))
+                        }
+                        Ok(Ok(None)) => None,
+                        Ok(Err(e)) => {
+                            log::error!("save dialog failed: {e}");
+                            None
+                        }
+                        Err(_) => None,
                     }
-                    Ok(Ok(None)) => None,
-                    Ok(Err(e)) => {
-                        log::error!("save dialog failed: {e}");
-                        None
-                    }
-                    Err(_) => None,
                 }
-            }
-            Err(e) => {
-                log::error!("save dialog failed: {e:#}");
-                None
-            }
-        };
+                Err(e) => {
+                    log::error!("save dialog failed: {e:#}");
+                    None
+                }
+            };
 
-        let Some((path, format)) = chosen else {
+            let Some((path, format)) = chosen else {
+                if hide_after {
+                    cx.update(|_| platform.restore_previous_app()).ok();
+                }
+                return;
+            };
+            let write_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match format {
+                        SaveFormat::Png => image.save_png(&write_path).map_err(|e| anyhow::anyhow!("{e}")),
+                        SaveFormat::Bs => {
+                            bluesnap_core::format::save_bs(&composition, &write_path).map_err(|e| anyhow::anyhow!("{e}"))
+                        }
+                    }
+                })
+                .await;
+
+            match result {
+                Ok(()) => {
+                    log::info!("saved {}", path.display());
+                    if let Some(cb) = on_saved {
+                        cx.update(|cx| cb(path, cx)).ok();
+                    }
+                }
+                Err(e) => log::error!("saving {} failed: {e:#}", path.display()),
+            }
             if hide_after {
                 cx.update(|_| platform.restore_previous_app()).ok();
             }
-            return;
-        };
-        let write_path = path.clone();
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                match format {
-                    SaveFormat::Png => image.save_png(&write_path).map_err(|e| anyhow::anyhow!("{e}")),
-                    SaveFormat::Bs => bluesnap_core::format::save_bs(&composition, &write_path).map_err(|e| anyhow::anyhow!("{e}")),
-                }
-            })
-            .await;
-
-        match result {
-            Ok(()) => {
-                log::info!("saved {}", path.display());
-                if let Some(cb) = on_saved {
-                    cx.update(|cx| cb(path, cx)).ok();
-                }
-            }
-            Err(e) => log::error!("saving {} failed: {e:#}", path.display()),
         }
-        if hide_after {
-            cx.update(|_| platform.restore_previous_app()).ok();
-        }
+        .await;
+        cx.update(run_mode::end_job).ok();
     })
     .detach();
 }

@@ -37,6 +37,7 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, DestroyWindow, EnumWindows, GWL_EXSTYLE, GWLP_HWNDPARENT, GWLP_WNDPROC,
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCURSOR, HTCLIENT,
@@ -48,8 +49,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::{
-    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat, TextLine, Tray,
-    TrayCommand, WindowRef,
+    AppRole, Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
+    TextLine, Tray, TrayCommand, WindowRef,
 };
 
 pub struct Native;
@@ -57,6 +58,16 @@ pub struct Native;
 /// Programs started at login, per user (under `HKEY_CURRENT_USER`).
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "bluesnap";
+
+/// Per-user `.bs` file association keys under `HKEY_CURRENT_USER` (no elevation required).
+const BS_PROGID: &str = "bluesnap.bs";
+const BS_CLASS_KEY: &str = r"Software\Classes\bluesnap.bs";
+const BS_ICON_KEY: &str = r"Software\Classes\bluesnap.bs\DefaultIcon";
+const BS_OPEN_KEY: &str = r"Software\Classes\bluesnap.bs\shell\open";
+const BS_CMD_KEY: &str = r"Software\Classes\bluesnap.bs\shell\open\command";
+const BS_EXT_KEY: &str = r"Software\Classes\.bs";
+const BS_OPEN_WITH_KEY: &str = r"Software\Classes\.bs\OpenWithProgids";
+const BS_DESCRIPTION: &str = "BlueSnap Editable Screenshot";
 
 /// A NUL-terminated UTF-16 string.
 fn wide(s: &str) -> Vec<u16> {
@@ -221,9 +232,14 @@ impl Platform for Native {
     const DEFAULT_HOTKEY: &'static str = "Ctrl+Alt+A";
     const TRAY_LOCATION: &'static str = "system tray";
     const OVERLAY_FULLSCREEN: bool = true;
+    const HAS_COLOR_DIALOG: bool = true;
 
-    fn init(&self) -> anyhow::Result<()> {
+    fn init(&self, _role: AppRole) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn register_file_associations(&self, overwrite_existing: bool) -> anyhow::Result<()> {
+        register_bs_file_association(overwrite_existing)
     }
 
     fn capture_display_under_cursor(&self) -> anyhow::Result<Capture> {
@@ -232,7 +248,6 @@ impl Platform for Native {
 
     fn configure_overlay(&self, window: &dyn HasWindowHandle, display: &DisplayInfo) -> anyhow::Result<()> {
         let _ = display; // gpui's fullscreen mode already covers exactly this monitor.
-    const HAS_COLOR_DIALOG: bool = true;
         // Always on top, above the taskbar. Allowed to focus because the process
         // just received the hotkey input.
         set_topmost_and_focus(window)
@@ -477,21 +492,6 @@ impl Platform for Native {
         Ok(Some(Some(path)))
     }
 
-    fn escape_pressed(&self) -> bool {
-        (unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } as u16 & 0x8000) != 0
-    }
-
-    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, PixelRect)> {
-        with_per_monitor_dpi(|| {
-            let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
-            let mut info: MONITORINFO = unsafe { zeroed() };
-            info.cbSize = size_of::<MONITORINFO>() as u32;
-            if unsafe { GetMonitorInfoW(monitor, &mut info) } == FALSE {
-                bail!("GetMonitorInfoW failed: {}", std::io::Error::last_os_error());
-            }
-            let (rc, work) = (info.rcMonitor, info.rcWork);
-            let display = DisplayInfo {
-                id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
     fn color_dialog(
         &self,
         owner: Option<WindowRef>,
@@ -525,6 +525,21 @@ impl Platform for Native {
         }))
     }
 
+    fn escape_pressed(&self) -> bool {
+        (unsafe { GetAsyncKeyState(VK_ESCAPE as i32) } as u16 & 0x8000) != 0
+    }
+
+    fn notification_area(&self) -> anyhow::Result<(DisplayInfo, PixelRect)> {
+        with_per_monitor_dpi(|| {
+            let monitor = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+            let mut info: MONITORINFO = unsafe { zeroed() };
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if unsafe { GetMonitorInfoW(monitor, &mut info) } == FALSE {
+                bail!("GetMonitorInfoW failed: {}", std::io::Error::last_os_error());
+            }
+            let (rc, work) = (info.rcMonitor, info.rcWork);
+            let display = DisplayInfo {
+                id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
                 bounds: NativeRect {
                     x: rc.left as f64,
                     y: rc.top as f64,
@@ -606,6 +621,122 @@ impl Platform for Native {
         };
         primary.into_iter().chain(cjk).collect()
     }
+}
+
+/// Reads a `REG_SZ` string value under `HKEY_CURRENT_USER\subkey`.
+fn reg_get_sz(subkey: &str, name: Option<&str>) -> Option<String> {
+    let key = wide(subkey);
+    let name_w = name.map(wide);
+    let name_ptr = name_w.as_ref().map_or(null(), |v| v.as_ptr());
+    let mut byte_len: u32 = 0;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name_ptr,
+            RRF_RT_REG_SZ,
+            null_mut(),
+            null_mut(),
+            &mut byte_len,
+        )
+    };
+    if status != ERROR_SUCCESS || byte_len < 2 {
+        return None;
+    }
+    let mut buf = vec![0u16; (byte_len as usize).div_ceil(2)];
+    let mut actual = std::mem::size_of_val(buf.as_slice()) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name_ptr,
+            RRF_RT_REG_SZ,
+            null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut actual,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// Writes a NUL-terminated UTF-16 `REG_SZ` value under `HKEY_CURRENT_USER\subkey`.
+fn reg_set_sz_w(subkey: &str, name: Option<&str>, nul_terminated: &[u16]) -> anyhow::Result<()> {
+    debug_assert_eq!(nul_terminated.last(), Some(&0));
+    let key = wide(subkey);
+    let name_w = name.map(wide);
+    let name_ptr = name_w.as_ref().map_or(null(), |v| v.as_ptr());
+    let bytes = std::mem::size_of_val(nul_terminated) as u32;
+    let status = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name_ptr,
+            REG_SZ,
+            nul_terminated.as_ptr().cast(),
+            bytes,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .with_context(|| format!("setting HKCU\\{subkey}"));
+    }
+    Ok(())
+}
+
+/// Registers `.bs` -> `bluesnap.bs` (`"...\bluesnap.exe" "%1"`) under `HKEY_CURRENT_USER`
+/// so double-clicking a `.bs` file opens it in the Composition Editor without requiring
+/// Administrator elevation, and avoids redundant writes or shell notifications when
+/// already up to date.
+fn register_bs_file_association(overwrite_existing: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("finding bluesnap.exe")?;
+
+    let mut open_cmd_w: Vec<u16> = "\"".encode_utf16().collect();
+    open_cmd_w.extend(exe.as_os_str().encode_wide());
+    open_cmd_w.extend("\" \"%1\"\0".encode_utf16());
+    let expected_cmd = String::from_utf16_lossy(&open_cmd_w[..open_cmd_w.len() - 1]);
+
+    let existing_cmd = reg_get_sz(BS_CMD_KEY, None);
+    if !overwrite_existing && existing_cmd.as_deref().is_some_and(|s| !s.is_empty()) {
+        return Ok(());
+    }
+
+    let existing_ext = reg_get_sz(BS_EXT_KEY, None);
+    let open_with_registered = reg_get_sz(BS_OPEN_WITH_KEY, Some(BS_PROGID)).is_some();
+    let ext_ready = existing_ext.as_deref().is_some_and(|s| !s.is_empty());
+    if existing_cmd.as_deref() == Some(expected_cmd.as_str()) && ext_ready && open_with_registered {
+        return Ok(());
+    }
+
+    let mut icon_w: Vec<u16> = "\"".encode_utf16().collect();
+    icon_w.extend(exe.as_os_str().encode_wide());
+    icon_w.extend("\",0\0".encode_utf16());
+
+    let desc_w = wide(BS_DESCRIPTION);
+    reg_set_sz_w(BS_CLASS_KEY, None, &desc_w)?;
+    reg_set_sz_w(BS_CLASS_KEY, Some("FriendlyTypeName"), &desc_w)?;
+    reg_set_sz_w(BS_ICON_KEY, None, &icon_w)?;
+    reg_set_sz_w(BS_OPEN_KEY, Some("FriendlyAppName"), &wide("bluesnap"))?;
+    reg_set_sz_w(BS_CMD_KEY, None, &open_cmd_w)?;
+    reg_set_sz_w(BS_OPEN_WITH_KEY, Some(BS_PROGID), &[0])?;
+
+    // Claim `.bs` as default when unassigned or already pointing to Bluesnap,
+    // without overwriting a different ProgID chosen explicitly by the user.
+    if existing_ext
+        .as_deref()
+        .is_none_or(|s| s.is_empty() || s.eq_ignore_ascii_case(BS_PROGID))
+    {
+        reg_set_sz_w(BS_EXT_KEY, None, &wide(BS_PROGID))?;
+    }
+
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, null(), null());
+    }
+    log::info!("registered .bs file association -> {}", exe.display());
+    Ok(())
 }
 
 fn capture_under_cursor() -> anyhow::Result<Capture> {

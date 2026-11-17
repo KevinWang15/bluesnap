@@ -26,8 +26,8 @@ use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNR
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::{
-    Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat, TextLine, Tray,
-    TrayCommand, WindowRef,
+    AppRole, Capture, DisplayInfo, FontFamily, FontSource, Image, NativeRect, PixelRect, Platform, SaveFormat,
+    TextLine, Tray, TrayCommand, WindowRef,
 };
 
 pub struct Native;
@@ -46,6 +46,8 @@ static PREVIOUS_APP: Mutex<Option<Retained<NSRunningApplication>>> = Mutex::new(
 
 /// The bundle identifier, so the login item reads as bluesnap's.
 const LAUNCH_AGENT_LABEL: &str = "com.kevinwang15.bluesnap";
+/// Uniform Type Identifier exported in `Info.plist` for `.bs` compositions.
+const BS_UTI: &str = "com.kevinwang15.bluesnap.bs";
 
 fn launch_agent_path() -> Option<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME")?);
@@ -57,16 +59,54 @@ impl Platform for Native {
     const TRAY_LOCATION: &'static str = "menu bar";
     const NOTIFY_TOP_RIGHT: bool = true;
     const OVERLAY_FULLSCREEN: bool = false;
-
-    fn init(&self) -> anyhow::Result<()> {
     const HAS_COLOR_DIALOG: bool = true;
+
+    fn init(&self, role: AppRole) -> anyhow::Result<()> {
         let mtm = MainThreadMarker::new().context("init must run on the main thread")?;
-        // Background utility: no Dock icon or menu bar.
-        NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-        if !CGPreflightScreenCaptureAccess() {
-            // Shows the system prompt once; captures contain only the wallpaper until granted.
-            log::warn!("screen recording permission not granted; requesting it");
-            CGRequestScreenCaptureAccess();
+        let app = NSApplication::sharedApplication(mtm);
+        match role {
+            AppRole::BackgroundUtility => {
+                // Background utility: no Dock icon or menu bar.
+                app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+                if !CGPreflightScreenCaptureAccess() {
+                    // Shows the system prompt once; captures contain only the wallpaper until granted.
+                    log::warn!("screen recording permission not granted; requesting it");
+                    CGRequestScreenCaptureAccess();
+                }
+            }
+            AppRole::StandaloneEditor => {
+                // Standalone `.bs` editor has no menu-bar icon, so expose it in Cmd+Tab / Dock.
+                app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+                #[allow(deprecated)]
+                app.activateIgnoringOtherApps(true);
+            }
+        }
+        Ok(())
+    }
+
+    fn register_file_associations(&self, overwrite_existing: bool) -> anyhow::Result<()> {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(macos_dir) = exe.parent()
+            && macos_dir.file_name().is_some_and(|n| n == "MacOS")
+            && let Some(contents_dir) = macos_dir.parent()
+            && contents_dir.file_name().is_some_and(|n| n == "Contents")
+            && let Some(bundle_dir) = contents_dir.parent()
+            && bundle_dir.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"))
+            && let Some(bundle_str) = bundle_dir.to_str()
+        {
+            let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(bundle_str), true);
+            unsafe {
+                let _ = LSRegisterURL((&*url as *const NSURL).cast(), u8::from(overwrite_existing));
+            }
+        }
+        if overwrite_existing {
+            let uti = CFString::from_static_str(BS_UTI);
+            let bundle_id = CFString::from_static_str(LAUNCH_AGENT_LABEL);
+            // kLSRolesEditor = 0x0000_0004
+            let status = unsafe { LSSetDefaultRoleHandlerForContentType(&uti, 0x0000_0004, &bundle_id) };
+            if status != 0 {
+                log::debug!("LSSetDefaultRoleHandlerForContentType returned OSStatus {status}");
+            }
         }
         Ok(())
     }
@@ -303,6 +343,35 @@ impl Platform for Native {
         Ok(Some(Some(PathBuf::from(ns_path.to_string()))))
     }
 
+    fn color_dialog(
+        &self,
+        _owner: Option<WindowRef>,
+        initial: bluesnap_core::Color,
+    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
+        let (r, g, b) = if initial.is_transparent() { (255, 255, 255) } else { (initial.r, initial.g, initial.b) };
+        let script = format!(
+            "choose color default color {{{}, {}, {}}}",
+            (r as u32) * 257,
+            (g as u32) * 257,
+            (b as u32) * 257
+        );
+        let out = std::process::Command::new("osascript").args(["-e", &script]).output()?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        let mut parts = s.trim().split(',').filter_map(|p| p.trim().parse::<u32>().ok());
+        let (Some(cr), Some(cg), Some(cb)) = (parts.next(), parts.next(), parts.next()) else {
+            return Ok(None);
+        };
+        Ok(Some(bluesnap_core::Color {
+            r: ((cr + 128) / 257).min(255) as u8,
+            g: ((cg + 128) / 257).min(255) as u8,
+            b: ((cb + 128) / 257).min(255) as u8,
+            a: 255,
+        }))
+    }
+
     fn escape_pressed(&self) -> bool {
         // CombinedSessionState = 0, kVK_Escape = 0x35 (53).
         unsafe { CGEventSourceKeyState(0, 0x35) }
@@ -343,35 +412,6 @@ impl Platform for Native {
 
     fn create_tray(&self, hotkey: &str, on_command: Box<dyn Fn(TrayCommand) + Send + Sync>) -> anyhow::Result<Tray> {
         let style = crate::tray::Style {
-    fn color_dialog(
-        &self,
-        _owner: Option<WindowRef>,
-        initial: bluesnap_core::Color,
-    ) -> anyhow::Result<Option<bluesnap_core::Color>> {
-        let (r, g, b) = if initial.is_transparent() { (255, 255, 255) } else { (initial.r, initial.g, initial.b) };
-        let script = format!(
-            "choose color default color {{{}, {}, {}}}",
-            (r as u32) * 257,
-            (g as u32) * 257,
-            (b as u32) * 257
-        );
-        let out = std::process::Command::new("osascript").args(["-e", &script]).output()?;
-        if !out.status.success() {
-            return Ok(None);
-        }
-        let s = String::from_utf8_lossy(&out.stdout);
-        let mut parts = s.trim().split(',').filter_map(|p| p.trim().parse::<u32>().ok());
-        let (Some(cr), Some(cg), Some(cb)) = (parts.next(), parts.next(), parts.next()) else {
-            return Ok(None);
-        };
-        Ok(Some(bluesnap_core::Color {
-            r: ((cr + 128) / 257).min(255) as u8,
-            g: ((cg + 128) / 257).min(255) as u8,
-            b: ((cb + 128) / 257).min(255) as u8,
-            a: 255,
-        }))
-    }
-
             icon_png: include_bytes!("../assets/tray-macos-template-36.png"),
             template: true,
             left_click_captures: false,
@@ -466,6 +506,16 @@ unsafe extern "C" {
         bitmap_info: u32,
     ) -> Option<NonNull<CGContext>>;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn LSRegisterURL(in_url: *const c_void, in_update: u8) -> i32;
+    fn LSSetDefaultRoleHandlerForContentType(
+        in_content_type: &CFString,
+        in_roles: u32,
+        in_handler_bundle_id: &CFString,
+    ) -> i32;
 }
 
 fn raw_ns_view_and_window(raw: RawWindowHandle) -> anyhow::Result<(Retained<NSView>, Retained<objc2_app_kit::NSWindow>)> {
