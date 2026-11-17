@@ -50,6 +50,10 @@ pub struct DisplayInfo {
 /// Captured pixels in the layout every supported OS produces natively: BGRX,
 /// row-major without padding, 4th byte undefined. Converting is left to the
 /// caller so it happens once, in parallel (`bluesnap_core::pixels::split_bgrx`).
+///
+/// Colors are sRGB on every OS (macOS converts from the display's profile),
+/// so saved files and the clipboard look the same on any screen, and windows
+/// showing them must be marked with [`Platform::present_as_srgb`].
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -221,6 +225,13 @@ pub trait Platform {
     fn set_window_visible(&self, _window: WindowRef, _visible: bool) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Declares that `window` draws sRGB pixels, the color space captures are
+    /// delivered in, so the compositor color-matches them to the display just
+    /// as it does the rest of the desktop. Call it on every window that shows
+    /// captured pixels, before its first frame. Only macOS color-manages
+    /// windows; elsewhere the pixels already go to the display unchanged.
+    fn present_as_srgb(&self, _window: WindowRef) {}
 
     /// Sets the active canvas cursor for `window` when `Some` (supplying native
     /// diagonal resize cursors `IDC_SIZENWSE` / `IDC_SIZENESW` and `IDC_SIZEALL`

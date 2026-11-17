@@ -143,6 +143,9 @@ fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new(editor, surface, cx)))?;
     stages.push(("open window", started.elapsed()));
     handle.update(cx, |view, window, _| {
+        if let Ok(window_ref) = bluesnap_platform::window_ref(window) {
+            platform.present_as_srgb(window_ref);
+        }
         window.focus(view.focus_handle());
         window.activate_window();
         if let Err(e) = platform.configure_overlay(window, &capture.display) {

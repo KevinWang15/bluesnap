@@ -283,6 +283,10 @@ pub fn start(
             Ok((bluesnap_platform::window_ref(window)?, cx.entity().downgrade()))
         })??;
         frame.update(cx, |dim, _, _| dim.session = Some(entity.clone()))?;
+        // The frame shows the live stitched preview, so color-match it like the overlay.
+        let platform = bluesnap_platform::native();
+        platform.present_as_srgb(frame_ref);
+        platform.present_as_srgb(bar_ref);
         Ok((frame_ref, bar, bar_ref, entity))
     })();
     let (frame_ref, bar, bar_ref, entity) = match setup {

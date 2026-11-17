@@ -351,7 +351,11 @@ fn open_window_with(comp: Composition, display: Option<DisplayId>, title: &str, 
     let win_ref = handle.update(cx, |view, window, _| {
         window.focus(view.focus_handle());
         window.activate_window();
-        bluesnap_platform::window_ref(window).ok()
+        let window_ref = bluesnap_platform::window_ref(window).ok();
+        if let Some(window_ref) = window_ref {
+            bluesnap_platform::native().present_as_srgb(window_ref);
+        }
+        window_ref
     })?;
     let state = cx.global_mut::<AppState>();
     state.editor = Some(handle);

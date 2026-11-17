@@ -8,7 +8,8 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use objc2::rc::Retained;
-use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message};
+use objc2::runtime::AnyObject;
+use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel,
     NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowAnimationBehavior, NSWindowStyleMask,
@@ -16,10 +17,10 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGBitmapContextCreateImage, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
+    CGBitmapContextCreateImage, CGColorRenderingIntent, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
     CGImageAlphaInfo, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
-    kCGWindowLayer, kCGWindowOwnerPID,
+    kCGColorSpaceSRGB, kCGWindowLayer, kCGWindowOwnerPID,
 };
 use objc2_foundation::{NSArray, NSDictionary, NSProcessInfo, NSString, NSURL};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
@@ -270,6 +271,25 @@ impl Platform for Native {
             ns_window.orderOut(None);
         }
         Ok(())
+    }
+
+    /// gpui leaves its `CAMetalLayer`'s color space unset, which means "no
+    /// color matching": pixels go to the display as they are, so sRGB captures
+    /// would look off on any non-sRGB (e.g. Display P3) screen.
+    fn present_as_srgb(&self, window: WindowRef) {
+        let Ok((view, _)) = raw_ns_view_and_window(window.0) else { return };
+        let Some(space) = srgb() else { return };
+        // SAFETY: plain property accessors on the view's backing layer, on the main thread.
+        unsafe {
+            let layer: Option<Retained<AnyObject>> = msg_send![&*view, layer];
+            let Some(layer) = layer else { return };
+            let settable: bool = msg_send![&*layer, respondsToSelector: sel!(setColorspace:)];
+            if settable {
+                let _: () = msg_send![&*layer, setColorspace: &*space];
+            } else {
+                log::warn!("window layer has no color space; captured colors may look shifted");
+            }
+        }
     }
 
     fn save_dialog(
@@ -634,23 +654,31 @@ fn recognize_with_vision_locked(width: u32, height: u32, rgba: &[u8]) -> anyhow:
     Ok(lines)
 }
 
-/// Draws `image` into a BGRX buffer we own: the display's native layout, so with
-/// the image's own color space this is a plain copy, with no color conversion.
+/// The color space every capture is delivered in, and that windows showing
+/// captures are tagged with (see [`Platform::present_as_srgb`]).
+fn srgb() -> Option<CFRetained<CGColorSpace>> {
+    // SAFETY: a constant CFString exported by CoreGraphics.
+    CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))
+}
+
+/// Draws `image` into a BGRX buffer we own (the display's native layout),
+/// converting its colors to sRGB. `CGDisplayCreateImage` tags its result with
+/// the display's profile on some macOS versions and with sRGB on others;
+/// converting explicitly makes captures mean the same thing everywhere, and
+/// windows that show them declare sRGB so Core Animation maps them back to
+/// the display exactly (relative colorimetric: in-gamut colors round-trip).
 fn to_bgrx(image: &CGImage) -> anyhow::Result<Image> {
     let (w, h) = (CGImage::width(Some(image)), CGImage::height(Some(image)));
     let mut bgrx = vec![0u8; w * h * 4];
     // Little-endian 32-bit "XRGB" is B, G, R, X in memory.
     let info = CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0;
-    let space = CGImage::color_space(Some(image)).or_else(CGColorSpace::new_device_rgb);
+    let space = srgb().context("the sRGB color space is unavailable")?;
     // SAFETY: `bgrx` outlives the context, which is released at the end of this function.
-    let context = unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, space.as_deref(), info) }
-        .or_else(|| {
-            let srgb = CGColorSpace::new_device_rgb();
-            unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, srgb.as_deref(), info) }
-        })
-    .context("CGBitmapContextCreate failed")?;
+    let context = unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), info) }
+        .context("CGBitmapContextCreate failed")?;
     // SAFETY: Create functions return a +1 reference.
     let context = unsafe { CFRetained::from_raw(context) };
+    CGContext::set_rendering_intent(Some(&context), CGColorRenderingIntent::RenderingIntentRelativeColorimetric);
     let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w as f64, height: h as f64 } };
     CGContext::draw_image(Some(&context), rect, Some(image));
     drop(context);
