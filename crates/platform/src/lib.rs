@@ -13,8 +13,16 @@ use raw_window_handle::HasWindowHandle;
 /// `Window` so [`Platform::place_floating_window`] can run after releasing
 /// gpui's borrow on `App` (OS resize/show callbacks re-enter gpui).
 #[derive(Clone, Copy, Debug)]
-pub struct WindowRef(#[cfg_attr(target_os = "linux", allow(dead_code))] pub(crate) raw_window_handle::RawWindowHandle);
+pub struct WindowRef(#[cfg(not(target_os = "linux"))] pub(crate) raw_window_handle::RawWindowHandle);
 
+// Linux's platform operations are stubs and do not consume a native handle.
+// GPUI's X11 backend panics if asked for one, including during editor paint.
+#[cfg(target_os = "linux")]
+pub fn window_ref(_: &dyn HasWindowHandle) -> anyhow::Result<WindowRef> {
+    Ok(WindowRef())
+}
+
+#[cfg(not(target_os = "linux"))]
 pub fn window_ref(window: &dyn HasWindowHandle) -> anyhow::Result<WindowRef> {
     Ok(WindowRef(window.window_handle().map_err(|e| anyhow::anyhow!("{e:?}"))?.as_raw()))
 }
