@@ -44,3 +44,6 @@ codegen-units = 1
 # current libc (`ENOATTR` was removed there). Only affects Linux builds.
 [patch.crates-io]
 xattr = { path = "third_party/xattr" }
+
+# GPUI 0.2.2 with per-window Direct3D atlas region updates for annotation layers.
+gpui = { path = "third_party/gpui" }
