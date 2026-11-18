@@ -92,6 +92,39 @@ impl PlatformAtlas for DirectXAtlas {
         }
     }
 
+    fn replace_image_regions(
+        &self,
+        old: &AtlasKey,
+        new: AtlasKey,
+        size: Size<DevicePixels>,
+        bytes: &[u8],
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        let mut lock = self.0.lock();
+        if lock.tiles_by_key.contains_key(&new) {
+            return false;
+        }
+        let Some(tile) = lock.tiles_by_key.get(old) else {
+            return false;
+        };
+        if tile.bounds.size != size {
+            return false;
+        }
+        let texture = lock.texture(tile.texture_id);
+        let pitch = size.width.to_bytes(4);
+        for region in regions {
+            let offset =
+                region.origin.y.0 as usize * pitch as usize + region.origin.x.0 as usize * 4;
+            let dst = Bounds::new(tile.bounds.origin + region.origin, region.size);
+            texture.upload_region(&lock.device_context, dst, &bytes[offset..], pitch);
+        }
+        // Transfer the existing allocation, including its reference count, to
+        // the new image. Dropping the old image can no longer remove this tile.
+        let tile = lock.tiles_by_key.remove(old).unwrap();
+        lock.tiles_by_key.insert(new, tile);
+        true
+    }
+
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
@@ -264,6 +297,21 @@ impl DirectXAtlasTexture {
         bounds: Bounds<DevicePixels>,
         bytes: &[u8],
     ) {
+        self.upload_region(
+            device_context,
+            bounds,
+            bytes,
+            bounds.size.width.to_bytes(self.bytes_per_pixel as u8),
+        );
+    }
+
+    fn upload_region(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        bounds: Bounds<DevicePixels>,
+        bytes: &[u8],
+        row_pitch: u32,
+    ) {
         unsafe {
             device_context.UpdateSubresource(
                 &self.texture,
@@ -277,7 +325,7 @@ impl DirectXAtlasTexture {
                     back: 1,
                 }),
                 bytes.as_ptr() as _,
-                bounds.size.width.to_bytes(self.bytes_per_pixel as u8),
+                row_pitch,
                 0,
             );
         }

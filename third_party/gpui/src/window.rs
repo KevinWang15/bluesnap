@@ -3194,6 +3194,49 @@ impl Window {
         });
     }
 
+    /// Replace a retired, single-frame image in this window's atlas. The caller
+    /// must include every pixel that differs and stop drawing the old image.
+    /// Regions are relative to the image. If the tile cannot be reused, painting
+    /// the new image will upload its complete contents through the usual path.
+    #[cfg(target_os = "windows")]
+    pub fn replace_image_regions(
+        &mut self,
+        old: &RenderImage,
+        new: &RenderImage,
+        regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        if old.id == new.id || old.frame_count() != 1 || new.frame_count() != 1 {
+            return false;
+        }
+        let size = new.size(0);
+        if old.size(0) != size
+            || regions.iter().any(|r| {
+                r.origin.x.0 < 0
+                    || r.origin.y.0 < 0
+                    || r.size.width.0 <= 0
+                    || r.size.height.0 <= 0
+                    || r.origin.x.0 > size.width.0 - r.size.width.0
+                    || r.origin.y.0 > size.height.0 - r.size.height.0
+            })
+        {
+            return false;
+        }
+        let key = |image: &RenderImage| {
+            RenderImageParams {
+                image_id: image.id,
+                frame_index: 0,
+            }
+            .into()
+        };
+        self.sprite_atlas.replace_image_regions(
+            &key(old),
+            key(new),
+            size,
+            new.as_bytes(0).expect("single-frame image"),
+            regions,
+        )
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

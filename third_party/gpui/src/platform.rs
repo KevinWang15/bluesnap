@@ -765,6 +765,17 @@ pub(crate) trait PlatformAtlas: Send + Sync {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    #[cfg(target_os = "windows")]
+    fn replace_image_regions(
+        &self,
+        _old: &AtlasKey,
+        _new: AtlasKey,
+        _size: Size<DevicePixels>,
+        _bytes: &[u8],
+        _regions: &[Bounds<DevicePixels>],
+    ) -> bool {
+        false
+    }
     fn remove(&self, key: &AtlasKey);
 }
 

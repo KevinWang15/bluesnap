@@ -1640,10 +1640,7 @@ impl Editor {
     }
 
     fn rectangular_redaction_bounds(&self, range: Range<usize>) -> Option<Rect> {
-        let rect = |element: &Element| match &element.as_shape()?.geometry {
-            Geometry::Redact { area: RedactShape::Rect(r), .. } => Some(*r),
-            _ => None,
-        };
+        let rect = |element: &Element| element.as_shape()?.redaction_rect();
         let (first, rest) = self.elements.get(range)?.split_first()?;
         let bounds = rest.iter().try_fold(rect(first)?, |bounds, el| Some(bounds.union(&rect(el)?)))?;
         // Include the same antialiasing gutter as render_shapes.

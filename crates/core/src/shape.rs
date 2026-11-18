@@ -53,6 +53,14 @@ pub enum EditHandle {
 }
 
 impl Shape {
+    /// Canvas bounds of a rectangular redaction, before rasterization padding.
+    pub fn redaction_rect(&self) -> Option<Rect> {
+        match &self.geometry {
+            Geometry::Redact { area: RedactShape::Rect(r), .. } => Some(*r),
+            _ => None,
+        }
+    }
+
     pub fn tool(&self) -> Tool {
         match self.geometry {
             Geometry::Rect(_) => Tool::Rect,
