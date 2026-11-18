@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bluesnap_core::pixels::pixmap_from_rgba;
+use bluesnap_core::pixels::pixmap_from_straight_rgba;
 use bluesnap_core::{Composition, Editor};
 use bluesnap_platform::{Platform, WindowRef};
 use gpui::{
@@ -115,7 +115,7 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
     let dyn_img = image::open(path).with_context(|| format!("opening image {}", path.display()))?;
     let rgba = dyn_img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    let pixmap = pixmap_from_rgba(w, h, rgba.into_raw()).context("invalid image dimensions")?;
+    let pixmap = pixmap_from_straight_rgba(w, h, rgba.into_raw()).context("invalid image dimensions")?;
 
     let was_hidden = cx.global::<AppState>().editor_hidden;
     if let Some(existing) = live_editor(cx) {

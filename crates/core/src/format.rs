@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::bson::{self, Doc, Value};
 use crate::composition::{Composition, Element, ImageAsset, ImageId, PlacedImage};
 use crate::geom::{Point, Rect};
-use crate::pixels::{par_map, pixmap_from_rgba, to_rgba_straight};
+use crate::pixels::{par_map, pixmap_from_rgba, pixmap_from_straight_rgba, to_rgba_straight};
 use crate::shape::{Geometry, RedactShape, Shape};
 use crate::style::{ArrowStyle, Color, CounterFormat, RedactEffect, SizeLevel, Style, TextStyle};
 
@@ -18,6 +18,12 @@ const MAX_CANVAS_SIDE: u32 = 65_535;
 const MAX_IMAGE_PIXELS: u64 = 256 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = (MAX_IMAGE_PIXELS as usize) * 4;
 const MAX_ABS_COORD: f32 = 1_000_000.0;
+
+/// Dimensions that an editable document can store and reopen.
+pub fn valid_canvas_size(width: u32, height: u32) -> bool {
+    (1..=MAX_CANVAS_SIDE).contains(&width) && (1..=MAX_CANVAS_SIDE).contains(&height)
+        && u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
+}
 
 #[derive(Debug)]
 pub enum FormatError {
@@ -103,7 +109,7 @@ pub fn decode_bs(bytes: &[u8]) -> Result<Composition, FormatError> {
         .ok()
         .filter(|&h| (1..=MAX_CANVAS_SIDE).contains(&h))
         .ok_or_else(|| bad("invalid canvas height"))?;
-    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
+    if !valid_canvas_size(width, height) {
         return Err(bad("canvas dimensions exceed maximum pixel budget"));
     }
     let scale = root.req_f32("scale")?;
@@ -200,6 +206,10 @@ fn encode_image_asset(asset: &ImageAsset) -> Result<Doc, FormatError> {
 
 fn decode_image_asset(doc: &Doc) -> Result<ImageAsset, FormatError> {
     let id = u64::try_from(doc.req_i64("id")?).map_err(|_| bad("negative image id"))?;
+    decode_image_pixels(doc, ImageId(id))
+}
+
+fn decode_image_pixels(doc: &Doc, id: ImageId) -> Result<ImageAsset, FormatError> {
     let width = u32::try_from(doc.req_i32("width")?)
         .ok()
         .filter(|&w| (1..=MAX_CANVAS_SIDE).contains(&w))
@@ -217,8 +227,8 @@ fn decode_image_asset(doc: &Doc) -> Result<ImageAsset, FormatError> {
     match encoding {
         "png" => {
             let rgba = decode_png_rgba(raw, width, height)?;
-            let pixmap = pixmap_from_rgba(width, height, rgba).ok_or_else(|| bad("failed to build image pixmap"))?;
-            Ok(ImageAsset::with_id_and_png(ImageId(id), pixmap, raw.to_vec()))
+            let pixmap = pixmap_from_straight_rgba(width, height, rgba).ok_or_else(|| bad("failed to build image pixmap"))?;
+            Ok(ImageAsset::with_id_and_png(id, pixmap, raw.to_vec()))
         }
         "rgba" => {
             let expected = width as usize * height as usize * 4;
@@ -226,7 +236,7 @@ fn decode_image_asset(doc: &Doc) -> Result<ImageAsset, FormatError> {
                 return Err(bad("raw RGBA byte length mismatch"));
             }
             let pixmap = pixmap_from_rgba(width, height, raw.to_vec()).ok_or_else(|| bad("failed to build image pixmap"))?;
-            Ok(ImageAsset::with_id(ImageId(id), pixmap))
+            Ok(ImageAsset::with_id(id, pixmap))
         }
         other => Err(bad(format!("unsupported image encoding `{other}`"))),
     }
@@ -463,18 +473,53 @@ fn encode_shape(d: &mut Doc, shape: &Shape) {
     d.push("size", Value::String(encode_size(shape.style.size).into()));
 }
 
+/// Encodes one editable item independently of its source document.
+pub fn encode_clipboard_element(element: &Element, scale: f32) -> Result<Vec<u8>, FormatError> {
+    let mut doc = encode_element(element);
+    if let Element::Image(image) = element {
+        doc.push("asset", Value::Document(encode_image_asset(&image.asset)?));
+    }
+    doc.push("scale", Value::Double(scale as f64));
+    Ok(bson::encode(&doc)?)
+}
+
+pub fn decode_clipboard_element(bytes: &[u8]) -> Result<(Element, f32), FormatError> {
+    let doc = bson::decode(bytes)?;
+    let scale = doc.req_f32("scale")?;
+    if !(0.1..=16.0).contains(&scale) {
+        return Err(bad("invalid clipboard scale"));
+    }
+    let kind = doc.req_str("kind")?;
+    let element = if kind == "image" {
+        // Independent documents may have assigned the same asset ID.
+        let asset = decode_image_pixels(doc.req_doc("asset")?, ImageId::next())?;
+        decode_placed_image(&doc, asset)?
+    } else {
+        Element::Shape(decode_shape(&doc, kind)?)
+    };
+    Ok((element, scale))
+}
+
 fn decode_element(d: &Doc, assets: &HashMap<ImageId, ImageAsset>) -> Result<Element, FormatError> {
     let kind = d.req_str("kind")?;
     if kind == "image" {
         let id = ImageId(u64::try_from(d.req_i64("image_id")?).map_err(|_| bad("invalid image_id"))?);
         let asset = assets.get(&id).ok_or_else(|| bad(format!("missing image asset {}", id.0)))?.clone();
-        let bounds = decode_rect(d.req_doc("bounds")?)?;
-        if bounds.w < 1.0 || bounds.h < 1.0 {
-            return Err(bad("placed image bounds must be at least 1x1"));
-        }
-        return Ok(Element::Image(PlacedImage::new(asset, bounds)));
+        return decode_placed_image(d, asset);
     }
 
+    Ok(Element::Shape(decode_shape(d, kind)?))
+}
+
+fn decode_placed_image(doc: &Doc, asset: ImageAsset) -> Result<Element, FormatError> {
+    let bounds = decode_rect(doc.req_doc("bounds")?)?;
+    if bounds.w < 1.0 || bounds.h < 1.0 {
+        return Err(bad("placed image bounds must be at least 1x1"));
+    }
+    Ok(Element::Image(PlacedImage::new(asset, bounds)))
+}
+
+fn decode_shape(d: &Doc, kind: &str) -> Result<Shape, FormatError> {
     let style = Style {
         color: decode_color(d.req_doc("color")?)?,
         size: decode_size(d.req_str("size")?)?,
@@ -539,12 +584,22 @@ fn decode_element(d: &Doc, assets: &HashMap<ImageId, ImageAsset>) -> Result<Elem
         }
         other => return Err(bad(format!("unknown element kind `{other}`"))),
     };
-    Ok(Element::Shape(Shape { geometry, style }))
+    Ok(Shape { geometry, style })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_image_alpha_survives_save_and_reopen() {
+        let raw = vec![255, 0, 0, 128, 30, 60, 90, 0];
+        let image = pixmap_from_straight_rgba(2, 1, raw).unwrap();
+        let comp = Composition::from_slice(image, 1.0, vec![]);
+        let restored = decode_bs(&encode_bs(&comp).unwrap()).unwrap();
+        let image = restored.elements[0].as_image().unwrap().asset.pixmap();
+        assert_eq!(image.data(), &[128, 0, 0, 128, 0, 0, 0, 0]);
+    }
     use crate::style::PALETTE;
 
     #[test]

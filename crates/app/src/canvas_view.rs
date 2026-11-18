@@ -25,6 +25,7 @@ use gpui::{
 
 use crate::AppState;
 use crate::capture::{CaptureMode, CapturedSlice};
+use crate::clipboard::{CopyContent, EditorClipboard, Paste};
 use crate::gpu_image::{ImageAtlasCache, ImageTiles, LayerBandPool, LayerKey, paint_tiles};
 use crate::output::{self, Finish};
 use crate::text_field::{byte_to_utf16, range_from_utf16, range_to_utf16, truncate_chars, utf16_to_byte};
@@ -73,6 +74,8 @@ pub struct CanvasView {
     text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
     slider: Option<f32>,
     canvas_hovered: bool,
+    /// Discards pending paste reads when Open replaces the document in this window.
+    document_generation: u64,
 }
 
 fn short_error(e: &anyhow::Error) -> String {
@@ -180,6 +183,7 @@ impl CanvasView {
             text_previews: None,
             slider: None,
             canvas_hovered: true,
+            document_generation: 0,
         }
     }
 
@@ -215,6 +219,7 @@ impl CanvasView {
 
     /// Replaces the entire composition (e.g. when loading a `.bs` file).
     pub fn replace_composition(&mut self, comp: Composition, window: &mut Window, cx: &mut Context<Self>) {
+        self.document_generation += 1;
         self.editor.replace_composition(comp);
         self.bg_menu = None;
         self.text_menu = false;
@@ -1109,6 +1114,69 @@ impl CanvasView {
         }
     }
 
+    fn copy_canvas_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let content = if let Some(text) = self.editor.text_content() {
+            if text.is_empty() {
+                return;
+            }
+            CopyContent::Text(text.to_owned())
+        } else {
+            let Some((pixels, element)) = self.editor.copy_canvas_item() else { return };
+            CopyContent::Item { pixels, element, scale: self.editor.scale() }
+        };
+        let copy = cx.default_global::<EditorClipboard>().copy(content);
+        crate::run_mode::begin_job(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = copy.await;
+            this.update_in(cx, |this, window, cx| {
+                let toast = match result {
+                    Ok(()) => Toast::new(toast::Kind::Done, "Copied to clipboard"),
+                    Err(e) => Toast::new(toast::Kind::Error, "Copy failed").detail(short_error(&e)),
+                };
+                this.show_toast(toast, window, cx);
+            }).ok();
+            gpui::AsyncApp::update(cx, crate::run_mode::end_job).ok();
+        }).detach();
+    }
+
+    fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_dragging() {
+            return;
+        }
+        let generation = self.document_generation;
+        let editing = self.editor.is_editing_text();
+        let selected = self.editor.selected_index();
+        let read = cx.default_global::<EditorClipboard>().paste(editing);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = read.await;
+            this.update_in(cx, |this, window, cx| {
+                if this.document_generation != generation || this.editor.is_dragging()
+                    || this.editor.is_editing_text() != editing || (editing && this.editor.selected_index() != selected)
+                {
+                    return;
+                }
+                let message = match result {
+                    Ok(Some(item)) => {
+                        let canvas = this.editor.screen();
+                        let visible = this.viewport.visible_image_rect(window.viewport_size()).intersect(&canvas).unwrap_or(canvas);
+                        let placed = match item {
+                            Paste::Element(element, scale) => this.editor.paste_element(element, scale),
+                            Paste::Image(image) => this.editor.paste_image(image, visible.center()),
+                            Paste::Text(text) => this.editor.paste_text(text, visible.center()),
+                        };
+                        (!placed).then(|| Toast::new(toast::Kind::Error, "Pasted content exceeds the canvas size limit"))
+                    }
+                    Ok(None) => Some(Toast::new(toast::Kind::Info, "No image or text to paste")),
+                    Err(e) => Some(Toast::new(toast::Kind::Error, "Paste failed").detail(short_error(&e))),
+                };
+                if let Some(toast) = message {
+                    this.show_toast(toast, window, cx);
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+    }
+
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.secondary();
@@ -1169,15 +1237,9 @@ impl CanvasView {
                     *zoom_override = Some((zoom_override.unwrap_or(fit) / 1.18).max(0.05));
                 }
             }
-            "c" if cmd && !editing => {
-                if self.is_capture() {
-                    return self.finish(Finish::Copy, window, cx);
-                }
-                if let Some(image) = self.editor.export() {
-                    output::copy_to_clipboard(image, cx);
-                    self.show_toast(Toast::new(toast::Kind::Done, "Copied image to clipboard"), window, cx);
-                }
-            }
+            "c" if cmd && !editing && self.is_capture() => return self.finish(Finish::Copy, window, cx),
+            "c" if cmd && !self.is_capture() => self.copy_canvas_item(window, cx),
+            "v" if cmd && !self.is_capture() => self.paste(window, cx),
             "s" if cmd => return self.finish(Finish::Save, window, cx),
             _ => return,
         }

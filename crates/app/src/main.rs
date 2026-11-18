@@ -7,6 +7,7 @@ mod ai_settings;
 mod assets;
 mod canvas_view;
 mod capture;
+mod clipboard;
 mod config;
 mod demo;
 mod editor_window;

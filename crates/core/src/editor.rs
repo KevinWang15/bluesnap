@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tiny_skia::Pixmap;
 
 use crate::composition::{
-    Composition, Element, LayerOrder, PlacedImage, renumber_counters_in, reorder_element,
+    Composition, Element, ImageAsset, LayerOrder, PlacedImage, renumber_counters_in, reorder_element,
 };
 use crate::geom::{CursorKind, Handle, Point, Rect, resize_rect_with_handle};
 use crate::outline::WindowOutline;
@@ -292,6 +292,103 @@ impl Editor {
         self.selected = Some(img_idx);
         self.touch_shapes();
         Some(img_idx)
+    }
+
+    /// Copies the selected item, or the complete canvas when nothing is selected.
+    /// If a later redaction covers the item, publish only the visible composite.
+    pub fn copy_canvas_item(&mut self) -> Option<(Pixmap, Option<Element>)> {
+        if !matches!(self.workspace, Workspace::Canvas { .. }) || self.drag.is_some() {
+            return None;
+        }
+        let Some(idx) = self.selected else { return Some((self.export()?, None)) };
+        let item = self.elements.get(idx)?;
+        let bounds = item.bounds(self.metrics()).round_out().intersect(&self.screen())?;
+        if self.elements[idx + 1..].iter().filter_map(Element::as_shape).any(|s| {
+            s.tool() == Tool::Redact && s.bounds(self.metrics()).intersect(&bounds).is_some()
+        }) {
+            let visible = self.export()?;
+            return Some((crop(&visible, bounds.x as u32, bounds.y as u32, bounds.w as u32, bounds.h as u32)?, None));
+        }
+        match item {
+            Element::Shape(_) => {
+                let (_, pixels) = self.render_band(idx..idx + 1, false, self.screen())?;
+                Some((pixels, Some(item.clone())))
+            }
+            Element::Image(image) => {
+                let mut pixels = Pixmap::new(bounds.w as u32, bounds.h as u32)?;
+                render::draw_placed_image(&mut pixels, image, Point::new(bounds.x, bounds.y));
+                // A resized image needs its original pixels if pasted back into
+                // BlueSnap. A cropped image only publishes the visible portion.
+                let native = image.bounds.round_out() == bounds && (image.bounds != bounds
+                    || pixels.width() != image.asset.width() || pixels.height() != image.asset.height());
+                Some((pixels, native.then(|| item.clone())))
+            }
+        }
+    }
+
+    /// Places a copied item just past its original location, keeping it on
+    /// the destination canvas when pasting between documents or display scales.
+    pub fn paste_element(&mut self, element: Element, source_scale: f32) -> bool {
+        if !source_scale.is_finite() || source_scale <= 0.0 {
+            return false;
+        }
+        let k = self.scale / source_scale;
+        let element = match element {
+            Element::Shape(shape) => Element::Shape(shape.scaled(k)),
+            Element::Image(image) => Element::Image(image.scaled(k)),
+        };
+        let bounds = element.bounds(self.metrics());
+        let step = 16.0 * self.scale;
+        self.paste_element_at(element, Point::new(bounds.x + step, bounds.y + step))
+    }
+
+    /// A clipboard bitmap is already in image pixels. Place it pixel-aligned in
+    /// the visible canvas, adopting its native dimensions for the first image.
+    pub fn paste_image(&mut self, image: Pixmap, center: Point) -> bool {
+        let x = (center.x - image.width() as f32 / 2.0).round();
+        let y = (center.y - image.height() as f32 / 2.0).round();
+        let image = PlacedImage::at_origin(ImageAsset::new(image));
+        self.paste_element_at(Element::Image(image), Point::new(x, y))
+    }
+
+    fn paste_element_at(&mut self, element: Element, position: Point) -> bool {
+        if !matches!(self.workspace, Workspace::Canvas { .. }) || self.drag.is_some() {
+            return false;
+        }
+        let bounds = element.bounds(self.metrics());
+        let first_image = self.elements.is_empty() && matches!(element, Element::Image(_));
+        let (width, height) = if first_image { (0, 0) } else { self.canvas_dims() };
+        let dimensions = (width.max(bounds.w.ceil() as u32), height.max(bounds.h.ceil() as u32));
+        if !crate::format::valid_canvas_size(dimensions.0, dimensions.1) {
+            return false;
+        }
+        let x = position.x.clamp(0.0, (dimensions.0 as f32 - bounds.w).max(0.0));
+        let y = position.y.clamp(0.0, (dimensions.1 as f32 - bounds.h).max(0.0));
+        self.finish_text();
+        self.begin_change();
+        if let Workspace::Canvas { width, height, .. } = &mut self.workspace {
+            (*width, *height) = dimensions;
+        }
+        self.tool = None;
+        self.selected = Some(self.elements.len());
+        self.elements.push(element.translated(Point::new(x - bounds.x, y - bounds.y)));
+        renumber_counters_in(&mut self.elements);
+        self.invalidate_backdrop();
+        self.end_change();
+        self.touch_shapes();
+        true
+    }
+
+    pub fn paste_text(&mut self, text: String, position: Point) -> bool {
+        if self.is_editing_text() {
+            self.text_replace(None, &text, false, None);
+            true
+        } else if !text.is_empty() {
+            let geometry = Geometry::Text { origin: position, content: text, style: self.text_style };
+            self.paste_element_at(Element::Shape(Shape { geometry, style: self.styles[Tool::Text.index()] }), position)
+        } else {
+            true
+        }
     }
 
     /// Annotations inside the selection, translated relative to the selection's
@@ -2121,6 +2218,85 @@ mod tests {
         assert!(e.undo());
         assert_eq!(e.screen(), Rect::new(0.0, 0.0, 400.0, 3000.0));
         assert_eq!(e.elements()[0].as_image().unwrap().bounds.x, 0.0);
+    }
+
+    #[test]
+    fn pasted_annotations_keep_their_style_and_can_be_undone_individually() {
+        let original = Shape {
+            geometry: Geometry::Rect(Rect::new(10.0, 20.0, 30.0, 40.0)),
+            style: Style { color: crate::PALETTE[2], size: SizeLevel::Large },
+        };
+        let comp = Composition::new_empty(300, 300, 2.0);
+        let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
+        let bytes = crate::format::encode_clipboard_element(&Element::Shape(original.clone()), 1.0).unwrap();
+        let (element, scale) = crate::format::decode_clipboard_element(&bytes).unwrap();
+        assert!(editor.paste_element(element, scale));
+        assert_eq!(editor.selected_index(), Some(0));
+        let pasted = original.scaled(2.0).translated(Point::new(32.0, 32.0));
+        let (_, editable) = editor.copy_canvas_item().unwrap();
+        assert_eq!(editable, Some(Element::Shape(pasted)));
+        assert!(editor.undo());
+        assert!(editor.elements().is_empty());
+    }
+
+    #[test]
+    fn copied_resized_image_keeps_source_pixels_but_a_cropped_image_only_copies_visible_pixels() {
+        let source = crate::pixels::pixmap_from_rgba(80, 40, [30, 20, 10, 255].repeat(80 * 40)).unwrap();
+        let asset = ImageAsset::new(source);
+        let bounds = Rect::new(10.0, 20.0, 40.0, 20.0);
+        let original = PlacedImage::new(asset.clone(), bounds);
+        let mut comp = Composition::new_empty(100, 80, 1.0);
+        comp.elements.push(Element::Image(original));
+        let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
+        click(&mut editor, 30.0, 30.0);
+        let (raster, editable) = editor.copy_canvas_item().unwrap();
+        assert_eq!((raster.width(), raster.height()), (40, 20));
+        let bytes = crate::format::encode_clipboard_element(&editable.unwrap(), 1.0).unwrap();
+        let (item, scale) = crate::format::decode_clipboard_element(&bytes).unwrap();
+        let restored = item.as_image().unwrap();
+        assert_eq!(restored.bounds, bounds);
+        assert_eq!(restored.asset.pixmap(), asset.pixmap());
+        assert_ne!(restored.asset.id, asset.id);
+        assert!(editor.paste_element(item, scale));
+        assert_eq!(editor.selected_index(), Some(1));
+        assert!(editor.undo());
+        drag(&mut editor, (30.0, 30.0), (10.0, 30.0));
+        let (cropped, editable) = editor.copy_canvas_item().unwrap();
+        assert_eq!(cropped.width(), 30);
+        assert!(editable.is_none());
+    }
+
+    #[test]
+    fn pasting_the_first_bitmap_sizes_the_canvas_and_undo_restores_it() {
+        let mut editor = Editor::from_composition(Composition::new_empty(500, 300, 2.0), Arc::new(Fonts::empty()));
+        assert!(editor.paste_image(Pixmap::new(90, 55).unwrap(), Point::new(200.0, 100.0)));
+        assert_eq!(editor.screen(), Rect::new(0.0, 0.0, 90.0, 55.0));
+        assert_eq!(editor.elements()[0].as_image().unwrap().bounds, editor.screen());
+        assert_eq!(editor.selected_index(), Some(0));
+        assert!(editor.undo());
+        assert!(editor.elements().is_empty());
+        assert_eq!(editor.screen(), Rect::new(0.0, 0.0, 500.0, 300.0));
+    }
+
+    #[test]
+    fn copying_an_item_covered_by_a_redaction_only_copies_visible_pixels() {
+        let mask = Shape {
+            geometry: Geometry::Redact {
+                area: RedactShape::Rect(Rect::new(20.0, 20.0, 30.0, 30.0)),
+                effect: RedactEffect::Gray,
+                strength: 0.5,
+            },
+            style: Style::default(),
+        };
+        let image = crate::pixels::pixmap_from_rgba(80, 80, [255, 0, 0, 255].repeat(80 * 80)).unwrap();
+        let comp = Composition::from_slice(image, 1.0, vec![mask]);
+        let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
+        click(&mut editor, 10.0, 10.0);
+        assert_eq!(editor.selected_index(), Some(0));
+        let (pixels, editable) = editor.copy_canvas_item().unwrap();
+        assert!(editable.is_none());
+        assert_eq!(pixels.pixel(30, 30).unwrap().red(), crate::REDACT_GRAY.r);
+        assert_eq!(pixels, editor.export().unwrap());
     }
 
     #[test]

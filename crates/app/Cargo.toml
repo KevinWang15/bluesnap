@@ -12,6 +12,7 @@ bluesnap-ai.workspace = true
 anyhow.workspace = true
 log.workspace = true
 arboard = { version = "3", default-features = false, features = ["image-data"] }
+clipboard-rs = "0.3.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
 env_logger = "0.11"
@@ -23,6 +24,9 @@ image = { version = "0.25", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+clipboard-win = { version = "5", features = ["std"] }
 
 [build-dependencies]
 embed-resource = "3"

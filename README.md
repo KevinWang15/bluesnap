@@ -91,6 +91,10 @@ Press the hotkey, then:
     swatches, transparent checkerboard, or native OS color picker), saved in `.bs`
   - click **Add image** on the far left of the toolbar to hide the editor temporarily
     and capture another screenshot; **✓** adds that capture straight into the editor
+  - **Ctrl/Cmd+C** copies the selected image or annotation. With nothing selected,
+    it copies the whole canvas. **Ctrl/Cmd+V** pastes an editable BlueSnap annotation,
+    an image from another app, or plain text. **Ctrl/Cmd+Z** removes the pasted layer in one step.
+    Copying an item covered by a redaction gives you the visible, flattened pixels.
   - click **Open** (next to Add image) to load a saved `.bs` composition or image file,
     or double-click any `.bs` file in Explorer / Finder (`bluesnap <file.bs>` opens a
     standalone editor session without conflicting with a running tray instance)
@@ -111,7 +115,7 @@ Press the hotkey, then:
   The stitched image keeps the full width of the selection, including fixed side
   panels and scrollbars. Annotations made before capture stay on the selected
   content and remain editable in the editor. The image stops at 30,000 px.
-- ✓ (or Enter, Ctrl/Cmd+C, double-click) always copies a plain raster image to the
+- In the capture overlay, ✓ (or Enter, Ctrl/Cmd+C, double-click) copies a plain raster image to the
   clipboard; the download icon (or Ctrl/Cmd+S) saves either a `.png` image or an
   editable BSON-based **`.bs`** file (storing lossless raw image data, canvas size and
   all live elements so it can be reopened and edited later); ✕ (or Esc) cancels.

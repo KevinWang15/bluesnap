@@ -348,6 +348,20 @@ pub fn pixmap_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Pixmap
     Pixmap::from_vec(rgba, IntSize::from_wh(width, height)?)
 }
 
+/// Imports straight-alpha pixels from a decoded image into the renderer.
+pub fn pixmap_from_straight_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Option<Pixmap> {
+    let mut pixmap = pixmap_from_rgba(width, height, rgba)?;
+    for [r, g, b, a] in pixmap.data_mut().as_chunks_mut::<4>().0 {
+        if *a < 255 {
+            let alpha = u16::from(*a);
+            for channel in [r, g, b] {
+                *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+    }
+    Some(pixmap)
+}
+
 /// The pixels around `center` magnified for a loupe: (2·`radius` + 1)² pixels,
 /// each drawn as a `cell`-sized square (nearest neighbor, so pixels stay
 /// sharp), with a faint grid between them. Pixels outside the image are dark.
