@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 use bluesnap_core::render::to_rgba_straight;
-use bluesnap_core::{Composition, Pixmap};
+use bluesnap_core::editor::SaveSnapshot;
+use bluesnap_core::Pixmap;
 use bluesnap_platform::{Platform, SaveFormat, WindowRef};
 use gpui::App;
 
@@ -54,8 +55,7 @@ pub type OnSaved = Box<dyn FnOnce(PathBuf, &mut App) + 'static>;
 /// closes. `closing` is an optional overlay window to hide immediately before
 /// opening the modal dialog so a topmost overlay can never cover the dialog.
 pub fn save_with_dialog(
-    image: Pixmap,
-    composition: Composition,
+    snapshot: impl FnOnce() -> Option<SaveSnapshot> + Send + 'static,
     owner: Option<WindowRef>,
     closing: Option<WindowRef>,
     hide_after: bool,
@@ -63,6 +63,7 @@ pub fn save_with_dialog(
     cx: &mut App,
 ) {
     let dir = cx.global::<AppState>().config.save_dir();
+    let fonts = cx.global::<AppState>().fonts.clone();
     let stem = chrono::Local::now().format("Screenshot %Y-%m-%d %H.%M.%S").to_string();
     // Native dialogs on macOS require the background app to be active.
     cx.activate(true);
@@ -117,9 +118,12 @@ pub fn save_with_dialog(
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let source = snapshot().ok_or_else(|| anyhow::anyhow!("empty capture"))?;
                     match format {
-                        SaveFormat::Png => image.save_png(&write_path).map_err(|e| anyhow::anyhow!("{e}")),
+                        SaveFormat::Png => source.into_pixmap(&fonts).ok_or_else(|| anyhow::anyhow!("could not render image"))?
+                            .save_png(&write_path).map_err(|e| anyhow::anyhow!("{e}")),
                         SaveFormat::Bs => {
+                            let composition = source.into_composition().ok_or_else(|| anyhow::anyhow!("unsupported canvas dimensions"))?;
                             bluesnap_core::format::save_bs(&composition, &write_path).map_err(|e| anyhow::anyhow!("{e}"))
                         }
                     }

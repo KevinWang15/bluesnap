@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 
 use tiny_skia::{
     FillRule, FilterQuality, LineCap, LineJoin, Paint, PathBuilder, Pattern, Pixmap, SpreadMode, Stroke, Transform,
@@ -21,7 +22,7 @@ use crate::text::{FontSet, Fonts};
 
 /// The frozen screenshot an editing session works on.
 pub struct Document {
-    image: Pixmap,
+    image: Arc<Pixmap>,
     effects: EffectCache,
 }
 
@@ -33,7 +34,12 @@ impl Document {
 
     /// Wraps an opaque image.
     pub fn from_pixmap(image: Pixmap) -> Self {
-        Self { image, effects: EffectCache::default() }
+        Self { image: Arc::new(image), effects: EffectCache::default() }
+    }
+
+    /// Shares the immutable capture pixels with a worker. Effect tiles stay local to each renderer.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self { image: self.image.clone(), effects: EffectCache::default() }
     }
 
     pub fn width(&self) -> u32 {
@@ -53,7 +59,7 @@ impl Document {
     }
 
     pub fn into_pixmap(self) -> Pixmap {
-        self.image
+        Arc::unwrap_or_clone(self.image)
     }
 
     /// The color at pixel (`x`, `y`), if it's in the image.

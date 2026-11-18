@@ -12,7 +12,8 @@ use bluesnap_core::layout::place_scrolling_preview;
 use bluesnap_core::pixels::split_bgrx;
 use bluesnap_core::shape::Shape;
 use bluesnap_core::stitch::{Progress, Stitcher};
-use bluesnap_core::{Color, Composition, Rect as PxRect, THEME_BLUE};
+use bluesnap_core::editor::SaveSnapshot;
+use bluesnap_core::{Color, Document, Rect as PxRect, THEME_BLUE};
 use bluesnap_platform::{DisplayInfo, PixelRect, Platform};
 use global_hotkey::GlobalHotKeyManager;
 use gpui::{
@@ -457,14 +458,11 @@ impl ScrollingCapture {
         }
     }
 
-    /// Stops capturing and closes the bar and dim layer; returns the stitched image.
-    fn stop(&mut self, cx: &mut Context<Self>) -> Option<bluesnap_core::Pixmap> {
-        if std::mem::replace(&mut self.stopped, true) {
-            return None;
-        }
+    /// Stops the capture loop and closes the bar and dim layer.
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        self.stopped = true;
         self._task = None;
         self._escape = None;
-        let image = self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Stitcher::finish);
         let id = cx.entity_id();
         if cx.try_global::<AppState>().and_then(|s| s.scrolling.as_ref()).is_some_and(|s| s.entity_id() == id) {
             cx.global_mut::<AppState>().scrolling = None;
@@ -485,7 +483,10 @@ impl ScrollingCapture {
                 .ok();
         });
         log::info!("scrolling capture of {}x{} finished", self.rect.width, self.height);
-        image
+    }
+
+    fn take_stitcher(&self) -> Option<Stitcher> {
+        self.stitcher.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Ends the session; in `Standard` mode `Copy` and `Save` deliver the
@@ -495,49 +496,33 @@ impl ScrollingCapture {
         if self.stopped {
             return;
         }
-        if self.mode == CaptureMode::ForEditor {
-            match how {
-                Finish::Copy => return self.send_to_editor(cx),
-                Finish::Cancel => {
-                    self.stop(cx);
-                    cx.defer(crate::editor_window::restore_if_hidden);
-                    return;
-                }
-                Finish::Save => {
-                    let raw = self.stop(cx);
-                    cx.defer(crate::editor_window::restore_if_hidden);
-                    if let Some(raw) = raw {
-                        let annotated = self.annotate(raw.clone(), cx);
-                        let shapes = std::mem::take(&mut self.shapes);
-                        let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
-                        cx.defer(move |cx| {
-                            let owner = cx.global::<AppState>().editor_ref;
-                            output::save_with_dialog(annotated, comp, owner, None, false, None, cx);
-                        });
-                    }
-                    return;
-                }
-            }
+        let for_editor = self.mode == CaptureMode::ForEditor;
+        if for_editor && how == Finish::Copy {
+            return self.send_to_editor(cx);
+        }
+        self.stop(cx);
+        if for_editor {
+            cx.defer(crate::editor_window::restore_if_hidden);
         }
         match how {
-            Finish::Cancel => {
-                self.stop(cx);
-            }
+            Finish::Cancel => {}
             Finish::Copy => {
-                if let Some(raw) = self.stop(cx) {
+                if let Some(raw) = self.take_stitcher().and_then(Stitcher::into_pixmap) {
                     let annotated = self.annotate(raw, cx);
                     output::copy_to_clipboard(annotated, cx);
                 }
             }
             Finish::Save => {
-                if let Some(raw) = self.stop(cx) {
-                    let annotated = self.annotate(raw.clone(), cx);
-                    let shapes = std::mem::take(&mut self.shapes);
-                    let comp = Composition::from_slice(raw, self.display.scale_factor, shapes);
-                    cx.defer(move |cx| {
-                        output::save_with_dialog(annotated, comp, None, None, true, None, cx);
-                    });
-                }
+                let Some(stitcher) = self.take_stitcher() else { return };
+                let scale = self.display.scale_factor;
+                let shapes = std::mem::take(&mut self.shapes);
+                cx.defer(move |cx| {
+                    let owner = if for_editor { cx.global::<AppState>().editor_ref } else { None };
+                    output::save_with_dialog(move || {
+                        let doc = Document::from_pixmap(stitcher.into_pixmap()?);
+                        Some(SaveSnapshot::Capture { region: doc.bounds(), doc, outline: None, shapes, scale })
+                    }, owner, None, !for_editor, None, cx);
+                });
             }
         }
     }
@@ -558,7 +543,8 @@ impl ScrollingCapture {
         if self.stopped {
             return;
         }
-        let Some(image) = self.stop(cx) else {
+        self.stop(cx);
+        let Some(image) = self.take_stitcher().and_then(Stitcher::into_pixmap) else {
             log::warn!("scrolling capture produced no image");
             if self.mode == CaptureMode::ForEditor {
                 cx.defer(crate::editor_window::restore_if_hidden);

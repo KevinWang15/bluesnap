@@ -435,7 +435,7 @@ impl CanvasView {
         // In the Composition Editor, `Save` keeps the session open so the user
         // can save a `.bs` project and continue editing or click `Tick` to copy.
         if !self.is_capture() && how == Finish::Save {
-            let (Some(image), Some(comp)) = (self.editor.export(), self.editor.to_composition()) else {
+            let Some(snapshot) = self.editor.save_snapshot() else {
                 return;
             };
             let entity = cx.entity().downgrade();
@@ -443,8 +443,7 @@ impl CanvasView {
             let owner = bluesnap_platform::window_ref(window).ok();
             cx.defer(move |cx| {
                 output::save_with_dialog(
-                    image,
-                    comp,
+                    move || Some(snapshot),
                     owner,
                     None,
                     false,
@@ -512,14 +511,14 @@ impl CanvasView {
                 }
             }
             Finish::Save => {
-                let pair = self.editor.export().zip(self.editor.to_composition());
+                let snapshot = self.editor.save_snapshot();
                 let closing = bluesnap_platform::window_ref(window).ok();
                 self.drop_gpu_images(window);
                 window.remove_window();
                 if mode == Some(CaptureMode::ForEditor) {
                     cx.defer(crate::editor_window::restore_if_hidden);
                 }
-                if let Some((image, comp)) = pair {
+                if let Some(snapshot) = snapshot {
                     // Defer until after `window.remove_window()` drops `Window`
                     // so `DestroyWindow(overlay_hwnd)` is queued ahead of the
                     // modal `GetSaveFileNameW` task on Windows.
@@ -528,8 +527,7 @@ impl CanvasView {
                             .then(|| cx.global::<AppState>().editor_ref)
                             .flatten();
                         output::save_with_dialog(
-                            image,
-                            comp,
+                            move || Some(snapshot),
                             owner,
                             closing,
                             mode != Some(CaptureMode::ForEditor),

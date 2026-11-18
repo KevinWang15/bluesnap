@@ -115,6 +115,53 @@ struct Snapshot {
     elements: Vec<Element>,
 }
 
+/// An immutable save request. Capture PNGs sample effects in screen coordinates,
+/// while editable captures store a cropped image and translated vector shapes.
+pub enum SaveSnapshot {
+    Canvas(Composition),
+    Capture { doc: Document, region: Rect, outline: Option<WindowOutline>, shapes: Vec<Shape>, scale: f32 },
+}
+
+impl SaveSnapshot {
+    pub fn into_pixmap(self, fonts: &Fonts) -> Option<Pixmap> {
+        match self {
+            Self::Canvas(comp) => render::render_composition(&comp, fonts),
+            Self::Capture { doc, region, outline, shapes, scale } => {
+                if region == doc.bounds() && outline.is_none() && shapes.is_empty() {
+                    Some(doc.into_pixmap())
+                } else {
+                    render::export_within(&doc, region, outline.as_ref(), &shapes, Metrics { scale, fonts })
+                }
+            }
+        }
+    }
+
+    pub fn into_composition(self) -> Option<Composition> {
+        match self {
+            Self::Canvas(comp) => Some(comp),
+            Self::Capture { doc, region, outline, shapes, scale } => {
+                let (raw, shapes) = capture_slice(doc, region, outline, shapes)?;
+                Some(Composition::from_slice(raw, scale, shapes))
+            }
+        }
+    }
+}
+
+fn capture_slice(doc: Document, region: Rect, outline: Option<WindowOutline>, shapes: Vec<Shape>) -> Option<(Pixmap, Vec<Shape>)> {
+    let sel = region.round().intersect(&doc.bounds())?;
+    let mut raw = if sel == doc.bounds() {
+        doc.into_pixmap()
+    } else {
+        crop(doc.image(), sel.x as u32, sel.y as u32, sel.w as u32, sel.h as u32)?
+    };
+    if let Some(outline) = outline {
+        outline.clip(&mut raw, Point::new(sel.x, sel.y));
+    }
+    let offset = Point::new(-sel.x, -sel.y);
+    let shapes = if offset == Point::default() { shapes } else { shapes.iter().map(|s| s.translated(offset)).collect() };
+    Some((raw, shapes))
+}
+
 enum Workspace {
     Capture {
         doc: Document,
@@ -407,47 +454,39 @@ impl Editor {
     /// Extracts `(raw_cropped_image, scale, unflattened_shapes)` from a capture
     /// selection so annotations stay editable when sent to the Editor or `.bs`.
     pub fn extract_slice(&mut self) -> Option<(Pixmap, f32, Vec<Shape>)> {
-        self.finish_text();
-        match &self.workspace {
-            Workspace::Capture { doc, selection, snapped, .. } => {
-                let sel = (*selection)?.round().intersect(&doc.bounds())?;
-                let mut raw = crop(doc.image(), sel.x as u32, sel.y as u32, sel.w as u32, sel.h as u32)?;
-                if let Some(outline) = snapped {
-                    outline.clip(&mut raw, Point::new(sel.x, sel.y));
-                }
-                let to_origin = Point::new(-sel.x, -sel.y);
-                let shapes = self
-                    .elements
-                    .iter()
-                    .filter_map(Element::as_shape)
-                    .map(|s| s.translated(to_origin))
-                    .collect();
-                Some((raw, self.scale, shapes))
+        match self.save_snapshot()? {
+            SaveSnapshot::Capture { doc, region, outline, shapes, scale } => {
+                let (raw, shapes) = capture_slice(doc, region, outline, shapes)?;
+                Some((raw, scale, shapes))
             }
-            Workspace::Canvas { .. } => {
-                let rendered = self.export()?;
-                Some((rendered, self.scale, Vec::new()))
-            }
+            SaveSnapshot::Canvas(comp) => Some((render::render_composition(&comp, &self.fonts)?, comp.scale, Vec::new())),
         }
     }
 
-    /// Builds a lossless editable [`Composition`] from either Capture mode (raw
-    /// cropped selection + unflattened annotations) or Canvas mode (full scene).
-    pub fn to_composition(&mut self) -> Option<Composition> {
+    /// Captures document state for saving without rasterizing or copying image pixels.
+    pub fn save_snapshot(&mut self) -> Option<SaveSnapshot> {
         self.finish_text();
         match &self.workspace {
-            Workspace::Capture { .. } => {
-                let (raw, scale, shapes) = self.extract_slice()?;
-                Some(Composition::from_slice(raw, scale, shapes))
-            }
-            Workspace::Canvas { width, height, background, .. } => Some(Composition {
+            Workspace::Capture { doc, selection, snapped, .. } => Some(SaveSnapshot::Capture {
+                doc: doc.snapshot(),
+                region: (*selection)?,
+                outline: *snapped,
+                shapes: self.elements.iter().filter_map(Element::as_shape).cloned().collect(),
+                scale: self.scale,
+            }),
+            Workspace::Canvas { width, height, background, .. } => Some(SaveSnapshot::Canvas(Composition {
                 width: *width,
                 height: *height,
                 scale: self.scale,
                 background: *background,
                 elements: self.elements.clone(),
-            }),
+            })),
         }
+    }
+
+    /// Builds the editable document with the captured image and its vector annotations.
+    pub fn to_composition(&mut self) -> Option<Composition> {
+        self.save_snapshot()?.into_composition()
     }
 
     pub fn selection_mode(&self) -> SelectionMode {
@@ -1968,6 +2007,31 @@ mod tests {
         assert_eq!(e.active_rect(), Some(e.screen()));
         click(&mut e, 60.0, 60.0);
         assert_eq!(e.selection(), Some(Rect::new(50.0, 50.0, 100.0, 100.0)));
+    }
+
+    #[test]
+    fn capture_save_snapshot_keeps_original_effect_sampling_and_rounded_corners() {
+        let mut pixmap = Pixmap::new(200, 150).unwrap();
+        for (i, px) in pixmap.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            px.copy_from_slice(&[(i % 251) as u8, (i % 139) as u8, (i % 97) as u8, 255]);
+        }
+        let bounds = Rect::new(33.0, 17.0, 120.0, 90.0);
+        let outline = WindowOutline::new(bounds, 11.0);
+        let fonts = Arc::new(Fonts::empty());
+        let mut editor = Editor::new(Document::from_pixmap(pixmap), fonts.clone(), vec![outline], 1.0);
+        click(&mut editor, 70.0, 50.0);
+        editor.set_redaction(|r| r.effect = RedactEffect::Mosaic);
+        editor.add_redactions(&[Rect::new(46.0, 35.0, 63.0, 35.0)]);
+        let expected_png = editor.export().unwrap();
+        let png = editor.save_snapshot().unwrap();
+        let snapshot = editor.save_snapshot().unwrap();
+        assert!(editor.undo());
+        let png = png.into_pixmap(&fonts).unwrap();
+        assert_eq!(png.data(), expected_png.data());
+        assert_eq!(png.pixel(0, 0).unwrap().alpha(), 0);
+        let editable = snapshot.into_composition().unwrap();
+        assert_eq!(editable.elements.len(), 2);
+        assert_eq!(editable.elements[0].as_image().unwrap().asset.pixmap().pixel(0, 0).unwrap().alpha(), 0);
     }
 
     #[test]

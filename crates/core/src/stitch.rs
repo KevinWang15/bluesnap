@@ -365,6 +365,16 @@ impl Stitcher {
         pixmap_from_rgba(self.width(), self.height(), rgba)
     }
 
+    /// Consumes the session and reuses its accumulated pixel buffer for the final image.
+    pub fn into_pixmap(mut self) -> Option<Pixmap> {
+        let (width, height) = self.dimensions()?;
+        let mut rgba = std::mem::take(&mut self.body);
+        let footer = self.footer()?;
+        rgba.reserve_exact(footer.len());
+        rgba.extend_from_slice(footer);
+        pixmap_from_rgba(width, height, rgba)
+    }
+
     /// `(width, height)` of the image [`Self::finish`] would produce, or `None`
     /// before the first frame.
     pub fn dimensions(&self) -> Option<(u32, u32)> {
@@ -822,6 +832,7 @@ mod tests {
         expected.extend_from_slice(&footer);
         assert_eq!((out.width() as usize, out.height() as usize), (W, 30 + content + 20));
         assert_eq!(s.height(), out.height());
+        assert_eq!(s.into_pixmap().unwrap().data(), out.data());
         assert!(out.data() == &expected[..], "stitched image differs from the document");
     }
 
