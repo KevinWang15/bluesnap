@@ -2010,6 +2010,20 @@ mod tests {
     }
 
     #[test]
+    fn each_tool_starts_small_and_accepts_other_sizes() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        for tool in Tool::ALL {
+            e.toggle_tool(tool);
+            assert_eq!(e.current_style().unwrap().1.size, SizeLevel::Small, "{tool:?}");
+            for size in [SizeLevel::Medium, SizeLevel::Large] {
+                e.set_size(size);
+                assert_eq!(e.current_style().unwrap().1.size, size, "{tool:?}");
+            }
+        }
+    }
+
+    #[test]
     fn style_changes_apply_to_selected_shape() {
         let mut e = editor();
         drag(&mut e, (0.0, 0.0), (400.0, 300.0));
@@ -2281,7 +2295,7 @@ mod tests {
         assert_eq!(shapes_of(&e)[0].geometry, Geometry::Highlight(vec![Point::new(50.0, 100.0), Point::new(160.0, 100.0)]));
         e.pointer_move(Point::new(300.0, 200.0), false);
         let ring = e.brush_ring().unwrap();
-        assert_eq!((ring.center, ring.half_height), (Point::new(300.0, 200.0), 9.0));
+        assert_eq!((ring.center, ring.half_height), (Point::new(300.0, 200.0), 5.0));
         assert!(ring.half_width < ring.half_height);
     }
 
@@ -2509,7 +2523,7 @@ mod tests {
         e.pointer_move(Point::new(100.0, 100.0), false);
         assert_eq!(e.brush_ring(), None);
         e.toggle_tool(Tool::Redact);
-        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(100.0, 100.0), half_width: 12.0, half_height: 12.0, corner: 12.0 }));
+        assert_eq!(e.brush_ring(), Some(BrushRing { center: Point::new(100.0, 100.0), half_width: 6.0, half_height: 6.0, corner: 6.0 }));
         e.set_redaction(|r| r.area = RedactArea::Rect);
         assert_eq!(e.brush_ring(), None);
     }

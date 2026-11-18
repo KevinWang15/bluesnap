@@ -119,8 +119,8 @@ impl Tool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SizeLevel {
-    Small,
     #[default]
+    Small,
     Medium,
     Large,
 }
@@ -151,7 +151,7 @@ pub struct Style {
 
 impl Default for Style {
     fn default() -> Self {
-        Self { color: PALETTE[0], size: SizeLevel::Medium }
+        Self { color: PALETTE[0], size: SizeLevel::default() }
     }
 }
 

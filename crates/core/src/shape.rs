@@ -473,8 +473,7 @@ mod tests {
             geometry: Geometry::Counter { center: Point::new(50.0, 50.0), number: 3, format: CounterFormat::Decimal },
             style: Style::default(),
         };
-        // Medium: 28 px across.
-        assert_eq!(s.bounds(metrics(&fonts)), Rect::new(36.0, 36.0, 28.0, 28.0).inflate(1.0));
+        assert_eq!(s.bounds(metrics(&fonts)), Rect::new(40.0, 40.0, 20.0, 20.0).inflate(1.0));
         assert!(s.hit(Point::new(50.0, 50.0), metrics(&fonts)));
         assert!(!s.hit(Point::new(80.0, 50.0), metrics(&fonts)));
         assert!(!s.is_degenerate());
