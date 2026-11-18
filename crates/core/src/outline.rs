@@ -5,7 +5,7 @@
 //! slivers of whatever was behind its corners. [`WindowOutline::clip`] makes
 //! those pixels transparent, anti-aliased like the compositor draws them.
 
-use tiny_skia::Pixmap;
+use tiny_skia::{Pixmap, PremultipliedColorU8};
 
 use crate::geom::{Point, Rect};
 
@@ -15,24 +15,99 @@ const SUBSAMPLES: u32 = 8;
 /// the background blended into them by the compositor doesn't show.
 const INSET: f32 = 1.5;
 
-/// A window's full (unclipped) bounds in screenshot pixels and its corner radius.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Window picking only needs bounds on hover. Resolve the compositor's outline
+/// once, on click, before the user starts annotating the selection.
+pub trait PickableWindow: Send + Sync {
+    fn bounds(&self) -> Rect;
+    fn outline(&self) -> WindowOutline;
+}
+
+impl PickableWindow for Rect {
+    fn bounds(&self) -> Rect {
+        *self
+    }
+
+    fn outline(&self) -> WindowOutline {
+        (*self).into()
+    }
+}
+
+impl PickableWindow for WindowOutline {
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    fn outline(&self) -> WindowOutline {
+        self.clone()
+    }
+}
+
+/// A horizontal run of compositor pixels, in window-local coordinates.
+#[derive(Clone, Debug, PartialEq)]
+struct CornerRun {
+    x: u32,
+    y: u32,
+    pixels: Vec<PremultipliedColorU8>,
+}
+
+/// Full window bounds and the compositor pixels or geometric radius for its corners.
+#[derive(Clone, Debug, PartialEq)]
 pub struct WindowOutline {
     pub bounds: Rect,
     /// Corner radius in screenshot pixels; `0` for square corners.
     pub corner_radius: f32,
+    corners: Vec<CornerRun>,
 }
 
 impl From<Rect> for WindowOutline {
     fn from(bounds: Rect) -> Self {
-        Self { bounds, corner_radius: 0.0 }
+        Self::new(bounds, 0.0)
     }
 }
 
 impl WindowOutline {
     pub fn new(bounds: Rect, corner_radius: f32) -> Self {
         let corner_radius = if corner_radius.is_finite() { corner_radius.max(0.0) } else { 0.0 };
-        Self { bounds, corner_radius }
+        Self { bounds, corner_radius, corners: Vec::new() }
+    }
+
+    /// Save the nonopaque pixels connected to each corner of a shadow-free
+    /// window image. Keep their premultiplied colors as well as alpha: the
+    /// desktop has already blended the background into anti-aliased edges.
+    pub fn from_window_image(bounds: Rect, image: &Pixmap) -> Self {
+        let mut outline = Self::from(bounds);
+        let (w, h) = (image.width(), image.height());
+        if (bounds.w, bounds.h) != (w as f32, h as f32) {
+            return outline;
+        }
+        for bottom in [false, true] {
+            for right in [false, true] {
+                let x_at = |dx| if right { w - 1 - dx } else { dx };
+                let y_at = |dy| if bottom { h - 1 - dy } else { dy };
+                let half_width = if right { w / 2 } else { w.div_ceil(2) };
+                let half_height = if bottom { h / 2 } else { h.div_ceil(2) };
+                // A straight edge can itself be translucent. Stop where the
+                // edge reaches its interior alpha, including on glass windows.
+                let width = corner_extent(half_width, |dx| image.pixel(x_at(dx), y_at(0)).unwrap().alpha());
+                let height = corner_extent(half_height, |dy| image.pixel(x_at(0), y_at(dy)).unwrap().alpha());
+                for dy in 0..height {
+                    let y = y_at(dy);
+                    let start = y as usize * w as usize;
+                    let row = &image.pixels()[start..start + w as usize];
+                    let (x, len) = if right {
+                        let n = row.iter().rev().take(width as usize).take_while(|p| p.alpha() < 255).count();
+                        (row.len() - n, n)
+                    } else {
+                        (0, row.iter().take(width as usize).take_while(|p| p.alpha() < 255).count())
+                    };
+                    if len == 0 {
+                        break;
+                    }
+                    outline.corners.push(CornerRun { x: x as u32, y, pixels: row[x..x + len].to_vec() });
+                }
+            }
+        }
+        outline
     }
 
     /// The radius actually drawn: never more than half the shorter side.
@@ -41,7 +116,7 @@ impl WindowOutline {
     }
 
     pub fn is_rounded(&self) -> bool {
-        self.radius() > 0.0
+        self.radius() > 0.0 || !self.corners.is_empty()
     }
 
     /// Makes the pixels of `pixmap` (whose top-left pixel is at `origin` in
@@ -50,6 +125,24 @@ impl WindowOutline {
     /// window. Corners outside `pixmap` (e.g. off-screen) are left alone, and
     /// only the corner squares are visited, so this costs nothing measurable.
     pub fn clip(&self, pixmap: &mut Pixmap, origin: Point) {
+        let dx = self.bounds.x as i64 - origin.x as i64;
+        let dy = self.bounds.y as i64 - origin.y as i64;
+        let width = i64::from(pixmap.width());
+        for run in &self.corners {
+            let y = dy + i64::from(run.y);
+            if !(0..i64::from(pixmap.height())).contains(&y) {
+                continue;
+            }
+            let x = dx + i64::from(run.x);
+            let left = x.max(0);
+            let right = (x + run.pixels.len() as i64).min(width);
+            if left < right {
+                let dst = (y * width + left) as usize;
+                let src = (left - x) as usize;
+                let n = (right - left) as usize;
+                pixmap.pixels_mut()[dst..dst + n].copy_from_slice(&run.pixels[src..src + n]);
+            }
+        }
         let r = self.radius();
         if r <= 0.0 {
             return;
@@ -92,6 +185,25 @@ impl WindowOutline {
             }
         }
     }
+}
+
+fn corner_extent(limit: u32, alpha: impl Fn(u32) -> u8) -> u32 {
+    // The first pixel at maximum coverage marks the start of the straight edge.
+    // Fully opaque edges are common, so finish as soon as coverage reaches 255.
+    let mut highest = 0;
+    let mut extent = 0;
+    for i in 0..limit {
+        let a = alpha(i);
+        if a > highest {
+            highest = a;
+            extent = i;
+        }
+        if a == 255 {
+            break;
+        }
+    }
+    // A completely clear outer edge can be padding around the entire window.
+    if highest == 0 { limit } else { extent }
 }
 
 /// How many of the cell's subsamples fall inside the arc around `center` (the
@@ -210,6 +322,34 @@ mod tests {
         assert_eq!(alpha(&p, 99, 69), 0);
         assert_eq!(alpha(&p, 99, 0), 255);
         assert_eq!(alpha(&p, 0, 69), 255);
+    }
+
+    #[test]
+    fn native_corners_preserve_window_edge_colors_and_frozen_content() {
+        let mut native = solid(9, 7, [80, 90, 100]);
+        let edge = [90, 0, 0, 100]; // premultiplied red, as captured in isolation
+        set_pixel(&mut native, (0, 0), [0; 4]);
+        set_pixel(&mut native, (1, 0), edge);
+        set_pixel(&mut native, (0, 1), edge);
+        set_pixel(&mut native, (8, 6), edge);
+        set_pixel(&mut native, (4, 3), [0; 4]);
+        let outline = WindowOutline::from_window_image(Rect::new(-1.0, 1.0, 9.0, 7.0), &native);
+        let mut crop = solid(8, 7, [20, 30, 40]);
+        outline.clip(&mut crop, Point::new(0.0, 1.0));
+        assert_eq!(pixel(&crop, (0, 0)), edge);
+        assert_eq!(pixel(&crop, (7, 6)), edge);
+        assert_eq!(pixel(&crop, (7, 0)), [20, 30, 40, 255]); // square corner
+        assert_eq!(pixel(&crop, (3, 3)), [20, 30, 40, 255]); // frozen desktop
+    }
+
+    #[test]
+    fn uniform_translucent_square_keeps_its_frozen_backdrop() {
+        let mut glass = solid(50, 32, [0, 0, 0]);
+        for pixel in glass.data_mut().chunks_exact_mut(4) {
+            pixel[3] = 128;
+        }
+        let outline = WindowOutline::from_window_image(Rect::new(0.0, 0.0, 50.0, 32.0), &glass);
+        assert!(!outline.is_rounded());
     }
 
     #[test]

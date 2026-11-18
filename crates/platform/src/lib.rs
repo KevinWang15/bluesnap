@@ -81,9 +81,27 @@ pub struct CapturedWindow {
     /// partly off-screen keeps its real size, so only its on-screen corners
     /// get rounded).
     pub bounds: PixelRect,
-    /// Radius in image pixels of the corners the compositor rounds (Windows 11,
-    /// macOS); `0` for square corners (maximized, snapped, older systems).
+    /// Geometric corner radius in image pixels for platforms that supply one.
     pub corner_radius: f32,
+    #[cfg(target_os = "macos")]
+    window_id: u32,
+    #[cfg(target_os = "macos")]
+    point_size: (f64, f64),
+}
+
+impl bluesnap_core::outline::PickableWindow for CapturedWindow {
+    fn bounds(&self) -> bluesnap_core::Rect {
+        let b = self.bounds;
+        bluesnap_core::Rect::new(b.x as f32, b.y as f32, b.width as f32, b.height as f32)
+    }
+
+    fn outline(&self) -> bluesnap_core::WindowOutline {
+        #[cfg(target_os = "macos")]
+        if let Some(image) = macos::window_image(self) {
+            return bluesnap_core::WindowOutline::from_window_image(self.bounds(), &image);
+        }
+        bluesnap_core::WindowOutline::new(self.bounds(), self.corner_radius)
+    }
 }
 
 pub struct Capture {

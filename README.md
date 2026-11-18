@@ -23,12 +23,11 @@ Press the hotkey, then:
   dragged) and the color under the cursor. Press **I** to copy that color as
   `#RRGGBB`. The loupe stays on screen, flipping to the other side of the cursor
   near an edge, and goes away once a selection is made.
-- click: select that window, or drag: select a region. A clicked window is captured
-  exactly: on Windows 11 and macOS 11–15, whose windows have rounded corners, the
-  corners come out transparent (anti-aliased, with no background showing through)
-  and Windows 11's translucent 1 px frame border is left out, so a saved PNG holds
-  only the window's own pixels. Resizing or moving the selection afterwards turns it
-  back into a plain rectangle.
+- click to select the window under the pointer, or drag to select a region.
+  On macOS, bluesnap uses the window’s own corner pixels to preserve its shape
+  and anti-aliased transparency. On Windows 11, it clips rounded corners and
+  omits the translucent 1 px frame border. Moving or resizing a snapped
+  selection turns it back into a rectangular crop.
 - drag the 8 handles to resize the selection, or drag inside it to move it
 - annotate with rectangle, ellipse, arrow, pen, highlighter, counter, redact and
   text. Click an existing

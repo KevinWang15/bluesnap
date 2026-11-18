@@ -872,6 +872,7 @@ dependencies = [
  "anyhow",
  "bluesnap-core",
  "bluesnap-ocr",
+ "cc",
  "log",
  "objc2",
  "objc2-app-kit",

@@ -52,7 +52,7 @@ pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
     }
     cx.global_mut::<AppState>().editor_hidden = false;
     if let Some((image, shapes)) = pending {
-        let opened = Composition::from_slice(image, scale, shapes).map_err(anyhow::Error::from)
+        let opened = Composition::from_capture(image, scale, shapes).map_err(anyhow::Error::from)
             .and_then(|comp| open_window_with(comp, display, "bluesnap editor", cx));
         if let Err(e) = opened {
             log::error!("could not open editor window: {e:#}");

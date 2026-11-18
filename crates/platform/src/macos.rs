@@ -20,9 +20,9 @@ use objc2_core_graphics::{
     CGBitmapContextCreateImage, CGColorRenderingIntent, CGColorSpace, CGImageByteOrderInfo, CGContext, CGDirectDisplayID, CGDisplayBounds, CGError, CGEvent, CGGetDisplaysWithPoint, CGImage,
     CGImageAlphaInfo, CGMainDisplayID, CGPreflightScreenCaptureAccess, CGRectMakeWithDictionaryRepresentation,
     CGRequestScreenCaptureAccess, CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowAlpha, kCGWindowBounds,
-    kCGColorSpaceSRGB, kCGWindowLayer, kCGWindowOwnerPID,
+    kCGColorSpaceSRGB, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSProcessInfo, NSString, NSURL};
+use objc2_foundation::{NSArray, NSDictionary, NSString, NSURL};
 use objc2_vision::{VNImageRequestHandler, VNRecognizeTextRequest, VNRequest, VNRequestTextRecognitionLevel};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -672,17 +672,22 @@ fn to_bgrx(image: &CGImage) -> anyhow::Result<Image> {
     let mut bgrx = vec![0u8; w * h * 4];
     // Little-endian 32-bit "XRGB" is B, G, R, X in memory.
     let info = CGImageAlphaInfo::NoneSkipFirst.0 | CGImageByteOrderInfo::Order32Little.0;
+    draw_srgb(image, &mut bgrx, w, h, info)?;
+    Ok(Image { width: w as u32, height: h as u32, bgrx })
+}
+
+/// Draw into the requested pixel format and size, including when a window
+/// straddles screens and its backing scale differs from the capture display.
+fn draw_srgb(image: &CGImage, pixels: &mut [u8], w: usize, h: usize, info: u32) -> anyhow::Result<()> {
     let space = srgb().context("the sRGB color space is unavailable")?;
-    // SAFETY: `bgrx` outlives the context, which is released at the end of this function.
-    let context = unsafe { CGBitmapContextCreate(bgrx.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), info) }
+    // SAFETY: the buffer contains w * h four-byte pixels and outlives the context.
+    let context = unsafe { CGBitmapContextCreate(pixels.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), info) }
         .context("CGBitmapContextCreate failed")?;
-    // SAFETY: Create functions return a +1 reference.
     let context = unsafe { CFRetained::from_raw(context) };
     CGContext::set_rendering_intent(Some(&context), CGColorRenderingIntent::RenderingIntentRelativeColorimetric);
     let rect = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w as f64, height: h as f64 } };
     CGContext::draw_image(Some(&context), rect, Some(image));
-    drop(context);
-    Ok(Image { width: w as u32, height: h as u32, bgrx })
+    Ok(())
 }
 
 fn is_pickable_window_layer(layer: i32) -> bool {
@@ -691,15 +696,52 @@ fn is_pickable_window_layer(layer: i32) -> bool {
     (0..20).contains(&layer)
 }
 
-/// Corner radius in points macOS draws on standard windows, or `None` where
-/// it isn't known: rounded since macOS 11 (10 pt through macOS 15); macOS 26
-/// varies it per window style, so those windows are treated as square.
-fn window_corner_radius_points() -> Option<f64> {
-    static RADIUS: OnceLock<Option<f64>> = OnceLock::new();
-    *RADIUS.get_or_init(|| {
-        let major = NSProcessInfo::processInfo().operatingSystemVersion().majorVersion;
-        (11..=15).contains(&major).then_some(10.0)
-    })
+fn window_bounds(dict: &CFDictionary) -> Option<CGRect> {
+    let mut r = CGRect::default();
+    let ok = unsafe {
+        let v = dict.value((kCGWindowBounds as *const CFString).cast());
+        !v.is_null() && CGRectMakeWithDictionaryRepresentation(Some(&*v.cast::<CFDictionary>()), &mut r)
+    };
+    ok.then_some(r)
+}
+
+/// Capture just the clicked window against transparency, without its shadow
+/// or the overlay. A closed or resized window can't supply the frozen outline.
+pub(super) fn window_image(window: &CapturedWindow) -> Option<bluesnap_core::Pixmap> {
+    unsafe extern "C" {
+        fn bluesnap_copy_window_image(id: u32, points: CGSize, width: usize, height: usize) -> Option<NonNull<CGImage>>;
+    }
+    let (w, h) = (window.bounds.width as u32, window.bounds.height as u32);
+    let points = CGSize { width: window.point_size.0, height: window.point_size.1 };
+    // SAFETY: the bridge returns a retained CGImage on success.
+    let capture = unsafe { bluesnap_copy_window_image(window.window_id, points, w as usize, h as usize) };
+    let image = capture.map(|p| unsafe { CFRetained::from_raw(p) }).or_else(|| quartz_window_image(window))?;
+    let mut pixmap = bluesnap_core::Pixmap::new(w, h)?;
+    let format = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
+    draw_srgb(&image, pixmap.data_mut(), w as usize, h as usize, format).ok()?;
+    // Quartz can supply an empty transparent image for unreadable content.
+    pixmap.pixels().iter().any(|p| p.alpha() != 0).then_some(pixmap)
+}
+
+/// Synchronous fallback for macOS 11–13 and unavailable ScreenCaptureKit services.
+fn quartz_window_image(window: &CapturedWindow) -> Option<CFRetained<CGImage>> {
+    use objc2_core_graphics::{CGRectNull, CGWindowImageOption};
+    let which = CGWindowListOption::OptionIncludingWindow;
+    let list = CGWindowListCopyWindowInfo(which, window.window_id)?;
+    if list.count() != 1 {
+        return None;
+    }
+    let dict = unsafe { &*list.value_at_index(0).cast::<CFDictionary>() };
+    let size = window_bounds(dict)?.size;
+    if (size.width, size.height) != window.point_size {
+        return None;
+    }
+
+    #[allow(deprecated)] // Same synchronous Quartz capture path as the display snapshot.
+    objc2_core_graphics::CGWindowListCreateImage(
+        unsafe { CGRectNull }, which, window.window_id,
+        CGWindowImageOption::BoundsIgnoreFraming | CGWindowImageOption::BestResolution,
+    )
 }
 
 /// On-screen windows of other apps in front-to-back order, relative to
@@ -709,7 +751,6 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<CapturedWindow> {
     let options = CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
     let Some(list) = CGWindowListCopyWindowInfo(options, 0) else { return Vec::new() };
     let own_pid = std::process::id() as i32;
-    let radius = window_corner_radius_points();
 
     let mut out = Vec::new();
     for i in 0..list.count() {
@@ -729,14 +770,9 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<CapturedWindow> {
         if pid == own_pid || alpha <= 0.0 || !is_pickable_window_layer(layer) {
             continue;
         }
-        let mut r = CGRect::default();
-        let ok = unsafe {
-            let v = dict.value((kCGWindowBounds as *const CFString).cast());
-            !v.is_null() && CGRectMakeWithDictionaryRepresentation(Some(&*v.cast::<CFDictionary>()), &mut r)
-        };
-        if !ok {
-            continue;
-        }
+        let Some(window_id) = (unsafe { number(kCGWindowNumber) }).and_then(|n| n.as_i64())
+            .and_then(|id| u32::try_from(id).ok()) else { continue };
+        let Some(r) = window_bounds(dict) else { continue };
         let (right, bottom) = (r.origin.x + r.size.width, r.origin.y + r.size.height);
         let visible_w = right.min(display.origin.x + display.size.width) - r.origin.x.max(display.origin.x);
         let visible_h = bottom.min(display.origin.y + display.size.height) - r.origin.y.max(display.origin.y);
@@ -746,16 +782,12 @@ fn visible_windows(display: &CGRect, scale: f64) -> Vec<CapturedWindow> {
         let px = |v: f64| (v * scale).round() as i32;
         let (x0, y0) = (px(r.origin.x - display.origin.x), px(r.origin.y - display.origin.y));
         let (x1, y1) = (px(right - display.origin.x), px(bottom - display.origin.y));
-        // Full-screen windows (and ones covering the whole display) are square.
-        let covers_display = r.origin.x <= display.origin.x
-            && r.origin.y <= display.origin.y
-            && right >= display.origin.x + display.size.width
-            && bottom >= display.origin.y + display.size.height;
-        let corner_radius = match radius {
-            Some(points) if layer == 0 && !covers_display => (points * scale) as f32,
-            _ => 0.0,
-        };
-        out.push(CapturedWindow { bounds: PixelRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, corner_radius });
+        out.push(CapturedWindow {
+            bounds: PixelRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 },
+            corner_radius: 0.0,
+            window_id,
+            point_size: (r.size.width, r.size.height),
+        });
     }
     out
 }

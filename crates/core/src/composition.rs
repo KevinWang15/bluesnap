@@ -342,6 +342,19 @@ impl Composition {
         Ok(comp)
     }
 
+    /// Starts a new composition from a screenshot. A clipped window needs a
+    /// transparent canvas so flattening the composition preserves its corners.
+    pub fn from_capture(image: Pixmap, scale: f32, shapes: Vec<Shape>) -> Result<Self, CanvasSizeError> {
+        let (right, bottom) = (image.width() - 1, image.height() - 1);
+        let clipped = [(0, 0), (right, 0), (0, bottom), (right, bottom)]
+            .iter().any(|&(x, y)| image.pixel(x, y).unwrap().alpha() < 255);
+        let mut comp = Self::from_slice(image, scale, shapes)?;
+        if clipped {
+            comp.background = Color::TRANSPARENT;
+        }
+        Ok(comp)
+    }
+
     /// Appends a slice, normalizing its display scale. A size error leaves the composition intact.
     pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> Result<usize, CanvasSizeError> {
         let placement = SlicePlacement::new((self.width, self.height), self.scale, &self.elements, &image, slice_scale)?;

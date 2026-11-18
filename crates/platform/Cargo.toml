@@ -100,3 +100,6 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGImage",
     "CGWindow",
 ] }
+
+[build-dependencies]
+cc = "1"

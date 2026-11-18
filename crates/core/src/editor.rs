@@ -16,7 +16,7 @@ use crate::composition::{
     Composition, Element, ImageAsset, LayerOrder, PlacedImage, renumber_counters_in, reorder_element,
 };
 use crate::geom::{CursorKind, Handle, Point, Rect, resize_rect_with_handle};
-use crate::outline::WindowOutline;
+use crate::outline::{PickableWindow, WindowOutline};
 use crate::pixels::crop;
 use crate::render::{self, CanvasBackdrop, Document};
 use crate::shape::{EditHandle, Geometry, Metrics, RedactShape, Shape};
@@ -141,7 +141,7 @@ impl SaveSnapshot {
             Self::Canvas(comp) => Some(comp),
             Self::Capture { doc, region, outline, shapes, scale } => {
                 let (raw, shapes) = capture_slice(doc, region, outline, shapes)?;
-                Composition::from_slice(raw, scale, shapes).ok()
+                Composition::from_capture(raw, scale, shapes).ok()
             }
         }
     }
@@ -166,10 +166,10 @@ enum Workspace {
     Capture {
         doc: Document,
         /// Candidate windows, topmost first: (bounds clipped to the screenshot, full outline).
-        windows: Vec<(Rect, WindowOutline)>,
+        windows: Vec<(Rect, Box<dyn PickableWindow>)>,
         hover: Option<Rect>,
         /// Outline of the window under the pointer, when `hover` is a window.
-        hover_window: Option<WindowOutline>,
+        hover_window: Option<usize>,
         selection: Option<Rect>,
         /// Set when `selection` came from a single click on a window and hasn't
         /// been resized or moved since: output is clipped to its exact outline.
@@ -223,14 +223,13 @@ impl Editor {
     pub fn new(
         doc: Document,
         fonts: Arc<Fonts>,
-        windows: impl IntoIterator<Item = impl Into<WindowOutline>>,
+        windows: impl IntoIterator<Item = impl PickableWindow + 'static>,
         scale: f32,
     ) -> Self {
         let bounds = doc.bounds();
         let windows = windows
             .into_iter()
-            .map(Into::into)
-            .filter_map(|w: WindowOutline| Some((w.bounds.intersect(&bounds)?, w)))
+            .filter_map(|w| Some((w.bounds().intersect(&bounds)?, Box::new(w) as Box<dyn PickableWindow>)))
             .collect();
         let mut editor = Self::with_workspace(
             Workspace::Capture { doc, windows, hover: None, hover_window: None, selection: None, snapped: None },
@@ -476,7 +475,7 @@ impl Editor {
             Workspace::Capture { doc, selection, snapped, .. } => Some(SaveSnapshot::Capture {
                 doc: doc.snapshot(),
                 region: (*selection)?,
-                outline: *snapped,
+                outline: snapped.clone(),
                 shapes: self.elements.iter().filter_map(Element::as_shape).cloned().collect(),
                 scale: self.scale,
             }),
@@ -1091,9 +1090,8 @@ impl Editor {
         let p = self.pointer;
         if let Workspace::Capture { doc, windows, hover, hover_window, .. } = &mut self.workspace {
             let bounds = doc.bounds();
-            let found = windows.iter().find(|(clipped, _)| clipped.contains(p));
-            *hover = Some(found.map_or(bounds, |(clipped, _)| *clipped));
-            *hover_window = found.map(|(_, outline)| *outline);
+            *hover_window = windows.iter().position(|(clipped, _)| clipped.contains(p));
+            *hover = Some(hover_window.map_or(bounds, |i| windows[i].0));
         }
     }
 
@@ -1337,12 +1335,12 @@ impl Editor {
                 let screen = self.screen();
                 let r = Rect::from_points(start, p).intersect(&screen);
                 let min = DRAG_THRESHOLD * self.ui_scale;
-                if let Workspace::Capture { selection, hover, hover_window, snapped, .. } = &mut self.workspace {
+                if let Workspace::Capture { selection, hover, hover_window, snapped, windows, .. } = &mut self.workspace {
                     self.content_revision += 1;
                     (*selection, *snapped) = match r {
                         Some(r) if moved && r.w >= min && r.h >= min => (Some(r.round()), None),
                         // A click picks the window under the pointer, outline and all.
-                        _ => (*hover, hover_window.filter(WindowOutline::is_rounded)),
+                        _ => (*hover, hover_window.map(|i| windows[i].1.outline()).filter(WindowOutline::is_rounded)),
                     };
                 }
             }
@@ -2084,6 +2082,9 @@ mod tests {
         assert_eq!(e.export().unwrap().pixel(100, 60).unwrap().alpha(), 255);
         let (raw, _, _) = e.extract_slice().unwrap();
         assert_eq!(raw.pixel(0, 0).unwrap().alpha(), 0);
+        let comp = e.to_composition().unwrap();
+        let mut reopened = Editor::from_composition(comp, e.fonts.clone());
+        assert_eq!(corner_alpha(&mut reopened), [0; 4]);
         // A click inside that doesn't move it keeps the snap.
         click(&mut e, 120.0, 90.0);
         assert_eq!(corner_alpha(&mut e), [0; 4]);
