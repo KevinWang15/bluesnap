@@ -403,6 +403,24 @@ impl Editor {
         })
     }
 
+    /// Only upper effects that sample changed pixels can change the static layer.
+    /// Include the previous position so moving a shape out of a filter updates it.
+    fn edit_affects_upper_effect(&self, idx: usize, previous: &Element) -> bool {
+        let m = self.metrics();
+        let canvas = self.screen();
+        let mut damage = None;
+        self.elements[idx + 1..].iter().filter_map(Element::as_shape).any(|shape| {
+            let Geometry::Redact { effect, strength, .. } = shape.geometry else { return false };
+            if effect == RedactEffect::Gray {
+                return false;
+            }
+            let Some(area) = shape.bounds(m).round_out().intersect(&canvas) else { return false };
+            let changed = damage.get_or_insert_with(|| previous.bounds(m).union(&self.elements[idx].bounds(m)).round_out());
+            render::effect_sample_bounds(self.canvas_dims(), effect, effect.amount(strength, m.scale), area)
+                .is_some_and(|sample| sample.intersect(changed).is_some())
+        })
+    }
+
     fn has_any_effect_redaction(&self) -> bool {
         self.elements.iter().any(|el| {
             matches!(
@@ -435,6 +453,7 @@ impl Editor {
             Some(Drag::Create { idx, .. } | Drag::ElementHandle { idx, .. } | Drag::ElementMove { idx, moved: true, .. }) => {
                 self.elements.get(*idx).and_then(|e| e.as_shape().map(|_| *idx))
             }
+            _ if self.continuous == Some(true) && self.text.is_none() => self.selected,
             _ => self.text.as_ref().map(|t| t.idx),
         }
     }
@@ -633,7 +652,15 @@ impl Editor {
         if self.continuous.is_none() {
             self.end_change();
         }
-        self.touch_shapes();
+        // The first slider step splits this shape into its own band. Later
+        // steps can reuse the other bands unless a higher effect samples it.
+        if !record && self.active_index() == Some(idx)
+            && (self.selection_mode() != SelectionMode::Canvas || !self.edit_affects_upper_effect(idx, &self.elements[idx]))
+        {
+            self.touch_active();
+        } else {
+            self.touch_shapes();
+        }
     }
 
     pub fn current_counter_format(&self) -> Option<CounterFormat> {
@@ -760,6 +787,7 @@ impl Editor {
     pub fn end_continuous_edit(&mut self) {
         if self.continuous.take() == Some(true) {
             self.end_change();
+            self.touch_shapes();
         }
     }
 
@@ -1040,9 +1068,9 @@ impl Editor {
         let scale = self.ui_scale;
         let content_scale = self.scale;
         let is_canvas = matches!(self.workspace, Workspace::Canvas { .. });
-        let mut shape_drag: Option<usize> = None;
+        let mut created = None;
         let mut split_static = false;
-        let mut image_changed: Option<usize> = None;
+        let mut moved_element = None;
 
         match self.drag.as_mut().expect("checked") {
             Drag::Pick { start, moved } => {
@@ -1074,7 +1102,7 @@ impl Editor {
             }
             Drag::Create { idx, start } => {
                 let elem_idx = *idx;
-                shape_drag = Some(elem_idx);
+                created = Some(elem_idx);
                 let start = *start;
                 if let Some(Shape { geometry, .. }) = self.elements.get_mut(elem_idx).and_then(Element::as_shape_mut) {
                     match geometry {
@@ -1107,36 +1135,28 @@ impl Editor {
                 if *moved {
                     let elem_idx = *idx;
                     let next = orig.translated(p - *start);
-                    if matches!(next, Element::Image(_)) {
-                        image_changed = Some(elem_idx);
-                    } else {
-                        shape_drag = Some(elem_idx);
-                        split_static = !was_moved;
-                    }
-                    self.elements[elem_idx] = next;
+                    split_static = !was_moved && matches!(next, Element::Shape(_));
+                    moved_element = Some((elem_idx, std::mem::replace(&mut self.elements[elem_idx], next)));
                 }
             }
             Drag::ElementHandle { idx, handle, orig, start } => {
                 let elem_idx = *idx;
                 let next = orig.with_handle_moved(*handle, p - *start, constrain);
-                if matches!(next, Element::Image(_)) {
-                    image_changed = Some(elem_idx);
-                } else {
-                    shape_drag = Some(elem_idx);
-                }
-                self.elements[elem_idx] = next;
+                moved_element = Some((elem_idx, std::mem::replace(&mut self.elements[elem_idx], next)));
             }
         }
-        if let Some(idx) = image_changed {
+        if let Some((idx, previous)) = moved_element {
             self.invalidate_backdrop_from(idx);
-            if self.has_effect_redaction_above(idx) {
+            if split_static || (is_canvas && self.edit_affects_upper_effect(idx, &previous)) {
                 self.touch_shapes();
+            } else if self.elements[idx].as_shape().is_some() {
+                self.touch_active();
             } else {
                 self.touch();
             }
-        } else if let Some(idx) = shape_drag {
+        } else if let Some(idx) = created {
             self.invalidate_backdrop_from(idx);
-            if split_static || (is_canvas && self.has_effect_redaction_above(idx)) {
+            if is_canvas && self.has_effect_redaction_above(idx) {
                 self.touch_shapes();
             } else {
                 self.touch_active();
@@ -1992,6 +2012,29 @@ mod tests {
     }
 
     #[test]
+    fn dragging_invalidates_upper_effects_when_entering_and_leaving_their_sample_area() {
+        let mut e = document_editor();
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Gray));
+        drag(&mut e, (20.0, 100.0), (40.0, 120.0));
+        e.toggle_tool(Tool::Redact);
+        e.set_redaction(|r| (r.effect, r.strength) = (RedactEffect::Mosaic, 1.0));
+        assert_eq!(e.add_redactions(&[Rect::new(189.0, 100.0, 8.0, 8.0)]), 1);
+        e.pointer_down(Point::new(30.0, 110.0));
+        e.pointer_move(Point::new(50.0, 110.0), false); // split off the moving shape
+        let rev = e.static_layer_revision();
+        e.pointer_move(Point::new(70.0, 110.0), false);
+        assert_eq!(e.static_layer_revision(), rev);
+        // The mosaic reads the entire [160, 200) cell. Neither rectangle
+        // touches the other, but the moving shape changes its average.
+        e.pointer_move(Point::new(165.0, 110.0), false);
+        assert!(e.static_layer_revision() > rev);
+        let rev = e.static_layer_revision();
+        e.pointer_move(Point::new(70.0, 110.0), false);
+        assert!(e.static_layer_revision() > rev);
+    }
+
+    #[test]
     fn canvas_editor_moves_resizes_images_and_resizes_canvas_with_undo() {
         let mut e = document_editor();
         assert_eq!(e.screen(), Rect::new(0.0, 0.0, 400.0, 3000.0));
@@ -2090,10 +2133,14 @@ mod tests {
         assert_eq!((*r, *effect), (Rect::new(50.0, 50.0, 100.0, 70.0), RedactEffect::Blur));
         let undo_depth = e.history.len();
         e.begin_continuous_edit();
-        for i in 0..10 {
+        e.set_redaction(|r| r.strength = 0.0);
+        let static_rev = e.static_layer_revision();
+        for i in 1..10 {
             e.set_redaction(|r| r.strength = i as f32 / 10.0);
+            assert_eq!(e.static_layer_revision(), static_rev);
         }
         e.end_continuous_edit();
+        assert!(e.static_layer_revision() > static_rev);
         assert_eq!(e.history.len(), undo_depth + 1);
         assert_eq!(e.current_redaction().unwrap().strength, 0.9);
         assert!(e.undo());
