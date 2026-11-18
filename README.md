@@ -107,12 +107,10 @@ Press the hotkey, then:
   wheel (Ctrl/Cmd+wheel zooms). Scroll at a moderate
   pace: if a frame shares nothing with the previous one the bar says so, and
   scrolling back a little picks it up again. Content redrawn at fractional pixel
-  offsets (display scaling, trackpads) is matched with sub-pixel accuracy. Only
-  the part that scrolls ends up in
-  the image: fixed side panels and scrollbars (including macOS overlay scrollbars)
-  are left out. Annotations made before starting come along: the image starts with
-  the selection, so they stay on the content they were drawn on (and remain
-  editable in the editor). The image stops at 30,000 px.
+  offsets (display scaling, trackpads) is matched with sub-pixel accuracy.
+  The stitched image keeps the full width of the selection, including fixed side
+  panels and scrollbars. Annotations made before capture stay on the selected
+  content and remain editable in the editor. The image stops at 30,000 px.
 - ✓ (or Enter, Ctrl/Cmd+C, double-click) always copies a plain raster image to the
   clipboard; the download icon (or Ctrl/Cmd+S) saves either a `.png` image or an
   editable BSON-based **`.bs`** file (storing lossless raw image data, canvas size and

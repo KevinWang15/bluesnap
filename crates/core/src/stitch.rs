@@ -14,9 +14,10 @@
 //!   lines the frames up and then vote, so a band disturbed by a moving scrollbar
 //!   or an animation doesn't spoil the match;
 //! - strips at the span's edges that don't follow the shift (scrollbar thumbs and
-//!   tracks) are dropped from matching and from the output;
+//!   tracks) are dropped from matching;
 //! - rows that stay put at the top and bottom (sticky headers and footers) are
-//!   found once and kept out of the middle, and only newly revealed rows are added.
+//!   found and kept out of the middle. Newly revealed rows are added at the
+//!   full width of the user's selection.
 
 use std::ops::Range;
 
@@ -173,25 +174,18 @@ impl Frame {
         best as f32 / strips.len() as f32
     }
 
-    /// Pixel columns covered by `strips`.
-    fn columns(&self, strips: &Range<usize>) -> Range<usize> {
-        strips.start * STRIP..(strips.end * STRIP).min(self.width)
-    }
-
-    /// Bytes of `rows`, cropped to pixel `columns`.
-    fn crop(&self, rows: Range<usize>, columns: &Range<usize>) -> Vec<u8> {
+    fn rows(&self, rows: Range<usize>) -> &[u8] {
         let stride = self.width * 4;
-        rows.flat_map(|r| &self.rgba[r * stride + columns.start * 4..r * stride + columns.end * 4]).copied().collect()
+        &self.rgba[rows.start * stride..rows.end * stride]
     }
 }
 
-/// Decided at the first scroll.
+/// Vertical stitching parameters inferred from the scrolling content.
 struct Layout {
-    /// Strips stored in the body (the scrolling span).
-    stored: Range<usize>,
-    /// Strips still trusted for matching and kept in the output (shrinks when
-    /// edge strips turn out to be scrollbars).
-    keep: Range<usize>,
+    /// Strips used to estimate the vertical shift, excluding noisy edges.
+    match_strips: Range<usize>,
+    /// Lower bound for edge trimming, based on the first scroll.
+    min_match_strips: usize,
     /// Sticky header and footer rows.
     top: usize,
     bottom: usize,
@@ -200,8 +194,7 @@ struct Layout {
 pub struct Stitcher {
     width: usize,
     max_height: usize,
-    /// Composed rows: the first frame (cropped to the stored strips and without
-    /// its footer, once the layout is known), then appended rows.
+    /// Full-width rows: the first frame without its sticky footer, then appended rows.
     body: Vec<u8>,
     /// The frame `body` currently ends with.
     last: Option<Frame>,
@@ -233,17 +226,10 @@ impl Stitcher {
         self.width as u32
     }
 
-    fn body_width(&self) -> usize {
-        match (&self.layout, &self.last) {
-            (Some(layout), Some(frame)) => frame.columns(&layout.stored).len(),
-            _ => self.width,
-        }
-    }
-
     /// Height of the image [`Self::finish`] would produce.
     pub fn height(&self) -> u32 {
         let footer = self.layout.as_ref().map_or(0, |l| l.bottom);
-        (self.body.len() / (self.body_width() * 4) + footer) as u32
+        (self.body.len() / (self.width * 4) + footer) as u32
     }
 
     fn restart(&mut self, frame: Frame) -> Progress {
@@ -281,9 +267,9 @@ impl Stitcher {
         };
         let Some(first) = (0..cur.strips).find(|&s| !fixed(s)) else { return Progress::Unchanged };
         let last = (0..cur.strips).rev().find(|&s| !fixed(s)).expect("a strip changed");
-        let mut stored = first..last + 1;
+        let mut match_strips = first..last + 1;
 
-        let shift = match estimate_shift(prev, &cur, &stored, &(0..n)) {
+        let shift = match estimate_shift(prev, &cur, &match_strips, &(0..n)) {
             Some(shift) if shift > 0.0 => shift,
             Some(_) => return Progress::ScrolledUp,
             None => {
@@ -297,7 +283,7 @@ impl Stitcher {
         // Sticky bars first: rows that don't move would otherwise make every strip
         // whose only content they are (blank margins) look like a scrollbar.
         let dy = shift.round() as usize;
-        let (top, bottom) = sticky_bands(prev, &cur, &stored, &(0..n), Some(dy));
+        let (top, bottom) = sticky_bands(prev, &cur, &match_strips, &(0..n), Some(dy));
         let middle = top..n - bottom;
 
         // Blank margins never change either, but belong to the scrolling page,
@@ -306,20 +292,18 @@ impl Stitcher {
             let flat = middle.clone().filter(|&r| cur.flat[cur.at(r, s)]).count();
             flat as f32 >= middle.len() as f32 * (1.0 - FIXED_TOLERANCE)
         };
-        while stored.start > 0 && blank(stored.start - 1) {
-            stored.start -= 1;
+        while match_strips.start > 0 && blank(match_strips.start - 1) {
+            match_strips.start -= 1;
         }
-        while stored.end < cur.strips && blank(stored.end) {
-            stored.end += 1;
+        while match_strips.end < cur.strips && blank(match_strips.end) {
+            match_strips.end += 1;
         }
-        let min_keep = stored.len().div_ceil(2).max(stored.len().saturating_sub(16));
-        let keep = trim_noisy_edges(prev, &cur, stored.clone(), &middle, dy, min_keep);
+        let min_match_strips = match_strips.len().div_ceil(2).max(match_strips.len().saturating_sub(16));
+        let match_strips = trim_noisy_edges(prev, &cur, match_strips, &middle, dy, min_match_strips);
 
-        // The first frame becomes the start of the body: scrolling span only, and
-        // without the footer, which belongs at the very end.
-        let columns = prev.columns(&stored);
-        self.body = prev.crop(0..n - bottom, &columns);
-        self.layout = Some(Layout { stored, keep, top, bottom });
+        // The footer belongs at the end of the stitched image.
+        self.body.truncate((n - bottom) * self.width * 4);
+        self.layout = Some(Layout { match_strips, min_match_strips, top, bottom });
         self.append(cur, shift)
     }
 
@@ -327,26 +311,25 @@ impl Stitcher {
         let prev = self.last.as_ref().expect("checked by push");
         let layout = self.layout.as_ref().expect("checked by push");
         let n = cur.height;
-        let (extra_top, _) = sticky_bands(prev, &cur, &layout.keep, &(layout.top..n - layout.bottom), None);
+        let strips = &layout.match_strips;
+        let (extra_top, _) = sticky_bands(prev, &cur, strips, &(layout.top..n - layout.bottom), None);
         let middle = layout.top + extra_top..n - layout.bottom;
         // If the sticky bands stopped holding (e.g. a header that hides on
         // scroll), try again over the whole height.
-        let shift = estimate_shift(prev, &cur, &layout.keep, &middle)
-            .or_else(|| estimate_shift(prev, &cur, &layout.keep, &(0..n)));
+        let shift = estimate_shift(prev, &cur, strips, &middle).or_else(|| estimate_shift(prev, &cur, strips, &(0..n)));
         let shift = match shift {
             Some(shift) if shift > 0.0 => shift,
             Some(_) => return Progress::ScrolledUp,
             None => return Progress::LostTrack,
         };
         let dy = shift.round() as usize;
-        let (detected_top, _) = sticky_bands(prev, &cur, &layout.keep, &(0..n - layout.bottom), Some(dy));
+        let (detected_top, _) = sticky_bands(prev, &cur, strips, &(0..n - layout.bottom), Some(dy));
         let active_top = layout.top.max(detected_top);
         let active_middle = active_top..n - layout.bottom;
-        let min_keep = layout.stored.len().div_ceil(2).max(layout.stored.len().saturating_sub(16));
-        let keep = trim_noisy_edges(prev, &cur, layout.keep.clone(), &active_middle, dy, min_keep);
+        let match_strips = trim_noisy_edges(prev, &cur, strips.clone(), &active_middle, dy, layout.min_match_strips);
         let layout = self.layout.as_mut().expect("checked above");
         layout.top = active_top;
-        layout.keep = keep;
+        layout.match_strips = match_strips;
         self.append(cur, shift)
     }
 
@@ -357,8 +340,7 @@ impl Stitcher {
         let shift = (new_position.round() - self.position.round()).max(0.0) as usize;
         self.position = new_position;
         let layout = self.layout.as_ref().expect("set before appending");
-        let columns = cur.columns(&layout.stored);
-        let stride = columns.len() * 4;
+        let stride = self.width * 4;
         let end = cur.height - layout.bottom;
         let mut start = end.saturating_sub(shift).max(layout.top);
         let room = self.max_height.saturating_sub(self.body.len() / stride + layout.bottom);
@@ -366,42 +348,27 @@ impl Stitcher {
             start = end - room;
             self.full = true;
         }
-        self.body.extend(cur.crop(start..end, &columns));
+        self.body.extend_from_slice(cur.rows(start..end));
         self.last = Some(cur);
         if self.full { Progress::Full } else { Progress::Appended((end - start) as u32) }
     }
 
-    /// The stitched image so far: body plus the latest frame's footer, cropped to
-    /// the strips that scrolled cleanly.
-    pub fn finish(&self) -> Option<Pixmap> {
+    fn footer(&self) -> Option<&[u8]> {
         let last = self.last.as_ref()?;
-        let Some(layout) = &self.layout else {
-            return pixmap_from_rgba(self.width as u32, last.height as u32, self.body.clone());
-        };
-        let stored = last.columns(&layout.stored);
-        let mut rgba = self.body.clone();
-        rgba.extend(last.crop(last.height - layout.bottom..last.height, &stored));
+        let count = self.layout.as_ref().map_or(0, |layout| layout.bottom);
+        Some(last.rows(last.height - count..last.height))
+    }
 
-        let keep = last.columns(&layout.keep);
-        let (x0, x1) = (keep.start - stored.start, keep.end - stored.start);
-        let (src, dst) = (stored.len() * 4, keep.len() * 4);
-        let rows = rgba.len() / src;
-        let mut out = Vec::with_capacity(rows * dst);
-        for row in rgba.chunks_exact(src) {
-            out.extend_from_slice(&row[x0 * 4..x1 * 4]);
-        }
-        pixmap_from_rgba(keep.len() as u32, rows as u32, out)
+    /// The stitched image so far, including the latest frame's sticky footer.
+    pub fn finish(&self) -> Option<Pixmap> {
+        let rgba = [self.body.as_slice(), self.footer()?].concat();
+        pixmap_from_rgba(self.width(), self.height(), rgba)
     }
 
     /// `(width, height)` of the image [`Self::finish`] would produce, or `None`
     /// before the first frame.
     pub fn dimensions(&self) -> Option<(u32, u32)> {
-        let last = self.last.as_ref()?;
-        let width = match &self.layout {
-            Some(layout) => last.columns(&layout.keep).len() as u32,
-            None => self.width as u32,
-        };
-        Some((width, self.height()))
+        self.last.as_ref().map(|_| (self.width(), self.height()))
     }
 
     /// Downscales the current stitched image into a `dst_w × dst_h` opaque BGRA8
@@ -410,33 +377,19 @@ impl Stitcher {
         if dst_w == 0 || dst_h == 0 {
             return None;
         }
-        let last = self.last.as_ref()?;
-        let (src_w, body_stride, body_x0, footer_x0, footer_rows) = match &self.layout {
-            Some(layout) => {
-                let stored = last.columns(&layout.stored);
-                let keep = last.columns(&layout.keep);
-                (keep.len(), stored.len() * 4, keep.start - stored.start, keep.start, layout.bottom)
-            }
-            None => (self.width, self.width * 4, 0, 0, 0),
-        };
-        if body_stride == 0 {
-            return None;
-        }
-        let body_rows = self.body.len() / body_stride;
-        let src_h = body_rows + footer_rows;
+        let footer = self.footer()?;
+        let (src_w, src_h) = (self.width, self.height() as usize);
         if src_w == 0 || src_h == 0 {
             return None;
         }
-        let last_stride = last.width * 4;
-        let footer_y0 = last.height - footer_rows;
+        let stride = src_w * 4;
         let row_bytes = |sy: usize| -> &[u8] {
-            if sy < body_rows {
-                let start = sy * body_stride + body_x0 * 4;
-                &self.body[start..start + src_w * 4]
+            let start = sy * stride;
+            if start < self.body.len() {
+                &self.body[start..start + stride]
             } else {
-                let fy = footer_y0 + (sy - body_rows);
-                let start = fy * last_stride + footer_x0 * 4;
-                &last.rgba[start..start + src_w * 4]
+                let start = start - self.body.len();
+                &footer[start..start + stride]
             }
         };
 
@@ -919,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_at_the_edge_is_tolerated_and_trimmed() {
+    fn scrollbar_appearing_mid_capture_preserves_selection_pixels() {
         // 80 px of content plus a 16 px scrollbar whose thumb tracks the scroll
         // position, macOS style: hidden until scrolling starts.
         let (cw, sb, height, doc_h) = (80, 16, 240, 3000);
@@ -932,16 +885,18 @@ mod tests {
                 if thumb && (top..top + len).contains(&r) { [90, 90, 90, 255] } else { [235, 235, 235, 255] }
             })
         };
-        assert_eq!(s.push(height as u32, frame(0, false)), Progress::Started);
+        let mut expected = frame(0, false);
+        assert_eq!(s.push(height as u32, expected.clone()), Progress::Started);
+        let mut previous = 0;
         for y in [40, 100, 180, 260, 330, 420, 500, 610, 700] {
-            assert!(matches!(s.push(height as u32, frame(y, true)), Progress::Appended(_)), "frame at {y}");
+            let current = frame(y, y >= 180);
+            expected.extend_from_slice(rows_w(&current, cw + sb, height - (y - previous), height));
+            assert_eq!(s.push(height as u32, current), Progress::Appended((y - previous) as u32));
+            assert_eq!(s.dimensions(), Some(((cw + sb) as u32, (height + y) as u32)));
+            previous = y;
         }
         let out = s.finish().unwrap();
-        assert_eq!(out.width() as usize, cw, "scrollbar columns trimmed");
-        let mut expected = Vec::new();
-        for r in 0..700 + height {
-            expected.extend_from_slice(rows_w(&doc, cw, r, r + 1));
-        }
+        assert_eq!(out.width() as usize, cw + sb);
         assert!(out.data() == &expected[..]);
     }
 
@@ -960,18 +915,38 @@ mod tests {
     }
 
     #[test]
-    fn fixed_sidebar_is_left_out() {
-        let (side, cw, height) = (32, 64, 240);
-        let doc = document_w(cw, 2000, 7);
-        // A sidebar with its own non-uniform content that never moves.
-        let sidebar = |r: usize, _: bool| [(r * 7 % 256) as u8, 40, (r * 3 % 256) as u8, 255];
-        let mut s = Stitcher::new((side + cw) as u32, 100_000);
-        for y in [0, 50, 120, 200, 290] {
-            s.push(height as u32, compose(&doc, cw, y, height, side, 0, sidebar));
+    fn scrolling_in_either_half_preserves_the_1800px_selection() {
+        let (half, height) = (900, 160);
+        let width = 2 * half;
+        let sidebar = document_w(half, height, 7);
+        let doc = document_w(half, height + 100, 42);
+        for sidebar_on_left in [true, false] {
+            let mut s = Stitcher::new(width as u32, 30_000);
+            let mut expected = Vec::new();
+            let mut previous = 0;
+            for y in [0, 40, 100] {
+                let mut frame = Vec::with_capacity(width * height * 4);
+                for row in 0..height {
+                    let fixed = rows_w(&sidebar, half, row, row + 1);
+                    let moving = rows_w(&doc, half, y + row, y + row + 1);
+                    let halves = if sidebar_on_left { [fixed, moving] } else { [moving, fixed] };
+                    for pixels in halves {
+                        frame.extend_from_slice(pixels);
+                    }
+                }
+                let added = y - previous;
+                let start = if y == 0 { 0 } else { height - added };
+                expected.extend_from_slice(rows_w(&frame, width, start, height));
+                let progress = s.push(height as u32, frame);
+                assert_eq!(progress, if y == 0 { Progress::Started } else { Progress::Appended(added as u32) });
+                let dims = (width as u32, (height + y) as u32);
+                assert_eq!(s.dimensions(), Some(dims));
+                let image = s.finish().unwrap();
+                assert_eq!((image.width(), image.height()), dims);
+                assert!(image.data() == expected.as_slice());
+                previous = y;
+            }
         }
-        let out = s.finish().unwrap();
-        assert_eq!(out.width() as usize, cw);
-        assert!(out.data() == rows_w(&doc, cw, 0, 290 + height));
     }
 
     /// A text-like page at twice the resolution: lines of dark "words".
@@ -1187,7 +1162,7 @@ mod tests {
             assert!(matches!(s.push(height as u32, frame(y, true)), Progress::Appended(_)));
         }
         let finished = s.finish().unwrap();
-        assert_eq!(finished.width() as usize, cw);
+        assert_eq!(finished.width() as usize, total_w);
         assert_eq!(s.dimensions(), Some((finished.width(), finished.height())));
         // At 1:1 dimensions, `thumbnail_bgra` must match `finish` pixel-for-pixel.
         assert_eq!(
