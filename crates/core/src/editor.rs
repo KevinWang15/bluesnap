@@ -210,6 +210,7 @@ pub struct Editor {
     /// Accumulated canvas-origin shift from normalizing a Left/Top canvas resize.
     pending_origin_shift: Point,
     revision: u64,
+    content_revision: u64,
     static_revision: u64,
     active_revision: u64,
 }
@@ -301,6 +302,7 @@ impl Editor {
             text: None,
             pending_origin_shift: Point::default(),
             revision: 0,
+            content_revision: 0,
             static_revision: 0,
             active_revision: 0,
         }
@@ -657,6 +659,12 @@ impl Editor {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Version of the exported pixels and selection. An in-progress edit has no
+    /// stable version. Hover, pan, and changes to the active tool don't affect it.
+    pub fn settled_content_revision(&self) -> Option<u64> {
+        (self.drag.is_none() && self.text.is_none() && self.continuous != Some(true)).then_some(self.content_revision)
     }
 
     pub fn is_picking(&self) -> bool {
@@ -1330,6 +1338,7 @@ impl Editor {
                 let r = Rect::from_points(start, p).intersect(&screen);
                 let min = DRAG_THRESHOLD * self.ui_scale;
                 if let Workspace::Capture { selection, hover, hover_window, snapped, .. } = &mut self.workspace {
+                    self.content_revision += 1;
                     (*selection, *snapped) = match r {
                         Some(r) if moved && r.w >= min && r.h >= min => (Some(r.round()), None),
                         // A click picks the window under the pointer, outline and all.
@@ -1343,6 +1352,7 @@ impl Editor {
                     *selection = selection.map(|s| s.round());
                     // Any change to a snapped selection makes it a plain region.
                     if *selection != Some(orig.round()) {
+                        self.content_revision += 1;
                         *snapped = None;
                     }
                 }
@@ -1464,6 +1474,7 @@ impl Editor {
         if selection.is_none() {
             return RightClick::Exit;
         }
+        self.content_revision += 1;
         *selection = None;
         *snapped = None;
         self.tool = None;
@@ -1561,6 +1572,7 @@ impl Editor {
             }
         }
         self.elements = prev.elements;
+        self.content_revision += 1;
         self.invalidate_backdrop();
         self.selected = None;
         self.touch_shapes();
@@ -1611,6 +1623,7 @@ impl Editor {
         if unchanged {
             self.history.pop_back();
         } else {
+            self.content_revision += 1;
             while self.history.len() > MAX_HISTORY {
                 self.history.pop_front();
             }

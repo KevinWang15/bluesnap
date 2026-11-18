@@ -57,6 +57,37 @@ pub enum Surface {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RedactionSource {
+    document: u64,
+    revision: u64,
+}
+
+impl RedactionSource {
+    fn current(document: u64, editor: &Editor) -> Option<Self> {
+        Some(Self { document, revision: editor.settled_content_revision()? })
+    }
+
+    fn update(
+        self, view: &gpui::WeakEntity<CanvasView>, cx: &mut gpui::AsyncWindowContext,
+        apply: impl FnOnce(&mut CanvasView, &mut Window, &mut Context<CanvasView>),
+    ) -> bool {
+        view.update_in(cx, |view, window, cx| {
+            if self.document != view.document_generation {
+                return false;
+            }
+            if view.editor.settled_content_revision() != Some(self.revision) {
+                let toast = Toast::new(toast::Kind::Info, "Selection or image changed")
+                    .detail("Run Auto again to check the current image.");
+                view.auto_finished(toast, window, cx);
+                return false;
+            }
+            apply(view, window, cx);
+            true
+        }).unwrap_or(false)
+    }
+}
+
 pub struct CanvasView {
     editor: Editor,
     surface: Surface,
@@ -74,7 +105,7 @@ pub struct CanvasView {
     text_previews: Option<(bluesnap_core::Color, f32, Vec<toolbar::TextPreview>)>,
     slider: Option<f32>,
     canvas_hovered: bool,
-    /// Discards pending paste reads when Open replaces the document in this window.
+    /// Distinguishes documents opened successively in the same window.
     document_generation: u64,
 }
 
@@ -222,6 +253,9 @@ impl CanvasView {
     /// Replaces the entire composition (e.g. when loading a `.bs` file).
     pub fn replace_composition(&mut self, comp: Composition, window: &mut Window, cx: &mut Context<Self>) {
         self.document_generation += 1;
+        self.auto = None;
+        self.ocr = None;
+        self.toast = None;
         self.editor.replace_composition(comp);
         self.bg_menu = None;
         self.text_menu = false;
@@ -855,6 +889,7 @@ impl CanvasView {
             return self.show_toast(toast, window, cx);
         }
         let (Some(sel), Some(pixmap)) = (self.editor.selection(), self.editor.export()) else { return };
+        let Some(source) = RedactionSource::current(self.document_generation, &self.editor) else { return };
         let origin = bluesnap_core::Point::new(sel.round().x, sel.round().y);
         let fonts = cx.global::<AppState>().fonts.clone();
         let scale = self.editor.scale();
@@ -884,7 +919,9 @@ impl CanvasView {
             for (i, (read, own)) in bands.iter().cloned().enumerate() {
                 if bands.len() > 1 {
                     let progress = Toast::new(toast::Kind::Busy, format!("{initial_title} {} of {}", i + 1, bands.len()));
-                    this.update_in(cx, |this, window, cx| this.show_toast(progress, window, cx)).ok();
+                    if !source.update(&this, cx, |view, window, cx| view.show_toast(progress, window, cx)) {
+                        return;
+                    }
                 }
                 let band = image.clone();
                 let recognized = cx
@@ -908,7 +945,7 @@ impl CanvasView {
                     Err(e) => {
                         log::error!("auto redact: text recognition failed: {e:#}");
                         let toast = Toast::new(toast::Kind::Error, "Couldn't read the text").detail(short_error(&e));
-                        this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
+                        source.update(&this, cx, |view, window, cx| view.auto_finished(toast, window, cx));
                         return;
                     }
                 }
@@ -916,7 +953,7 @@ impl CanvasView {
             let count = all_lines.len();
             if count == 0 {
                 let toast = Toast::new(toast::Kind::Info, "No text found").detail("There's nothing to redact in the selection.");
-                this.update_in(cx, |this, window, cx| this.auto_finished(toast, window, cx)).ok();
+                source.update(&this, cx, |view, window, cx| view.auto_finished(toast, window, cx));
                 return;
             }
             let ocr_time = started.elapsed();
@@ -925,7 +962,9 @@ impl CanvasView {
                 Some((llm_ep, task)) => {
                     let analyzing = Toast::new(toast::Kind::Busy, "Analyzing screen context…")
                         .detail(format!("Summarizing what is sensitive on this screen with {}", hosts(&settings)));
-                    this.update_in(cx, |this, window, cx| this.show_toast(analyzing, window, cx)).ok();
+                    if !source.update(&this, cx, |view, window, cx| view.show_toast(analyzing, window, cx)) {
+                        return;
+                    }
                     let (outcome, elapsed) = task.await;
                     match outcome {
                         bluesnap_ai::ContextOutcome::Ready(ctx) => (Some(ctx), elapsed),
@@ -954,7 +993,9 @@ impl CanvasView {
 
             let checking = Toast::new(toast::Kind::Busy, format!("Checking {} with AI…", plural(count, "line")))
                 .detail(format!("Using {}", hosts(&settings)));
-            this.update_in(cx, |this, window, cx| this.show_toast(checking, window, cx)).ok();
+            if !source.update(&this, cx, |view, window, cx| view.show_toast(checking, window, cx)) {
+                return;
+            }
 
             let found = {
                 let (settings, image, fonts) = (settings.clone(), image.clone(), fonts.clone());
@@ -974,7 +1015,7 @@ impl CanvasView {
                 "auto redact: {count} lines, OCR {ocr_time:?}, context {context_time:?}, total {:?}",
                 started.elapsed()
             );
-            this.update_in(cx, |this, window, cx| {
+            source.update(&this, cx, |this, window, cx| {
                 let toast = match found {
                     Ok((rects, report)) => {
                         let rects: Vec<PxRect> = rects.into_iter().map(|r| r.translate(origin)).collect();
@@ -1000,8 +1041,7 @@ impl CanvasView {
                     }
                 };
                 this.auto_finished(toast, window, cx);
-            })
-            .ok();
+            });
         }));
         cx.notify();
     }
@@ -1764,6 +1804,24 @@ impl EntityInputHandler for CanvasView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_redaction_is_invalid_after_moving_the_image_or_opening_another_document() {
+        let comp = || Composition::from_slice(Pixmap::new(160, 120).unwrap(), 1.0, Vec::new()).unwrap();
+        let mut editor = Editor::from_composition(comp(), Arc::new(bluesnap_core::Fonts::empty()));
+        let source = RedactionSource::current(0, &editor).unwrap();
+        let start = bluesnap_core::Point::new(40.0, 50.0);
+        let end = bluesnap_core::Point::new(78.0, 69.0);
+        editor.pointer_move(start, false);
+        assert_eq!(RedactionSource::current(0, &editor), Some(source));
+        editor.pointer_down(start);
+        editor.pointer_move(end, false);
+        assert!(RedactionSource::current(0, &editor).is_none());
+        editor.pointer_up(end);
+        assert_ne!(RedactionSource::current(0, &editor), Some(source));
+        editor.replace_composition(comp());
+        assert_ne!(RedactionSource::current(1, &editor), Some(source));
+    }
 
     #[test]
     fn utf16_offsets_round_trip() {
