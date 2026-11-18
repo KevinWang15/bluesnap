@@ -398,13 +398,15 @@ fn scrolling(c: &mut Criterion) {
 
 /// Mirrors `CanvasView::sync_gpu_resources` + `LayerBandPool` + `ImageAtlasCache`:
 /// uploads each unique `ImageAsset` once, and re-rasterizes + converts (`to_bgra_straight`)
-/// only those `VisualBand::Shapes` whose `(revision, start, end, clip)` changed.
-type BandKey = (u64, usize, usize, [i32; 4]);
+/// only the shape bands whose contents or visible bounds changed.
+type BandKey = (u64, usize, usize, Rect, bool);
 
 #[derive(Default)]
 struct BandPresenter {
     uploaded_images: HashSet<ImageId>,
     shape_bands: Vec<Option<BandKey>>,
+    /// A fractional display zoom requires a single texture per shape band.
+    fractional_zoom: bool,
 }
 
 impl BandPresenter {
@@ -423,16 +425,15 @@ impl BandPresenter {
         while self.shape_bands.len() < shape_count {
             self.shape_bands.push(None);
         }
-        let clip_key = [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32];
         let mut slot = 0;
         for b in bands {
             if let VisualBand::Shapes { range, revision, active } = b {
-                let key = (revision, range.start, range.end, clip_key);
+                let key = (revision, range.start, range.end, clip, active);
                 if self.shape_bands[slot] != Some(key) {
                     self.shape_bands[slot] = Some(key);
-                    if let Some((_, p)) = e.render_band(range, active, clip) {
+                    e.render_band_parts(range, active, clip, !self.fractional_zoom, |_, p| {
                         bytes += to_bgra_straight(&p).len();
-                    }
+                    });
                 }
                 slot += 1;
             }
@@ -672,22 +673,27 @@ fn bs_format(c: &mut Criterion) {
     g.finish();
 }
 
-/// Frame costs for editing a grid of small mosaics over a generated image.
-fn mosaic_grid(c: &mut Criterion) {
-    let (w, h) = (1920, 1080);
+fn mosaic_grid_composition(scale: u32, fonts: &Arc<Fonts>) -> (Composition, Point) {
+    let (w, h) = (1920 * scale, 1080 * scale);
     let doc = Document::from_rgba(w, h, screenshot(w, h)).unwrap();
-    let fonts = Arc::new(Fonts::empty());
     let mut editor = Editor::for_document(doc, fonts.clone(), 1.0);
     let mut rects = Vec::new();
     for row in 0..8 {
         for col in 0..8 {
-            rects.push(Rect::new(128.0 + col as f32 * 208.0, 96.0 + row as f32 * 120.0, 96.0, 32.0));
+            let rect = Rect::new(128.0 + col as f32 * 208.0, 96.0 + row as f32 * 120.0, 96.0, 32.0);
+            rects.push(rect.scale(scale as f32));
         }
     }
     editor.set_redaction(|r| r.effect = RedactEffect::Mosaic);
     assert_eq!(editor.add_redactions(&rects), rects.len());
-    let comp = editor.to_composition().unwrap();
-    let mosaic = rects[0].center();
+    (editor.to_composition().unwrap(), rects[0].center())
+}
+
+/// Frame costs for editing a grid of small mosaics over a generated image.
+fn mosaic_grid(c: &mut Criterion) {
+    let fonts = Arc::new(Fonts::empty());
+    let (comp, mosaic) = mosaic_grid_composition(1, &fonts);
+    let (large, _) = mosaic_grid_composition(2, &fonts);
     let image = Point::new(32.0, 32.0);
     let mut g = c.benchmark_group("mosaic_grid");
     g.sample_size(10);
@@ -698,15 +704,17 @@ fn mosaic_grid(c: &mut Criterion) {
             BatchSize::LargeInput,
         );
     });
-    for (name, start, index, step) in [
-        ("move_mosaic", mosaic, 1, 16.0),
-        ("move_background", image, 0, 16.0),
-        ("move_background_subpixel", image, 0, 16.25),
+    for (name, scene, start, index, step, fractional_zoom) in [
+        ("move_mosaic", &comp, mosaic, 1, 16.0, false),
+        ("move_background", &comp, image, 0, 16.0, false),
+        ("move_background_subpixel", &comp, image, 0, 16.25, false),
+        ("move_background_fit_1080p", &comp, image, 0, 16.25, true),
+        ("move_background_fit_4k", &large, image, 0, 16.25, true),
     ] {
         g.bench_function(name, |b| {
-            let mut e = Editor::from_composition(comp.clone(), fonts.clone());
+            let mut e = Editor::from_composition(scene.clone(), fonts.clone());
             let clip = e.screen();
-            let mut presenter = BandPresenter::default();
+            let mut presenter = BandPresenter { fractional_zoom, ..BandPresenter::default() };
             presenter.present(&e, clip);
             e.pointer_down(start);
             assert_eq!(e.selected_index(), Some(index));
