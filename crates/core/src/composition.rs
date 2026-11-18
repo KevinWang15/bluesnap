@@ -250,6 +250,68 @@ pub fn renumber_counters_in(elements: &mut [Element]) {
     }
 }
 
+const MAX_CANVAS_SIDE: u32 = 65_535;
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct CanvasSizeError(u32, u32);
+
+impl std::fmt::Display for CanvasSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unsupported image or canvas dimensions {} × {}", self.0, self.1)
+    }
+}
+
+impl std::error::Error for CanvasSizeError {}
+
+pub fn check_canvas_size(width: u32, height: u32) -> Result<(), CanvasSizeError> {
+    if (1..=MAX_CANVAS_SIDE).contains(&width)
+        && (1..=MAX_CANVAS_SIDE).contains(&height)
+        && u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
+    {
+        Ok(())
+    } else {
+        Err(CanvasSizeError(width, height))
+    }
+}
+
+/// Computes the canvas expansion before changing layers or their undo history.
+pub(crate) struct SlicePlacement {
+    pub canvas: (u32, u32),
+    bounds: Rect,
+    scale_ratio: f32,
+}
+
+impl SlicePlacement {
+    pub fn new(
+        canvas: (u32, u32), scale: f32, elements: &[Element], image: &Pixmap, slice_scale: f32,
+    ) -> Result<Self, CanvasSizeError> {
+        check_canvas_size(image.width(), image.height())?;
+        let k = if slice_scale > 0.0 && slice_scale.is_finite() { scale / slice_scale } else { 1.0 };
+        let width = (image.width() as f32 * k).round().max(1.0);
+        let height = (image.height() as f32 * k).round().max(1.0);
+        let (shift, canvas) = if elements.is_empty() {
+            (0.0, (width as u32, height as u32))
+        } else {
+            let step = (24.0 * scale).round().max(8.0);
+            let n = elements.iter().filter(|e| matches!(e, Element::Image(_))).count();
+            let shift = ((n % 6) as f32).max(1.0) * step;
+            (shift, (canvas.0.max((shift + width).ceil() as u32), canvas.1.max((shift + height).ceil() as u32)))
+        };
+        check_canvas_size(canvas.0, canvas.1)?;
+        Ok(Self { canvas, bounds: Rect::new(shift, shift, width, height), scale_ratio: k })
+    }
+
+    pub fn insert(self, elements: &mut Vec<Element>, image: Pixmap, shapes: Vec<Shape>) -> usize {
+        let index = elements.len();
+        let offset = Point::new(self.bounds.x, self.bounds.y);
+        elements.push(Element::Image(PlacedImage::new(ImageAsset::new(image), self.bounds)));
+        elements.extend(shapes.into_iter().map(|s| Element::Shape(s.scaled(self.scale_ratio).translated(offset))));
+        renumber_counters_in(elements);
+        index
+    }
+}
+
 /// An editable multi-image composition (saved/loaded as `.bs` BSON).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Composition {
@@ -261,54 +323,30 @@ pub struct Composition {
 }
 
 impl Composition {
-    pub fn new_empty(width: u32, height: u32, scale: f32) -> Self {
-        Self {
-            width: width.max(1),
-            height: height.max(1),
+    pub fn new_empty(width: u32, height: u32, scale: f32) -> Result<Self, CanvasSizeError> {
+        let (width, height) = (width.max(1), height.max(1));
+        check_canvas_size(width, height)?;
+        Ok(Self {
+            width,
+            height,
             scale: if scale > 0.0 && scale.is_finite() { scale } else { 1.0 },
             background: Color::rgb(0xFFFFFF),
             elements: Vec::new(),
-        }
+        })
     }
 
-    /// Creates a composition sized to `image`, placing `image` at `(0, 0)` and
-    /// keeping `shapes` as live editable elements on top of it.
-    pub fn from_slice(image: Pixmap, scale: f32, shapes: Vec<Shape>) -> Self {
-        let mut comp = Self::new_empty(image.width(), image.height(), scale);
-        comp.append_slice(image, scale, shapes);
-        comp
+    /// Creates a canvas with the captured image and its editable shapes.
+    pub fn from_slice(image: Pixmap, scale: f32, shapes: Vec<Shape>) -> Result<Self, CanvasSizeError> {
+        let mut comp = Self::new_empty(image.width(), image.height(), scale)?;
+        comp.append_slice(image, scale, shapes)?;
+        Ok(comp)
     }
 
-    /// Appends a captured `image` + `shapes` to the composition, normalizing to
-    /// `self.scale` if captured on a differently-scaled display. Returns the
-    /// index of the newly added [`Element::Image`].
-    pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> usize {
-        let k = if slice_scale > 0.0 && slice_scale.is_finite() { self.scale / slice_scale } else { 1.0 };
-        let img_w = (image.width() as f32 * k).round().max(1.0);
-        let img_h = (image.height() as f32 * k).round().max(1.0);
-
-        let offset = if self.elements.is_empty() {
-            self.width = img_w as u32;
-            self.height = img_h as u32;
-            Point::new(0.0, 0.0)
-        } else {
-            let step = (24.0 * self.scale).round().max(8.0);
-            let n = self.elements.iter().filter(|e| matches!(e, Element::Image(_))).count();
-            let shift = ((n % 6) as f32).max(1.0) * step;
-            let pos = Point::new(shift, shift);
-            self.width = self.width.max((pos.x + img_w).ceil() as u32);
-            self.height = self.height.max((pos.y + img_h).ceil() as u32);
-            pos
-        };
-
-        let asset = ImageAsset::new(image);
-        let img_idx = self.elements.len();
-        self.elements.push(Element::Image(PlacedImage::new(asset, Rect::new(offset.x, offset.y, img_w, img_h))));
-        for shape in shapes {
-            self.elements.push(Element::Shape(shape.scaled(k).translated(offset)));
-        }
-        renumber_counters_in(&mut self.elements);
-        img_idx
+    /// Appends a slice, normalizing its display scale. A size error leaves the composition intact.
+    pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> Result<usize, CanvasSizeError> {
+        let placement = SlicePlacement::new((self.width, self.height), self.scale, &self.elements, &image, slice_scale)?;
+        (self.width, self.height) = placement.canvas;
+        Ok(placement.insert(&mut self.elements, image, shapes))
     }
 
     pub fn bounds(&self) -> Rect {
@@ -326,11 +364,11 @@ mod tests {
 
     #[test]
     fn first_slice_sets_canvas_size_and_second_cascades_and_expands_if_needed() {
-        let mut comp = Composition::from_slice(dummy_pixmap(400, 300), 1.0, Vec::new());
+        let mut comp = Composition::from_slice(dummy_pixmap(400, 300), 1.0, Vec::new()).unwrap();
         assert_eq!((comp.width, comp.height), (400, 300));
         assert_eq!(comp.elements[0].as_image().unwrap().bounds, Rect::new(0.0, 0.0, 400.0, 300.0));
 
-        let idx = comp.append_slice(dummy_pixmap(500, 200), 1.0, Vec::new());
+        let idx = comp.append_slice(dummy_pixmap(500, 200), 1.0, Vec::new()).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(comp.elements[1].as_image().unwrap().bounds, Rect::new(24.0, 24.0, 500.0, 200.0));
         assert_eq!((comp.width, comp.height), (524, 300));

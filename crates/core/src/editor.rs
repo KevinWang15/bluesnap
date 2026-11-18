@@ -141,7 +141,7 @@ impl SaveSnapshot {
             Self::Canvas(comp) => Some(comp),
             Self::Capture { doc, region, outline, shapes, scale } => {
                 let (raw, shapes) = capture_slice(doc, region, outline, shapes)?;
-                Some(Composition::from_slice(raw, scale, shapes))
+                Composition::from_slice(raw, scale, shapes).ok()
             }
         }
     }
@@ -266,8 +266,8 @@ impl Editor {
     }
 
     /// Convenience constructor wrapping a single `Document` in a composition.
-    pub fn for_document(doc: Document, fonts: Arc<Fonts>, scale: f32) -> Self {
-        Self::from_composition(Composition::from_slice(doc.into_pixmap(), scale, Vec::new()), fonts)
+    pub fn for_document(doc: Document, fonts: Arc<Fonts>, scale: f32) -> Result<Self, crate::composition::CanvasSizeError> {
+        Ok(Self::from_composition(Composition::from_slice(doc.into_pixmap(), scale, Vec::new())?, fonts))
     }
 
     /// Appends initial `shapes` without recording an undo step.
@@ -315,25 +315,24 @@ impl Editor {
     /// Appends a captured `image` and its unflattened `shapes` into a canvas
     /// editor as one undoable step, selecting the newly added image.
     pub fn append_slice(&mut self, image: Pixmap, slice_scale: f32, shapes: Vec<Shape>) -> Option<usize> {
+        if !matches!(self.workspace, Workspace::Canvas { .. }) {
+            return None;
+        }
+        // Committing a lone, empty text box will leave an empty canvas.
+        let layers = if self.elements.len() == 1 && self.text_content() == Some("") {
+            &[][..]
+        } else {
+            &self.elements
+        };
+        let placement = crate::composition::SlicePlacement::new(self.canvas_dims(), self.scale, layers, &image, slice_scale).ok()?;
         self.finish_text();
         self.drag = None;
-        let prev = self.current_snapshot();
-        let Workspace::Canvas { width, height, background, backdrop } = &mut self.workspace else {
-            return None;
-        };
-        let mut comp = Composition {
-            width: *width,
-            height: *height,
-            scale: self.scale,
-            background: *background,
-            elements: std::mem::take(&mut self.elements),
-        };
-        let img_idx = comp.append_slice(image, slice_scale, shapes);
-        *width = comp.width;
-        *height = comp.height;
-        self.elements = comp.elements;
-        *backdrop.borrow_mut() = None;
-        self.push_snapshot(prev);
+        self.begin_change();
+        if let Workspace::Canvas { width, height, .. } = &mut self.workspace {
+            (*width, *height) = placement.canvas;
+        }
+        let img_idx = placement.insert(&mut self.elements, image, shapes);
+        self.invalidate_backdrop();
         self.end_change();
         self.tool = None;
         self.selected = Some(img_idx);
@@ -400,6 +399,11 @@ impl Editor {
 
     fn paste_element_at(&mut self, element: Element, position: Point) -> bool {
         if !matches!(self.workspace, Workspace::Canvas { .. }) || self.drag.is_some() {
+            return false;
+        }
+        if let Element::Image(image) = &element
+            && !crate::format::valid_canvas_size(image.asset.width(), image.asset.height())
+        {
             return false;
         }
         let bounds = element.bounds(self.metrics());
@@ -1234,7 +1238,10 @@ impl Editor {
             Drag::CanvasResize { handle, orig, current, start } => {
                 let min_side = (MIN_CANVAS_LOGICAL * content_scale).max(8.0);
                 let r = resize_rect_with_handle(*orig, *handle, p - *start, constrain, min_side);
-                *current = Rect::new(r.x.round(), r.y.round(), r.w.round().max(min_side), r.h.round().max(min_side));
+                let next = Rect::new(r.x.round(), r.y.round(), r.w.round().max(min_side), r.h.round().max(min_side));
+                if crate::format::valid_canvas_size(next.w.round() as u32, next.h.round() as u32) {
+                    *current = next;
+                }
             }
             Drag::Create { idx, start } => {
                 let elem_idx = *idx;
@@ -2233,7 +2240,7 @@ mod tests {
 
     fn document_editor() -> Editor {
         let doc = Document::from_rgba(400, 3000, vec![255; 400 * 3000 * 4]).unwrap();
-        Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0)
+        Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0).unwrap()
     }
 
     #[test]
@@ -2257,6 +2264,33 @@ mod tests {
         let rev = e.static_layer_revision();
         e.pointer_move(Point::new(70.0, 110.0), false);
         assert!(e.static_layer_revision() > rev);
+    }
+
+    #[test]
+    fn oversized_appends_and_resizes_keep_the_original_document_and_undo_history() {
+        let strip = || Pixmap::new(1, 65_530).unwrap();
+        let comp = Composition::from_slice(strip(), 1.0, Vec::new()).unwrap();
+        let mut editor = Editor::from_composition(comp.clone(), Arc::new(Fonts::empty()));
+        assert_eq!(editor.append_slice(strip(), 1.0, vec![]), None);
+        assert_eq!(editor.to_composition().unwrap(), comp);
+        assert!(!editor.can_undo());
+
+        let mut editor = document_editor();
+        let before = editor.to_composition().unwrap();
+        let start = Point::new(400.0 + CANVAS_HANDLE_OFFSET, 1500.0);
+        editor.pointer_down(start);
+        editor.pointer_move(Point::new(70_000.0, start.y), false);
+        assert_eq!(editor.active_canvas_rect(), before.bounds());
+        editor.pointer_up(Point::new(70_000.0, start.y));
+        assert_eq!(editor.to_composition().unwrap(), before);
+        assert!(!editor.can_undo());
+
+        let bytes = crate::format::encode_bs(&comp).unwrap();
+        assert_eq!(crate::format::decode_bs(&bytes).unwrap(), comp);
+        let mut invalid = comp;
+        invalid.height += 24;
+        assert!(crate::format::encode_bs(&invalid).is_err());
+        assert!(Composition::new_empty(32_768, 32_768, 1.0).is_err());
     }
 
     #[test]
@@ -2290,7 +2324,7 @@ mod tests {
             geometry: Geometry::Rect(Rect::new(10.0, 20.0, 30.0, 40.0)),
             style: Style { color: crate::PALETTE[2], size: SizeLevel::Large },
         };
-        let comp = Composition::new_empty(300, 300, 2.0);
+        let comp = Composition::new_empty(300, 300, 2.0).unwrap();
         let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
         let bytes = crate::format::encode_clipboard_element(&Element::Shape(original.clone()), 1.0).unwrap();
         let (element, scale) = crate::format::decode_clipboard_element(&bytes).unwrap();
@@ -2309,7 +2343,7 @@ mod tests {
         let asset = ImageAsset::new(source);
         let bounds = Rect::new(10.0, 20.0, 40.0, 20.0);
         let original = PlacedImage::new(asset.clone(), bounds);
-        let mut comp = Composition::new_empty(100, 80, 1.0);
+        let mut comp = Composition::new_empty(100, 80, 1.0).unwrap();
         comp.elements.push(Element::Image(original));
         let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
         click(&mut editor, 30.0, 30.0);
@@ -2332,7 +2366,7 @@ mod tests {
 
     #[test]
     fn pasting_the_first_bitmap_sizes_the_canvas_and_undo_restores_it() {
-        let mut editor = Editor::from_composition(Composition::new_empty(500, 300, 2.0), Arc::new(Fonts::empty()));
+        let mut editor = Editor::from_composition(Composition::new_empty(500, 300, 2.0).unwrap(), Arc::new(Fonts::empty()));
         assert!(editor.paste_image(Pixmap::new(90, 55).unwrap(), Point::new(200.0, 100.0)));
         assert_eq!(editor.screen(), Rect::new(0.0, 0.0, 90.0, 55.0));
         assert_eq!(editor.elements()[0].as_image().unwrap().bounds, editor.screen());
@@ -2353,7 +2387,7 @@ mod tests {
             style: Style::default(),
         };
         let image = crate::pixels::pixmap_from_rgba(80, 80, [255, 0, 0, 255].repeat(80 * 80)).unwrap();
-        let comp = Composition::from_slice(image, 1.0, vec![mask]);
+        let comp = Composition::from_slice(image, 1.0, vec![mask]).unwrap();
         let mut editor = Editor::from_composition(comp, Arc::new(Fonts::empty()));
         click(&mut editor, 10.0, 10.0);
         assert_eq!(editor.selected_index(), Some(0));
@@ -2644,7 +2678,7 @@ mod tests {
         assert_eq!(shapes.len(), 2);
         assert_eq!(shapes[0].geometry, Geometry::Rect(Rect::new(20.0, 20.0, 40.0, 20.0)));
         let doc = Document::from_rgba(200, 600, vec![255; 200 * 600 * 4]).unwrap();
-        let d = Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0).with_shapes(shapes);
+        let d = Editor::for_document(doc, Arc::new(Fonts::empty()), 1.0).unwrap().with_shapes(shapes);
         assert!(d.has_shapes() && !d.can_undo());
         assert!(d.render_static_layer(d.screen()).is_some());
     }
@@ -2690,7 +2724,7 @@ mod tests {
             let mut e = if run % 2 == 0 {
                 editor()
             } else {
-                let comp = Composition::from_slice(Pixmap::new(400, 300).unwrap(), 1.0, Vec::new());
+                let comp = Composition::from_slice(Pixmap::new(400, 300).unwrap(), 1.0, Vec::new()).unwrap();
                 Editor::from_composition(comp, Arc::new(Fonts::empty()))
             };
             for _ in 0..80 {
@@ -2792,7 +2826,7 @@ mod tests {
     fn shift_locks_aspect_ratio_on_bottom_and_side_dots_for_canvas_and_images_and_cursors_match() {
         let fonts = Arc::new(Fonts::empty());
         let img = Pixmap::new(200, 100).unwrap();
-        let comp = Composition::from_slice(img, 1.0, Vec::new());
+        let comp = Composition::from_slice(img, 1.0, Vec::new()).unwrap();
         let mut e = Editor::from_composition(comp, fonts);
 
         // Check all 8 outer canvas dots report their exact resize cursor (including 4 diagonals).
@@ -2841,7 +2875,7 @@ mod tests {
         use crate::format::{decode_bs, encode_bs};
 
         let fonts = Arc::new(Fonts::empty());
-        let mut comp = Composition::from_slice(Pixmap::new(100, 80).unwrap(), 1.0, Vec::new());
+        let mut comp = Composition::from_slice(Pixmap::new(100, 80).unwrap(), 1.0, Vec::new()).unwrap();
         // Expand canvas to 200x140 with the 100x80 image shifted to (50, 0), leaving left/bottom background space.
         comp.width = 200;
         comp.height = 140;

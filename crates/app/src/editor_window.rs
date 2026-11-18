@@ -52,8 +52,9 @@ pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
     }
     cx.global_mut::<AppState>().editor_hidden = false;
     if let Some((image, shapes)) = pending {
-        let comp = Composition::from_slice(image, scale, shapes);
-        if let Err(e) = open_window_with(comp, display, "bluesnap editor", cx) {
+        let opened = Composition::from_slice(image, scale, shapes).map_err(anyhow::Error::from)
+            .and_then(|comp| open_window_with(comp, display, "bluesnap editor", cx));
+        if let Err(e) = opened {
             log::error!("could not open editor window: {e:#}");
         }
     }
@@ -82,12 +83,12 @@ pub fn open_or_focus(cx: &mut App) {
         .primary_display()
         .and_then(|_| bluesnap_platform::native().notification_area().ok().map(|(d, _)| d.scale_factor))
         .unwrap_or(1.0);
-    let comp = Composition::new_empty(
+    let opened = Composition::new_empty(
         (DEFAULT_EMPTY_CANVAS.0 as f32 * scale).round() as u32,
         (DEFAULT_EMPTY_CANVAS.1 as f32 * scale).round() as u32,
         scale,
-    );
-    if let Err(e) = open_window_with(comp, None, "bluesnap editor", cx) {
+    ).map_err(anyhow::Error::from).and_then(|comp| open_window_with(comp, None, "bluesnap editor", cx));
+    if let Err(e) = opened {
         log::error!("could not open editor window: {e:#}");
     }
 }
@@ -113,6 +114,7 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
     }
 
     let dyn_img = image::open(path).with_context(|| format!("opening image {}", path.display()))?;
+    bluesnap_core::composition::check_canvas_size(dyn_img.width(), dyn_img.height())?;
     let rgba = dyn_img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let pixmap = pixmap_from_straight_rgba(w, h, rgba.into_raw()).context("invalid image dimensions")?;
@@ -142,12 +144,12 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
         }
         if let Some(pixmap) = pending {
             cx.global_mut::<AppState>().editor_hidden = false;
-            let comp = Composition::from_slice(pixmap, 1.0, Vec::new());
+            let comp = Composition::from_slice(pixmap, 1.0, Vec::new())?;
             return open_window_with(comp, None, &title, cx);
         }
     } else {
         cx.global_mut::<AppState>().editor_hidden = false;
-        let comp = Composition::from_slice(pixmap, 1.0, Vec::new());
+        let comp = Composition::from_slice(pixmap, 1.0, Vec::new())?;
         return open_window_with(comp, None, &title, cx);
     }
     Ok(())

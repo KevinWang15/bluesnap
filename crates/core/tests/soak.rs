@@ -176,7 +176,7 @@ fn translated_opaque_backdrop_matches_nearest_shader_at_pixel_centers_and_edges(
 
 #[test]
 fn sparse_redaction_parts_match_a_single_layer_and_skip_empty_pixels() {
-    let mut comp = Composition::from_slice(patterned_pixmap(700, 470, 31), 1.0, Vec::new());
+    let mut comp = Composition::from_slice(patterned_pixmap(700, 470, 31), 1.0, Vec::new()).unwrap();
     for (x, y, effect) in [
         (20.25, 30.5, RedactEffect::Mosaic),
         (90.5, 44.25, RedactEffect::Blur),
@@ -231,7 +231,7 @@ fn live_bands_match_export_across_z_ordered_images_shapes_and_stacked_redactions
     let bottom_img = patterned_pixmap(320, 240, 0xCAFE_BABE);
     let top_magenta = solid_pixmap(100, 90, [220, 20, 180, 255]);
 
-    let mut comp = Composition::new_empty(360, 280, 1.0);
+    let mut comp = Composition::new_empty(360, 280, 1.0).unwrap();
     comp.elements = vec![
         Element::Image(PlacedImage::new(ImageAsset::new(bottom_img), Rect::new(0.0, 0.0, 320.0, 240.0))),
         Element::Shape(Shape {
@@ -293,7 +293,7 @@ fn live_bands_match_export_across_z_ordered_images_shapes_and_stacked_redactions
 
     // Verify viewport-clipped `render_band` on a tall 400x3600 canvas matches unclipped export!
     let tall = patterned_pixmap(400, 3600, 0x1357_9BDF);
-    let mut tall_comp = Composition::from_slice(tall, 1.0, Vec::new());
+    let mut tall_comp = Composition::from_slice(tall, 1.0, Vec::new()).unwrap();
     tall_comp.elements.push(Element::Shape(Shape {
         geometry: Geometry::Redact {
             area: RedactShape::Rect(Rect::new(30.0, 1900.0, 260.0, 400.0)),
@@ -323,7 +323,7 @@ fn zero_rasterization_invariants_for_click_select_new_stroke_and_image_drags() {
     let fonts = test_fonts();
     let img1 = patterned_pixmap(300, 200, 11);
     let img2 = patterned_pixmap(240, 180, 22);
-    let mut comp = Composition::from_slice(img1, 1.0, Vec::new());
+    let mut comp = Composition::from_slice(img1, 1.0, Vec::new()).unwrap();
     comp.width = 800;
     comp.height = 600;
     let mut e = Editor::from_composition(comp, fonts);
@@ -401,7 +401,7 @@ fn long_session_composition_soak_test() {
 
     for session_seed in [0xD1B5_4A32_9E37_79B9u64, 0x94D0_49BB_1331_11EBu64, 0xBF58_476D_1CE4_E5B9u64] {
         let base = patterned_pixmap(240, 180, session_seed as u32);
-        let mut e = Editor::from_composition(Composition::from_slice(base, 1.0, Vec::new()), fonts.clone());
+        let mut e = Editor::from_composition(Composition::from_slice(base, 1.0, Vec::new()).unwrap(), fonts.clone());
         let mut gpu = GpuBandSimulator::default();
 
         let mut seed = session_seed;
@@ -796,7 +796,7 @@ fn adversarial_and_fuzz_bson_and_bs_decoder_soak_test() {
                 style: Style::default(),
             },
         ];
-        Composition::from_slice(img, 1.0, shapes)
+        Composition::from_slice(img, 1.0, shapes).unwrap()
     };
     let valid_bs = encode_bs(&seed_comp).unwrap();
     let fonts = Arc::new(Fonts::empty());

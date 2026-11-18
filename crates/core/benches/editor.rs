@@ -445,7 +445,7 @@ impl BandPresenter {
 /// Multi-image 4K composition with `n_images` screenshots and `n_shapes` mixed annotations.
 fn multi_image_editor(n_images: usize, img_w: u32, img_h: u32, n_shapes: usize) -> Editor {
     let first = pixmap_from_rgba(img_w, img_h, screenshot(img_w, img_h)).unwrap();
-    let mut comp = Composition::from_slice(first, 2.0, Vec::new());
+    let mut comp = Composition::from_slice(first, 2.0, Vec::new()).unwrap();
     comp.width = W4K;
     comp.height = H4K;
     let mut e = Editor::from_composition(comp, fonts());
@@ -536,7 +536,7 @@ fn composition(c: &mut Criterion) {
     // Live Blur redaction on a tall 1600x12000 composition when underlying image moves slightly.
     g.bench_function("live_blur_tall_canvas/1600x12000_small_blur", |b| {
         let tall = pixmap_from_rgba(1600, 12_000, text_page(1600, 12_000)).unwrap();
-        let comp = Composition::from_slice(tall, 2.0, Vec::new());
+        let comp = Composition::from_slice(tall, 2.0, Vec::new()).unwrap();
         let mut e = Editor::from_composition(comp, fonts());
         e.toggle_tool(Tool::Redact);
         e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
@@ -562,7 +562,7 @@ fn composition(c: &mut Criterion) {
     // Cold live Blur redaction after image move on a tall 1600x12000 canvas.
     g.bench_function("live_blur_after_image_move/1600x12000", |b| {
         let tall = pixmap_from_rgba(1600, 12_000, text_page(1600, 12_000)).unwrap();
-        let comp = Composition::from_slice(tall, 2.0, Vec::new());
+        let comp = Composition::from_slice(tall, 2.0, Vec::new()).unwrap();
         let mut e = Editor::from_composition(comp, fonts());
         e.toggle_tool(Tool::Redact);
         e.set_redaction(|r| (r.area, r.effect) = (RedactArea::Rect, RedactEffect::Blur));
@@ -603,7 +603,7 @@ fn bs_format(c: &mut Criterion) {
     // Build a 4-image (4 × 1280x720 noisy screenshots) composition with 30 long pen/highlight strokes.
     let make_scene = || {
         let first = pixmap_from_rgba(1280, 720, screenshot(1280, 720)).unwrap();
-        let mut comp = Composition::from_slice(first, 2.0, Vec::new());
+        let mut comp = Composition::from_slice(first, 2.0, Vec::new()).unwrap();
         comp.width = 2800;
         comp.height = 1800;
         let mut e = Editor::from_composition(comp, fonts());
@@ -645,7 +645,7 @@ fn bs_format(c: &mut Criterion) {
     // Pure vector/stroke serialization benchmark (1 tiny image + 50 strokes × 400 points = 20,000 points).
     let stroke_comp = {
         let tiny = pixmap_from_rgba(16, 16, screenshot(16, 16)).unwrap();
-        let mut comp = Composition::from_slice(tiny, 1.0, Vec::new());
+        let mut comp = Composition::from_slice(tiny, 1.0, Vec::new()).unwrap();
         comp.width = 2400;
         comp.height = 1600;
         let mut e = Editor::from_composition(comp, fonts());
@@ -676,7 +676,7 @@ fn bs_format(c: &mut Criterion) {
 fn mosaic_grid_composition(scale: u32, fonts: &Arc<Fonts>) -> (Composition, Point) {
     let (w, h) = (1920 * scale, 1080 * scale);
     let doc = Document::from_rgba(w, h, screenshot(w, h)).unwrap();
-    let mut editor = Editor::for_document(doc, fonts.clone(), 1.0);
+    let mut editor = Editor::for_document(doc, fonts.clone(), 1.0).unwrap();
     let mut rects = Vec::new();
     for row in 0..8 {
         for col in 0..8 {

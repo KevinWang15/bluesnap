@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn clipped_live_redactions_match_the_export_with_overlapping_filters() {
-        let mut comp = Composition::from_slice(noise_doc(850, 610).into_pixmap(), 1.25, Vec::new());
+        let mut comp = Composition::from_slice(noise_doc(850, 610).into_pixmap(), 1.25, Vec::new()).unwrap();
         for (r, effect, strength) in [
             (Rect::new(245.0, 220.0, 280.0, 190.0), RedactEffect::Mosaic, 0.7),
             (Rect::new(259.0, 250.0, 40.0, 21.0), RedactEffect::Blur, 0.9),

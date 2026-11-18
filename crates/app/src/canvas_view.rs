@@ -209,7 +209,9 @@ impl CanvasView {
 
     /// Appends a newly captured slice into this Editor session.
     pub fn append_slice(&mut self, image: Pixmap, scale: f32, shapes: Vec<Shape>, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor.append_slice(image, scale, shapes);
+        if self.editor.append_slice(image, scale, shapes).is_none() {
+            return self.show_toast(Toast::new(toast::Kind::Error, "Image exceeds the editable canvas limits"), window, cx);
+        }
         self.show_toast(
             Toast::new(toast::Kind::Done, "Added to editor").detail("Drag to arrange, drag handles to resize, or drag canvas edges."),
             window,

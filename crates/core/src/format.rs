@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::bson::{self, Doc, Value};
-use crate::composition::{Composition, Element, ImageAsset, ImageId, PlacedImage};
+use crate::composition::{Composition, Element, ImageAsset, ImageId, MAX_IMAGE_PIXELS, PlacedImage, check_canvas_size};
 use crate::geom::{Point, Rect};
 use crate::pixels::{par_map, pixmap_from_rgba, pixmap_from_straight_rgba, to_rgba_straight};
 use crate::shape::{Geometry, RedactShape, Shape};
@@ -14,15 +14,12 @@ use crate::style::{ArrowStyle, Color, CounterFormat, RedactEffect, SizeLevel, St
 
 const FORMAT_MAGIC: &str = "bluesnap";
 const FORMAT_VERSION: i32 = 1;
-const MAX_CANVAS_SIDE: u32 = 65_535;
-const MAX_IMAGE_PIXELS: u64 = 256 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = (MAX_IMAGE_PIXELS as usize) * 4;
 const MAX_ABS_COORD: f32 = 1_000_000.0;
 
 /// Dimensions that an editable document can store and reopen.
 pub fn valid_canvas_size(width: u32, height: u32) -> bool {
-    (1..=MAX_CANVAS_SIDE).contains(&width) && (1..=MAX_CANVAS_SIDE).contains(&height)
-        && u64::from(width) * u64::from(height) <= MAX_IMAGE_PIXELS
+    check_canvas_size(width, height).is_ok()
 }
 
 #[derive(Debug)]
@@ -62,6 +59,10 @@ fn bad(msg: impl Into<String>) -> FormatError {
 
 /// Encodes `comp` into `.bs` BSON bytes.
 pub fn encode_bs(comp: &Composition) -> Result<Vec<u8>, FormatError> {
+    check_canvas_size(comp.width, comp.height).map_err(|e| bad(e.to_string()))?;
+    if !(0.1..=16.0).contains(&comp.scale) {
+        return Err(bad("invalid canvas scale"));
+    }
     let mut seen: HashMap<ImageId, ()> = HashMap::new();
     let mut unique_assets: Vec<&ImageAsset> = Vec::new();
     for el in &comp.elements {
@@ -101,17 +102,7 @@ pub fn decode_bs(bytes: &[u8]) -> Result<Composition, FormatError> {
     if version != FORMAT_VERSION {
         return Err(bad(format!("unsupported .bs format version {version}")));
     }
-    let width = u32::try_from(root.req_i32("width")?)
-        .ok()
-        .filter(|&w| (1..=MAX_CANVAS_SIDE).contains(&w))
-        .ok_or_else(|| bad("invalid canvas width"))?;
-    let height = u32::try_from(root.req_i32("height")?)
-        .ok()
-        .filter(|&h| (1..=MAX_CANVAS_SIDE).contains(&h))
-        .ok_or_else(|| bad("invalid canvas height"))?;
-    if !valid_canvas_size(width, height) {
-        return Err(bad("canvas dimensions exceed maximum pixel budget"));
-    }
+    let (width, height) = decode_dimensions(&root)?;
     let scale = root.req_f32("scale")?;
     if !(0.1..=16.0).contains(&scale) {
         return Err(bad("invalid canvas scale"));
@@ -155,6 +146,7 @@ pub fn load_bs(path: &Path) -> Result<Composition, FormatError> {
 }
 
 fn encode_image_asset(asset: &ImageAsset) -> Result<Doc, FormatError> {
+    check_canvas_size(asset.width(), asset.height()).map_err(|e| bad(e.to_string()))?;
     let png_bytes = if let Some(cached) = asset.cached_png() {
         cached.to_vec()
     } else {
@@ -180,23 +172,20 @@ fn encode_image_asset(asset: &ImageAsset) -> Result<Doc, FormatError> {
     Ok(d)
 }
 
+fn decode_dimensions(doc: &Doc) -> Result<(u32, u32), FormatError> {
+    let width = u32::try_from(doc.req_i32("width")?).map_err(|_| bad("negative width"))?;
+    let height = u32::try_from(doc.req_i32("height")?).map_err(|_| bad("negative height"))?;
+    check_canvas_size(width, height).map_err(|e| bad(e.to_string()))?;
+    Ok((width, height))
+}
+
 fn decode_image_asset(doc: &Doc) -> Result<ImageAsset, FormatError> {
     let id = u64::try_from(doc.req_i64("id")?).map_err(|_| bad("negative image id"))?;
     decode_image_pixels(doc, ImageId(id))
 }
 
 fn decode_image_pixels(doc: &Doc, id: ImageId) -> Result<ImageAsset, FormatError> {
-    let width = u32::try_from(doc.req_i32("width")?)
-        .ok()
-        .filter(|&w| (1..=MAX_CANVAS_SIDE).contains(&w))
-        .ok_or_else(|| bad("invalid image width"))?;
-    let height = u32::try_from(doc.req_i32("height")?)
-        .ok()
-        .filter(|&h| (1..=MAX_CANVAS_SIDE).contains(&h))
-        .ok_or_else(|| bad("invalid image height"))?;
-    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
-        return Err(bad("image dimensions exceed maximum pixel budget"));
-    }
+    let (width, height) = decode_dimensions(doc)?;
     let encoding = doc.req_str("encoding")?;
     let raw = doc.req_bytes("data")?;
 
@@ -571,7 +560,7 @@ mod tests {
     fn imported_image_alpha_survives_save_and_reopen() {
         let raw = vec![255, 0, 0, 128, 30, 60, 90, 0];
         let image = pixmap_from_straight_rgba(2, 1, raw).unwrap();
-        let comp = Composition::from_slice(image, 1.0, vec![]);
+        let comp = Composition::from_slice(image, 1.0, vec![]).unwrap();
         let restored = decode_bs(&encode_bs(&comp).unwrap()).unwrap();
         let image = restored.elements[0].as_image().unwrap().asset.pixmap();
         assert_eq!(image.data(), &[128, 0, 0, 128, 0, 0, 0, 0]);
@@ -615,7 +604,7 @@ mod tests {
                 style: Style { color: PALETTE[4], size: SizeLevel::Large },
             },
         ];
-        let mut comp = Composition::from_slice(img, 2.0, shapes);
+        let mut comp = Composition::from_slice(img, 2.0, shapes).unwrap();
         comp.width = 640;
         comp.height = 480;
 
@@ -652,7 +641,7 @@ mod tests {
         assert_eq!(shapes1.len(), 1);
 
         // Open Editor from Capture #1: canvas defaults to first image size (120x90).
-        let comp = Composition::from_slice(img1, scale1, shapes1);
+        let comp = Composition::from_slice(img1, scale1, shapes1).unwrap();
         let mut editor = Editor::from_composition(comp, fonts.clone());
         assert_eq!(editor.screen(), Rect::new(0.0, 0.0, 120.0, 90.0));
 
