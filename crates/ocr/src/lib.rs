@@ -203,11 +203,13 @@ impl Engine {
         Ok(RecInferenceOutput { logits, valid_timesteps })
     }
 
-    fn recognize_crop(&self, crop: &image::RgbImage) -> Option<String> {
-        let batch = self.rec_pre.process_images(std::slice::from_ref(crop)).ok()?;
-        let out = self.recognize_batch(&batch).ok()?;
-        let seq = self.rec_post.process(&out).ok()?.into_iter().next()?;
-        (seq.confidence >= MIN_CONFIDENCE && !seq.text.trim().is_empty()).then_some(seq.text)
+    fn recognize_crop(&self, crop: &image::RgbImage) -> anyhow::Result<Option<String>> {
+        let batch = self.rec_pre.process_images(std::slice::from_ref(crop)).map_err(|e| anyhow!("recognition preprocessing: {e}"))?;
+        let out = self.recognize_batch(&batch)?;
+        let sequences = self.rec_post.process(&out).map_err(|e| anyhow!("recognition postprocessing: {e}"))?;
+        Ok(sequences.into_iter().next()
+            .filter(|s| s.confidence >= MIN_CONFIDENCE && !s.text.trim().is_empty())
+            .map(|s| s.text))
     }
 
     fn run(&self, rgb: image::RgbImage, scale: f32) -> anyhow::Result<Vec<Line>> {
@@ -254,18 +256,28 @@ impl Engine {
             })
             .collect();
 
-        let texts: Vec<Option<String>> = match regions.as_slice() {
+        let texts: Vec<anyhow::Result<Option<String>>> = match regions.as_slice() {
             [] => Vec::new(),
             [(crop, _)] => vec![multithread_tract_scope(self.executor.clone(), || self.recognize_crop(crop))],
             _ => self.pool.install(|| regions.par_iter().map(|(crop, _)| self.recognize_crop(crop)).collect()),
         };
 
+        let texts = collect_recognized(texts)?;
         Ok(regions
             .into_iter()
             .zip(texts)
             .filter_map(|((_, (x, y, width, height)), text)| Some(Line { text: text?, x, y, width, height }))
             .collect())
     }
+}
+
+/// Empty or low-confidence regions are normal. A failed inference means the
+/// image was only partially checked and must not be reported as a clean scan.
+fn collect_recognized(results: Vec<anyhow::Result<Option<String>>>) -> anyhow::Result<Vec<Option<String>>> {
+    let total = results.len();
+    let failed = results.iter().filter(|result| result.is_err()).count();
+    results.into_iter().collect::<anyhow::Result<_>>()
+        .with_context(|| format!("OCR failed for {failed} of {total} text regions"))
 }
 
 /// Recognizes text in straight-alpha RGBA pixels. Blocks for a few hundred
@@ -292,4 +304,19 @@ pub fn recognize(width: u32, height: u32, rgba: &[u8], scale: f32) -> anyhow::Re
     let results = warm.engine.run(image, scale);
     warm.last_used = Instant::now();
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_and_failed_regions_have_different_outcomes() {
+        assert_eq!(collect_recognized(vec![Ok(None)]).unwrap(), vec![None]);
+        for results in [vec![Err(anyhow!("inference"))], vec![Ok(Some("line".into())), Err(anyhow!("inference"))]] {
+            let total = results.len();
+            let error = collect_recognized(results).unwrap_err();
+            assert_eq!(format!("{error:#}"), format!("OCR failed for 1 of {total} text regions: inference"));
+        }
+    }
 }
