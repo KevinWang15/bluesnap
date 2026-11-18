@@ -433,6 +433,18 @@ fn blit_opaque_1to1(dst: &mut Pixmap, src: &Pixmap, dx: i64, dy: i64) {
     }
 }
 
+/// A fully covered row or column of an unscaled image can use one nearest
+/// sample offset. Near a half-pixel tie, f32 rounding can change that offset
+/// as the coordinate grows. Let the shader handle those spans and image edges.
+fn covered_sample_offset(delta: f32, span: u32, source_span: f32) -> Option<i64> {
+    if delta > 0.0 || delta + source_span < span as f32 {
+        return None;
+    }
+    let first = (0.5 - delta).floor() as i64;
+    let last = (span as f32 - 0.5 - delta).floor() as i64;
+    (last - first == i64::from(span) - 1).then_some(first)
+}
+
 /// Draws a placed image onto `pixmap` (whose top-left is at canvas `origin`).
 pub fn draw_placed_image(pixmap: &mut Pixmap, placed: &PlacedImage, origin: Point) {
     let src = placed.asset.pixmap();
@@ -445,11 +457,19 @@ pub fn draw_placed_image(pixmap: &mut Pixmap, placed: &PlacedImage, origin: Poin
     if placed.asset.is_opaque()
         && (placed.bounds.w - sw).abs() < 1e-4
         && (placed.bounds.h - sh).abs() < 1e-4
-        && (dx - dx.round()).abs() < 1e-4
-        && (dy - dy.round()).abs() < 1e-4
     {
-        blit_opaque_1to1(pixmap, src, dx.round() as i64, dy.round() as i64);
-        return;
+        if (dx - dx.round()).abs() < 1e-4 && (dy - dy.round()).abs() < 1e-4 {
+            blit_opaque_1to1(pixmap, src, dx.round() as i64, dy.round() as i64);
+            return;
+        }
+        if placed.bounds.w == sw
+            && placed.bounds.h == sh
+            && let Some(sx) = covered_sample_offset(dx, pixmap.width(), sw)
+            && let Some(sy) = covered_sample_offset(dy, pixmap.height(), sh)
+        {
+            blit_opaque_1to1(pixmap, src, -sx, -sy);
+            return;
+        }
     }
     let Some(rect) = tiny_skia::Rect::from_xywh(placed.bounds.x, placed.bounds.y, placed.bounds.w, placed.bounds.h) else {
         return;

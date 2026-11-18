@@ -49,12 +49,12 @@ fn solid_pixmap(w: u32, h: u32, c: [u8; 4]) -> Pixmap {
 }
 
 /// Stateful simulator of `CanvasView::sync_gpu_resources` + `LayerBandPool`:
-/// retains cached `Pixmap`s per `VisualBand::Shapes` slot and ONLY calls
-/// `editor.render_band` when `(revision, range.start, range.end, clip)` changes.
+/// retains cached `Pixmap`s per `VisualBand::Shapes` slot at native zoom and
+/// only renders them again when the revision, range, clip or active state changes.
 /// Catching any missing `touch_shapes()` / `touch_active()` or `CanvasBackdrop`
 /// invalidation bug immediately!
-type BandKey = (u64, usize, usize, [i32; 4]);
-type BandSlot = (Option<BandKey>, Option<(Rect, Pixmap)>);
+type BandKey = (u64, usize, usize, Rect, bool);
+type BandSlot = (Option<BandKey>, Vec<(Rect, Pixmap)>);
 
 #[derive(Default)]
 struct GpuBandSimulator {
@@ -69,21 +69,21 @@ impl GpuBandSimulator {
         let shape_count = bands.iter().filter(|b| matches!(b, VisualBand::Shapes { .. })).count();
         self.slots.truncate(shape_count);
         while self.slots.len() < shape_count {
-            self.slots.push((None, None));
+            self.slots.push((None, Vec::new()));
         }
-        let clip_key = [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32];
         let mut slot_idx = 0;
         let mut rasterized_bytes = 0;
         for band in bands {
             if let VisualBand::Shapes { range, revision, active } = band {
-                let key = (revision, range.start, range.end, clip_key);
+                let key = (revision, range.start, range.end, clip, active);
                 let (cached_key, cached_img) = &mut self.slots[slot_idx];
                 if *cached_key != Some(key) {
                     *cached_key = Some(key);
-                    *cached_img = editor.render_band(range, active, clip);
-                    if let Some((_, p)) = cached_img {
+                    cached_img.clear();
+                    editor.render_band_parts(range, active, clip, true, |r, p| {
                         rasterized_bytes += p.data().len();
-                    }
+                        cached_img.push((r, p));
+                    });
                 }
                 slot_idx += 1;
             }
@@ -108,7 +108,7 @@ impl GpuBandSimulator {
                     draw_placed_image(&mut out, &placed, Point::new(screen.x, screen.y));
                 }
                 VisualBand::Shapes { .. } => {
-                    if let Some((region, layer)) = &self.slots[slot_idx].1 {
+                    for (region, layer) in &self.slots[slot_idx].1 {
                         out.draw_pixmap(
                             (region.x - screen.x).round() as i32,
                             (region.y - screen.y).round() as i32,
@@ -153,6 +153,68 @@ fn assert_pixels_close(live: &Pixmap, exported: &Pixmap, context: &str) {
         bad_at.2,
         bad_at.3,
     );
+}
+
+#[test]
+fn translated_opaque_backdrop_matches_nearest_shader_at_pixel_centers_and_edges() {
+    let mut source = patterned_pixmap(640, 480, 42);
+    let opaque = ImageAsset::new(source.clone());
+    // An unused transparent corner forces the reference through tiny-skia.
+    *source.pixels_mut().last_mut().unwrap() = tiny_skia::PremultipliedColorU8::TRANSPARENT;
+    let reference = ImageAsset::new(source);
+    for (x, y) in [(-3.25, 2.375), (1.5, -0.5), (0.500001, -0.499999), (-0.499999, 0.75), (-17.75, -5.25)] {
+        let bounds = Rect::new(x, y, 640.0, 480.0);
+        for origin in [Point::default(), Point::new(3.0, 7.0), Point::new(233.0, 184.0), Point::new(420.0, 38.0)] {
+            let mut fast = Pixmap::new(256, 129).unwrap();
+            let mut expected = fast.clone();
+            draw_placed_image(&mut fast, &PlacedImage::new(opaque.clone(), bounds), origin);
+            draw_placed_image(&mut expected, &PlacedImage::new(reference.clone(), bounds), origin);
+            assert!(fast == expected, "sampling differs at image ({x}, {y}), backdrop {origin:?}");
+        }
+    }
+}
+
+#[test]
+fn sparse_redaction_parts_match_a_single_layer_and_skip_empty_pixels() {
+    let mut comp = Composition::from_slice(patterned_pixmap(700, 470, 31), 1.0, Vec::new());
+    for (x, y, effect) in [
+        (20.25, 30.5, RedactEffect::Mosaic),
+        (90.5, 44.25, RedactEffect::Blur),
+        (430.75, 350.5, RedactEffect::Mosaic),
+        (492.25, 362.75, RedactEffect::Blur),
+    ] {
+        comp.elements.push(Element::Shape(Shape {
+            geometry: Geometry::Redact { area: RedactShape::Rect(Rect::new(x, y, 150.0, 60.0)), effect, strength: 0.6 },
+            style: Style::default(),
+        }));
+    }
+    let editor = Editor::from_composition(comp, test_fonts());
+    for clip in [editor.screen(), Rect::new(72.0, 55.0, 520.0, 360.0)] {
+        let (bounds, expected) = editor.render_band(1..5, false, clip).unwrap();
+        let mut actual = Pixmap::new(expected.width(), expected.height()).unwrap();
+        let mut sizes = Vec::new();
+        editor.render_band_parts(1..5, false, clip, true, |rect, image| {
+            sizes.push(image.data().len());
+            actual.draw_pixmap(
+                (rect.x - bounds.x) as i32,
+                (rect.y - bounds.y) as i32,
+                image.as_ref(),
+                &tiny_skia::PixmapPaint::default(),
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        });
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes.iter().sum::<usize>() < expected.data().len() / 2);
+        assert!(actual == expected);
+        let mut count = 0;
+        editor.render_band_parts(1..5, false, clip, false, |r, image| {
+            count += 1;
+            assert_eq!(r, bounds);
+            assert!(image == expected);
+        });
+        assert_eq!(count, 1);
+    }
 }
 
 #[test]

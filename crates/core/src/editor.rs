@@ -1639,6 +1639,59 @@ impl Editor {
         self.active_revision
     }
 
+    fn rectangular_redaction_bounds(&self, range: Range<usize>) -> Option<Rect> {
+        let rect = |element: &Element| match &element.as_shape()?.geometry {
+            Geometry::Redact { area: RedactShape::Rect(r), .. } => Some(*r),
+            _ => None,
+        };
+        let (first, rest) = self.elements.get(range)?.split_first()?;
+        let bounds = rest.iter().try_fold(rect(first)?, |bounds, el| Some(bounds.union(&rect(el)?)))?;
+        // Include the same antialiasing gutter as render_shapes.
+        Some(bounds.inflate(1.0).round_out())
+    }
+
+    /// Rasterize disjoint groups of rectangular redactions separately when it
+    /// reduces the upload. The frontend can opt in when texture placement maps
+    /// canvas pixels to whole device pixels, preserving sampling across groups.
+    pub fn render_band_parts(
+        &self,
+        range: Range<usize>,
+        active: bool,
+        clip: Rect,
+        split: bool,
+        mut emit: impl FnMut(Rect, Pixmap),
+    ) {
+        if split && !active && self.selection_mode() == SelectionMode::Canvas {
+            if let Some(visible) = clip.round_out().intersect(&self.active_canvas_rect()) {
+                self.render_sparse_band(range, visible, &mut emit);
+            }
+        } else if let Some((rect, pixmap)) = self.render_band(range, active, clip) {
+            emit(rect, pixmap);
+        }
+    }
+
+    fn render_sparse_band(&self, range: Range<usize>, clip: Rect, emit: &mut impl FnMut(Rect, Pixmap)) {
+        // Balance another texture and draw call against unused BGRA upload bytes.
+        const MIN_SAVED_PIXELS: f32 = 128.0 * 128.0;
+        if range.len() >= 2 {
+            let mid = range.start + range.len() / 2;
+            if let Some(a) = self.rectangular_redaction_bounds(range.start..mid).and_then(|r| r.intersect(&clip))
+                && let Some(b) = self.rectangular_redaction_bounds(mid..range.end).and_then(|r| r.intersect(&clip))
+                && a.intersect(&b).is_none()
+            {
+                let whole = a.union(&b);
+                if whole.w * whole.h - a.w * a.h - b.w * b.h >= MIN_SAVED_PIXELS {
+                    self.render_sparse_band(range.start..mid, clip, emit);
+                    self.render_sparse_band(mid..range.end, clip, emit);
+                    return;
+                }
+            }
+        }
+        if let Some((rect, pixmap)) = self.render_band(range, false, clip) {
+            emit(rect, pixmap);
+        }
+    }
+
     /// Z-ordered GPU rendering bands: placed images are drawn directly by GPUI,
     /// while contiguous runs of shapes are rasterized into cached GPU layers.
     pub fn visual_bands(&self) -> Vec<VisualBand> {

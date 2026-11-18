@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bluesnap_core::render::to_bgra_straight;
-use bluesnap_core::{ImageAsset, ImageId, Pixmap, Rect as PxRect};
+use bluesnap_core::{Editor, ImageAsset, ImageId, Pixmap, Rect as PxRect};
 use gpui::{Bounds, Corners, Pixels, RenderImage, Window};
 
 use crate::viewport::Viewport;
@@ -135,41 +135,45 @@ pub fn paint_tiles(tiles: Vec<(Bounds<Pixels>, Arc<RenderImage>)>, window: &mut 
     }
 }
 
-/// One annotation layer band on the GPU, tagged with `(revision, start, end, clip)`.
+#[derive(PartialEq)]
+pub struct LayerKey {
+    pub revision: u64,
+    pub range: Range<usize>,
+    pub active: bool,
+    pub clip: PxRect,
+    pub split: bool,
+}
+
+/// Textures for a cached run of annotation shapes, in stacking order.
 #[derive(Default)]
 pub struct LayerCache {
-    key: Option<(u64, usize, usize, [i32; 4])>,
-    image: Option<(PxRect, Arc<RenderImage>)>,
+    key: Option<LayerKey>,
+    images: Vec<(PxRect, Arc<RenderImage>)>,
 }
 
 impl LayerCache {
     pub fn sync(
         &mut self,
-        revision: u64,
-        range: Range<usize>,
-        clip: PxRect,
-        render: impl FnOnce() -> Option<(PxRect, Pixmap)>,
+        editor: &Editor,
+        key: LayerKey,
         window: &mut Window,
-    ) {
-        let key = (revision, range.start, range.end, [clip.x as i32, clip.y as i32, clip.w as i32, clip.h as i32]);
-        if self.key == Some(key) {
-            return;
+    ) -> &[(PxRect, Arc<RenderImage>)] {
+        if self.key.as_ref() != Some(&key) {
+            self.drop_image(window);
+            editor.render_band_parts(key.range.clone(), key.active, key.clip, key.split, |rect, pixmap| {
+                if let Some(image) = pixmap_image(&pixmap) {
+                    self.images.push((rect, image));
+                }
+            });
+            self.key = Some(key);
         }
-        self.key = Some(key);
-        let new = render().and_then(|(rect, pixmap)| Some((rect, pixmap_image(&pixmap)?)));
-        if let Some((_, old)) = std::mem::replace(&mut self.image, new) {
-            window.drop_image(old).ok();
-        }
-    }
-
-    pub fn image(&self) -> Option<&(PxRect, Arc<RenderImage>)> {
-        self.image.as_ref()
+        &self.images
     }
 
     pub fn drop_image(&mut self, window: &mut Window) {
         self.key = None;
-        if let Some((_, old)) = self.image.take() {
-            window.drop_image(old).ok();
+        for (_, image) in self.images.drain(..) {
+            window.drop_image(image).ok();
         }
     }
 }

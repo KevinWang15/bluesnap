@@ -25,7 +25,7 @@ use gpui::{
 
 use crate::AppState;
 use crate::capture::{CaptureMode, CapturedSlice};
-use crate::gpu_image::{ImageAtlasCache, ImageTiles, LayerBandPool, paint_tiles};
+use crate::gpu_image::{ImageAtlasCache, ImageTiles, LayerBandPool, LayerKey, paint_tiles};
 use crate::output::{self, Finish};
 use crate::text_field::{byte_to_utf16, range_from_utf16, range_to_utf16, truncate_chars, utf16_to_byte};
 use crate::toast::{self, Toast};
@@ -318,6 +318,10 @@ impl CanvasView {
 
     fn sync_gpu_resources(&mut self, window: &mut Window) -> Vec<SceneBand> {
         let clip = self.layer_clip(window);
+        // GPUI snaps each sprite's origin and size to device pixels. At a
+        // fractional zoom, a single texture preserves the band's sampling grid.
+        let device_zoom = f64::from(self.viewport.zoom) * f64::from(window.scale_factor());
+        let split = device_zoom.fract() == 0.0;
         let window_bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         let bands = self.editor.visual_bands();
 
@@ -352,11 +356,9 @@ impl CanvasView {
                     }
                 }
                 VisualBand::Shapes { range, revision, active } => {
-                    let e = &self.editor;
-                    let r_clone = range.clone();
+                    let key = LayerKey { revision, range, active, clip, split };
                     let cache = self.layers.get_mut(shape_slot);
-                    cache.sync(revision, range, clip, || e.render_band(r_clone, active, clip), window);
-                    if let Some((r, img)) = cache.image() {
+                    for (r, img) in cache.sync(&self.editor, key, window) {
                         out.push(SceneBand::Layer(self.viewport.to_window(*r), img.clone()));
                     }
                     shape_slot += 1;
