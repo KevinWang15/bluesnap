@@ -846,6 +846,7 @@ dependencies = [
  "criterion",
  "memmap2",
  "png 0.18.1",
+ "tempfile",
  "tiny-skia 0.12.0",
 ]
 

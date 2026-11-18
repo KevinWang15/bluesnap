@@ -144,16 +144,7 @@ pub fn decode_bs(bytes: &[u8]) -> Result<Composition, FormatError> {
 /// Atomically writes `comp` to `path` in `.bs` BSON format.
 pub fn save_bs(comp: &Composition, path: &Path) -> Result<(), FormatError> {
     let bytes = encode_bs(comp)?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    write_private_or_normal(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
+    crate::atomic_file::write(path, &bytes)?;
     Ok(())
 }
 
@@ -161,21 +152,6 @@ pub fn save_bs(comp: &Composition, path: &Path) -> Result<(), FormatError> {
 pub fn load_bs(path: &Path) -> Result<Composition, FormatError> {
     let bytes = std::fs::read(path)?;
     decode_bs(&bytes)
-}
-
-fn write_private_or_normal(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, bytes)
-    }
 }
 
 fn encode_image_asset(asset: &ImageAsset) -> Result<Doc, FormatError> {

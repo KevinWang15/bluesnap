@@ -5,6 +5,7 @@
 //! `.bs` BSON file format ([`format`]), annotation shapes, layout helpers, and
 //! the CPU rasterizer.
 
+pub mod atomic_file;
 pub mod bson;
 pub mod composition;
 pub mod editor;

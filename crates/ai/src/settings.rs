@@ -70,30 +70,9 @@ impl AiSettings {
 
     /// Writes `path`, readable only by the user since it holds API tokens.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        write_private(&tmp, json.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        let json = serde_json::to_vec_pretty(self)?;
+        bluesnap_core::atomic_file::write(path, &json).with_context(|| format!("writing {}", path.display()))
     }
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    // `mode(0o600)` only applies on creation; tighten existing `.tmp` files too.
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    f.write_all(data)
-}
-
-/// On Windows the per-user config directory is already private to the user.
-#[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, data)
 }
 
 #[cfg(test)]
@@ -124,7 +103,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Even when a stale `.tmp` file had wide permissions, `save` tightens it to 0600.
+            // A stale staging file from an older version cannot change the new file’s mode.
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, b"stale").unwrap();
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
