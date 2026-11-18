@@ -155,22 +155,31 @@ impl EffectCache {
     }
 }
 
-fn effect_sample_bounds(canvas_size: (u32, u32), effect: RedactEffect, amount: u32, rect: [u32; 4]) -> Option<[u32; 4]> {
+/// Source pixels needed for a pixel-aligned effect output area inside the canvas.
+pub(crate) fn effect_sample_bounds(canvas_size: (u32, u32), effect: RedactEffect, amount: u32, area: Rect) -> Option<Rect> {
     let (w, h) = canvas_size;
-    let [tx0, ty0, tx1, ty1] = rect;
-    match effect {
-        // Blocks on one global grid anchored at canvas `(0, 0)`.
+    let (x0, y0, x1, y1) = (area.x as u32, area.y as u32, area.right() as u32, area.bottom() as u32);
+    let [l, t, r, b] = match effect {
         RedactEffect::Mosaic => {
-            let amount = amount.max(1);
-            let snap = |v: u32| (v / amount) * amount;
-            let up = |v: u32, max: u32| (v.div_ceil(amount) * amount).min(max);
-            Some([snap(tx0), snap(ty0), up(tx1, w), up(ty1, h)])
+            let block = amount.max(1);
+            let down = |v: u32| v / block * block;
+            let up = |v: u32, max: u32| (v.div_ceil(block) * block).min(max);
+            [down(x0), down(y0), up(x1, w), up(y1, h)]
         }
         RedactEffect::Blur => {
             let m = blur_margin(amount as f32 / 2.0) as u32;
-            Some([tx0.saturating_sub(m), ty0.saturating_sub(m), (tx1 + m).min(w), (ty1 + m).min(h)])
+            [x0.saturating_sub(m), y0.saturating_sub(m), (x1 + m).min(w), (y1 + m).min(h)]
         }
-        RedactEffect::Gray => None,
+        RedactEffect::Gray => return None,
+    };
+    Some(Rect::from_edges(l as f32, t as f32, r as f32, b as f32))
+}
+
+fn apply_effect(source: &Pixmap, effect: RedactEffect, amount: u32) -> Pixmap {
+    match effect {
+        RedactEffect::Mosaic => pixelate(source, amount),
+        RedactEffect::Blur => gaussian_blur(source, amount as f32 / 2.0),
+        RedactEffect::Gray => unreachable!("solid fill does not sample pixels"),
     }
 }
 
@@ -184,16 +193,12 @@ fn effect_tile_at(
     amount: u32,
     tile: Rect,
 ) -> Option<Pixmap> {
-    let (tx0, ty0, tx1, ty1) = (tile.x as u32, tile.y as u32, tile.right() as u32, tile.bottom() as u32);
-    let [sx0, sy0, sx1, sy1] = effect_sample_bounds(canvas_size, effect, amount, [tx0, ty0, tx1, ty1])?;
-    let lx0 = sx0.checked_sub(origin.0)?;
-    let ly0 = sy0.checked_sub(origin.1)?;
-    let source = crop(image, lx0, ly0, sx1.checked_sub(sx0)?, sy1.checked_sub(sy0)?)?;
-    let done = match effect {
-        RedactEffect::Mosaic => pixelate(&source, amount),
-        _ => gaussian_blur(&source, amount as f32 / 2.0),
-    };
-    crop(&done, tx0 - sx0, ty0 - sy0, tx1 - tx0, ty1 - ty0)
+    let sample = effect_sample_bounds(canvas_size, effect, amount, tile)?;
+    let sx = (sample.x as u32).checked_sub(origin.0)?;
+    let sy = (sample.y as u32).checked_sub(origin.1)?;
+    let source = crop(image, sx, sy, sample.w as u32, sample.h as u32)?;
+    let done = apply_effect(&source, effect, amount);
+    crop(&done, (tile.x - sample.x) as u32, (tile.y - sample.y) as u32, tile.w as u32, tile.h as u32)
 }
 
 /// IME composition underline for a text shape: (index into the rendered shapes, byte range in its content).
@@ -238,7 +243,7 @@ const BACKDROP_PAD: u32 = 256;
 /// redactions on multi-image and very tall canvases.
 pub struct CanvasBackdrop {
     upto: usize,
-    rect: [u32; 4],
+    rect: Rect,
     pixmap: Pixmap,
     effects: EffectCache,
 }
@@ -259,106 +264,86 @@ impl CanvasBackdrop {
         amount: u32,
         area: Rect,
     ) -> Option<(Pixmap, (u32, u32))> {
-        let needed = effect_source_rect(canvas_size, elements_below, m, effect, amount, area)?;
+        let canvas = Rect::new(0.0, 0.0, canvas_size.0 as f32, canvas_size.1 as f32);
+        let area = area.round_out().intersect(&canvas)?;
+        // Compute text-sized redactions directly when their entire source
+        // (including complete mosaic blocks or a blur halo) is smaller than one tile.
+        let source = effect_sample_bounds(canvas_size, effect, amount, area)?;
+        if source.w * source.h < (EFFECT_TILE * EFFECT_TILE) as f32 {
+            let pixels = render_backdrop_region(canvas_size, background, elements_below, m, source)?;
+            return Some((apply_effect(&pixels, effect, amount), (source.x as u32, source.y as u32)));
+        }
+
+        let tile = EFFECT_TILE as f32;
+        let snap = |r: Rect, step: f32| {
+            Rect::from_edges(
+                (r.x / step).floor() * step,
+                (r.y / step).floor() * step,
+                (r.right() / step).ceil() * step,
+                (r.bottom() / step).ceil() * step,
+            )
+        };
+        let tiled = snap(area, tile).intersect(&canvas)?;
+        let needed = effect_sample_bounds(canvas_size, effect, amount, tiled)?;
         let upto = elements_below.len();
-        if let Some(b) = slot.as_mut()
-            && b.upto == upto
-        {
-            if b.rect[0] > needed[0] || b.rect[1] > needed[1] || b.rect[2] < needed[2] || b.rect[3] < needed[3] {
-                let padded = expand_backdrop_rect(needed, canvas_size);
-                b.pixmap = render_backdrop_region(canvas_size, background, elements_below, m, padded)?;
-                b.rect = padded;
-            }
-            return b.effects.region_at(&b.pixmap, (b.rect[0], b.rect[1]), canvas_size, effect, amount, area);
+        if slot.as_ref().is_none_or(|b| b.upto != upto || b.rect.intersect(&needed) != Some(needed)) {
+            let pad = BACKDROP_PAD as f32;
+            let rect = snap(needed.inflate(pad), pad).intersect(&canvas)?;
+            let pixmap = render_backdrop_region(canvas_size, background, elements_below, m, rect)?;
+            // Tiles for the same prefix remain valid as the viewport moves.
+            let effects = slot.take().filter(|b| b.upto == upto).map(|b| b.effects).unwrap_or_default();
+            *slot = Some(Self { upto, rect, pixmap, effects });
         }
-        let padded = expand_backdrop_rect(needed, canvas_size);
-        let pixmap = render_backdrop_region(canvas_size, background, elements_below, m, padded)?;
-        let b = slot.insert(Self { upto, rect: padded, pixmap, effects: EffectCache::default() });
-        b.effects.region_at(&b.pixmap, (b.rect[0], b.rect[1]), canvas_size, effect, amount, area)
+        let b = slot.as_ref()?;
+        b.effects.region_at(&b.pixmap, (b.rect.x as u32, b.rect.y as u32), canvas_size, effect, amount, area)
     }
 }
 
-fn expand_backdrop_rect(r: [u32; 4], canvas_size: (u32, u32)) -> [u32; 4] {
-    let (cw, ch) = canvas_size;
-    let x0 = (r[0].saturating_sub(BACKDROP_PAD) / BACKDROP_PAD) * BACKDROP_PAD;
-    let y0 = (r[1].saturating_sub(BACKDROP_PAD) / BACKDROP_PAD) * BACKDROP_PAD;
-    let x1 = (r[2].saturating_add(BACKDROP_PAD).div_ceil(BACKDROP_PAD) * BACKDROP_PAD).min(cw);
-    let y1 = (r[3].saturating_add(BACKDROP_PAD).div_ceil(BACKDROP_PAD) * BACKDROP_PAD).min(ch);
-    [x0, y0, x1.max(x0.saturating_add(1)).min(cw), y1.max(y0.saturating_add(1)).min(ch)]
-}
-
-fn effect_source_rect(
-    canvas_size: (u32, u32),
-    elements_below: &[Element],
-    m: Metrics,
-    effect: RedactEffect,
-    amount: u32,
-    area: Rect,
-) -> Option<[u32; 4]> {
-    let (cw, ch) = (canvas_size.0.max(1), canvas_size.1.max(1));
-    let area = area.round_out().intersect(&Rect::new(0.0, 0.0, cw as f32, ch as f32))?;
-    let c0 = area.x as u32 / EFFECT_TILE;
-    let c1 = (area.right() as u32).div_ceil(EFFECT_TILE);
-    let r0 = area.y as u32 / EFFECT_TILE;
-    let r1 = (area.bottom() as u32).div_ceil(EFFECT_TILE);
-    let tiled = [c0 * EFFECT_TILE, r0 * EFFECT_TILE, (c1 * EFFECT_TILE).min(cw), (r1 * EFFECT_TILE).min(ch)];
-    let mut needed = effect_sample_bounds((cw, ch), effect, amount, tiled)?;
-    for el in elements_below.iter().rev() {
-        if let Element::Shape(shape) = el
-            && let Geometry::Redact { effect: e2 @ (RedactEffect::Mosaic | RedactEffect::Blur), strength, .. } =
-                shape.geometry
-        {
-            let cur = Rect::from_edges(needed[0] as f32, needed[1] as f32, needed[2] as f32, needed[3] as f32);
-            if shape.bounds(m).intersect(&cur).is_some()
-                && let Some(expanded) = effect_sample_bounds((cw, ch), e2, e2.amount(strength, m.scale), needed)
-            {
-                needed = expanded;
-            }
-        }
-    }
-    Some(needed)
-}
-
+/// Composite just the requested source pixels. Walk backwards to include the
+/// blocks/halos read by overlapping lower effects, then paint in stacking order.
 fn render_backdrop_region(
     canvas_size: (u32, u32),
     background: Color,
     elements_below: &[Element],
     m: Metrics,
-    rect: [u32; 4],
+    rect: Rect,
 ) -> Option<Pixmap> {
-    let [rx0, ry0, rx1, ry1] = rect;
-    let (rw, rh) = (rx1.checked_sub(rx0)?, ry1.checked_sub(ry0)?);
-    let mut sub = Pixmap::new(rw.max(1), rh.max(1))?;
+    let mut needed = rect;
+    let mut visible = Vec::new();
+    for el in elements_below.iter().rev() {
+        let Some(area) = el.bounds(m).round_out().intersect(&needed) else { continue };
+        let mut sample = None;
+        if let Element::Shape(Shape { geometry: Geometry::Redact { effect, strength, .. }, .. }) = el
+            && let Some(source) = effect_sample_bounds(canvas_size, *effect, effect.amount(*strength, m.scale), area)
+        {
+            needed = needed.union(&source);
+            sample = Some(source);
+        }
+        visible.push((el, sample));
+    }
+    let mut sub = Pixmap::new(needed.w as u32, needed.h as u32)?;
     sub.fill(tiny_skia::Color::from_rgba8(background.r, background.g, background.b, background.a));
-    let view = Rect::from_edges(rx0 as f32, ry0 as f32, rx1 as f32, ry1 as f32);
-    let origin = Point::new(rx0 as f32, ry0 as f32);
+    let origin = Point::new(needed.x, needed.y);
     let ts = Transform::from_translate(-origin.x, -origin.y);
-    for el in elements_below {
+    for (el, sample) in visible.into_iter().rev() {
         match el {
-            Element::Image(placed) => {
-                if placed.bounds.intersect(&view).is_some() {
-                    draw_placed_image(&mut sub, placed, origin);
-                }
-            }
+            Element::Image(placed) => draw_placed_image(&mut sub, placed, origin),
             Element::Shape(shape) => {
-                let sb = shape.bounds(m);
-                if sb.intersect(&view).is_none() {
-                    continue;
-                }
-                let nested_region = match &shape.geometry {
-                    Geometry::Redact { effect, strength, .. } if *effect != RedactEffect::Gray => {
-                        let amount = effect.amount(*strength, m.scale);
-                        sb.intersect(&view).and_then(|vis| {
-                            EffectCache::default().region_at(&sub, (rx0, ry0), canvas_size, *effect, amount, vis)
-                        })
-                    }
-                    _ => None,
-                };
-                draw_shape_with(&mut sub, shape, m, ts, |_, _, _| nested_region);
+                let source = sample.and_then(|r| {
+                    crop(&sub, (r.x - origin.x) as u32, (r.y - origin.y) as u32, r.w as u32, r.h as u32)
+                        .map(|p| (p, (r.x as u32, r.y as u32)))
+                });
+                draw_shape_with(&mut sub, shape, m, ts, |effect, amount, _| {
+                    source.map(|(p, xy)| (apply_effect(&p, effect, amount), xy))
+                });
             }
         }
     }
-    Some(sub)
+    if needed == rect {
+        Some(sub)
+    } else {
+        crop(&sub, (rect.x - origin.x) as u32, (rect.y - origin.y) as u32, rect.w as u32, rect.h as u32)
+    }
 }
 
 /// Renders indexed `shapes` onto a transparent pixmap covering `region` on a
@@ -942,6 +927,37 @@ mod tests {
             let (part, (px0, py0)) = d.effect_region(effect, amount, Rect::new(300.0, 300.0, 10.0, 10.0)).unwrap();
             assert_eq!((px0, py0), (256, 256));
             assert_eq!(part.pixel(50, 50), whole.pixel(306, 306));
+        }
+    }
+
+    #[test]
+    fn clipped_live_redactions_match_the_export_with_overlapping_filters() {
+        let mut comp = Composition::from_slice(noise_doc(850, 610).into_pixmap(), 1.25, Vec::new());
+        for (r, effect, strength) in [
+            (Rect::new(245.0, 220.0, 280.0, 190.0), RedactEffect::Mosaic, 0.7),
+            (Rect::new(259.0, 250.0, 40.0, 21.0), RedactEffect::Blur, 0.9),
+            (Rect::new(251.0, 242.0, 60.0, 30.0), RedactEffect::Mosaic, 0.35),
+            (Rect::new(279.0, 257.0, 590.0, 370.0), RedactEffect::Blur, 0.6),
+        ] {
+            comp.elements.push(Element::Shape(Shape {
+                geometry: Geometry::Redact { area: RedactShape::Rect(r), effect, strength },
+                style: Tool::Redact.default_style(),
+            }));
+        }
+        let fonts = Fonts::empty();
+        let expected = render_composition(&comp, &fonts).unwrap();
+        let shapes: Vec<_> = comp.elements.iter().enumerate().filter_map(|(i, el)| Some((i, el.as_shape()?))).collect();
+        let cache = RefCell::default();
+        for clip in [comp.bounds(), Rect::new(252.0, 246.0, 56.0, 27.0), Rect::new(645.0, 472.0, 205.0, 138.0)] {
+            let overlay = render_canvas_layer(
+                (comp.width, comp.height), comp.background, &comp.elements, &cache, clip, &shapes,
+                Metrics { scale: comp.scale, fonts: &fonts }, None,
+            ).unwrap();
+            let image = comp.elements[0].as_image().unwrap().asset.pixmap();
+            let mut preview = crop(image, clip.x as u32, clip.y as u32, clip.w as u32, clip.h as u32).unwrap();
+            preview.draw_pixmap(0, 0, overlay.as_ref(), &Default::default(), Transform::identity(), None);
+            let reference = crop(&expected, clip.x as u32, clip.y as u32, clip.w as u32, clip.h as u32).unwrap();
+            assert!(preview.data() == reference.data(), "preview differs from export at {clip:?}");
         }
     }
 
