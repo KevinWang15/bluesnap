@@ -672,5 +672,74 @@ fn bs_format(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, startup, frames, output, redaction, tools, scrolling, composition, bs_format);
+/// Frame costs for editing a grid of small mosaics over a generated image.
+fn mosaic_grid(c: &mut Criterion) {
+    let (w, h) = (1920, 1080);
+    let doc = Document::from_rgba(w, h, screenshot(w, h)).unwrap();
+    let fonts = Arc::new(Fonts::empty());
+    let mut editor = Editor::for_document(doc, fonts.clone(), 1.0);
+    let mut rects = Vec::new();
+    for row in 0..8 {
+        for col in 0..8 {
+            rects.push(Rect::new(128.0 + col as f32 * 208.0, 96.0 + row as f32 * 120.0, 96.0, 32.0));
+        }
+    }
+    editor.set_redaction(|r| r.effect = RedactEffect::Mosaic);
+    assert_eq!(editor.add_redactions(&rects), rects.len());
+    let comp = editor.to_composition().unwrap();
+    let mosaic = rects[0].center();
+    let image = Point::new(32.0, 32.0);
+    let mut g = c.benchmark_group("mosaic_grid");
+    g.sample_size(10);
+    g.bench_function("first_frame", |b| {
+        b.iter_batched(
+            || Editor::from_composition(comp.clone(), fonts.clone()),
+            |e| black_box(BandPresenter::default().present(&e, e.screen())),
+            BatchSize::LargeInput,
+        );
+    });
+    for (name, start, index, step) in [
+        ("move_mosaic", mosaic, 1, 16.0),
+        ("move_background", image, 0, 16.0),
+        ("move_background_subpixel", image, 0, 16.25),
+    ] {
+        g.bench_function(name, |b| {
+            let mut e = Editor::from_composition(comp.clone(), fonts.clone());
+            let clip = e.screen();
+            let mut presenter = BandPresenter::default();
+            presenter.present(&e, clip);
+            e.pointer_down(start);
+            assert_eq!(e.selected_index(), Some(index));
+            let mut offset = step;
+            e.pointer_move(start + Point::new(offset, 0.0), false);
+            presenter.present(&e, clip);
+            b.iter(|| {
+                offset = -offset;
+                e.pointer_move(start + Point::new(offset, 0.0), false);
+                black_box(presenter.present(&e, clip))
+            });
+        });
+    }
+    g.bench_function("adjust_redaction_strength", |b| {
+        let mut e = Editor::from_composition(comp.clone(), fonts.clone());
+        let clip = e.screen();
+        let mut presenter = BandPresenter::default();
+        e.pointer_down(mosaic);
+        e.pointer_up(mosaic);
+        assert_eq!(e.selected_index(), Some(1));
+        e.begin_continuous_edit();
+        let mut strength = 0.25;
+        e.set_redaction(|r| r.strength = strength);
+        presenter.present(&e, clip);
+        b.iter(|| {
+            strength = 1.0 - strength;
+            e.set_redaction(|r| r.strength = strength);
+            black_box(presenter.present(&e, clip))
+        });
+        e.end_continuous_edit();
+    });
+    g.finish();
+}
+
+criterion_group!(benches, startup, frames, output, redaction, tools, scrolling, composition, bs_format, mosaic_grid);
 criterion_main!(benches);
