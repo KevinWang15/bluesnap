@@ -265,6 +265,13 @@ class Rec:
             self.mouse((start[0] + (p[0] - start[0]) * t, start[1] + (p[1] - start[1]) * t))
             self.frame(40)
 
+    def switch_window(self, win):
+        """Switches target window while keeping the cursor at the same screen pixel."""
+        abs_x = self.pos[0] + self.win.x
+        abs_y = self.pos[1] + self.win.y
+        self.win = win
+        self.pos = (abs_x - win.x, abs_y - win.y)
+
     def click(self, p=None, ms=500):
         if p:
             self.goto(p, ms)
@@ -272,6 +279,14 @@ class Rec:
         time.sleep(0.05)
         run("xdotool", "mouseup", "1")
         self.frame(160)
+
+    def right_click(self, p=None, ms=500):
+        if p:
+            self.goto(p, ms)
+        run("xdotool", "mousedown", "3")
+        time.sleep(0.05)
+        run("xdotool", "mouseup", "3")
+        self.frame(180)
 
     def drag(self, a, b, ms=700, path=None):
         """Press at `a`, move to `b` (through `path` points if given), release."""
@@ -300,12 +315,15 @@ class Rec:
 
     def rect(self, name, window="capture"):
         """Bounds of a named control (see crates/app/src/demo.rs), relative to `win`."""
-        scale, controls = self.app.controls(window)
-        if name not in controls:
-            raise KeyError(f"{name} not in {sorted(controls)}")
-        r = tuple(v * scale for v in controls[name])
-        self.include(r)
-        return r
+        controls = {}
+        for _ in range(30):
+            scale, controls = self.app.controls(window)
+            if name in controls:
+                r = tuple(v * scale for v in controls[name])
+                self.include(r)
+                return r
+            time.sleep(0.08)
+        raise KeyError(f"{name} not in {sorted(controls)}")
 
     def control(self, name, window="capture"):
         """Center of a named control."""

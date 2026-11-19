@@ -9,7 +9,8 @@ A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https:
 | **Text** in seven styles<br>![Text styles](docs/demo/text-styles.gif) | **Highlighter** with a chisel nib<br>![The highlighter](docs/demo/highlighter.gif) |
 | **Counter**: numbered markers<br>![Counter markers](docs/demo/counter.gif) | **Redact** with mosaic, blur or gray<br>![Redacting](docs/demo/redact.gif) |
 | **Auto redact** with AI<br>![Auto redaction](docs/demo/auto-redact.gif) | **Scrolling screenshots**<br>![A scrolling screenshot](docs/demo/scrolling.gif) |
-| **To text**: copy the text in the selection<br>![To text](docs/demo/to-text.gif) | |
+| **To text**: copy the text in the selection<br>![To text](docs/demo/to-text.gif) | **Composition Editor**: combine captures, resize & reorder layers<br>![Composition Editor](docs/demo/composition-editor.gif) |
+| **Canvas & background**: resize workspace, solid or transparent fill<br>![Canvas and background](docs/demo/canvas-background.gif) | **Copy & paste**: duplicate live annotations, paste images or text<br>![Copy and paste](docs/demo/copy-paste.gif) |
 
 These are recorded from the real app by `demo/record.sh` (see
 [Demo recordings](#demo-recordings)).

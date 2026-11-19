@@ -753,6 +753,14 @@ pub fn background_menu_size() -> (f32, f32) {
     (w, h)
 }
 
+pub fn background_menu_swatch(i: usize) -> (f32, f32, f32, f32) {
+    let row = i / BG_COLS;
+    let col = i % BG_COLS;
+    let x = BORDER + BG_PAD + col as f32 * (BG_SWATCH_BTN + BG_SWATCH_GAP);
+    let y = BORDER + BG_PAD + 18.0 + 6.0 + row as f32 * (BG_SWATCH_BTN + BG_SWATCH_GAP);
+    (x, y, BG_SWATCH_BTN, BG_SWATCH_BTN)
+}
+
 fn color_chip(color: Color, chip_px: f32) -> Div {
     if color.is_transparent() {
         let half = chip_px / 2.0;

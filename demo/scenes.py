@@ -291,6 +291,137 @@ def to_text(layout):
     app.close()
 
 
+def composition_editor(layout):
+    app, rec = scene("composition-editor", layout)
+    pick(rec, desktop.CHAT, "Capture with annotations, then send to the Editor")
+    card = layout.spots["line:Use the company card: 4539 1488 0343 6467,"]
+    rec.press("Tool(Rect)")
+    rec.drag((card[0] - 14, card[1] - 10), (card[0] + card[2] + 14, card[1] + 80), 650)
+    rec.press("AddToEditor")
+    editor = app.wait_window(lambda win: "bluesnap editor" in win.name)
+    rec.switch_window(editor)
+    rec.cursor("arrow")
+    rec.pause(600)
+
+    rec.caption("Add another capture straight into the same canvas")
+    existing_ids = {app.overlay.id, editor.id}
+    rec.press("AddImage", window="editor")
+    overlay2 = app.wait_window(lambda win: (win.w, win.h) == (desktop.W, desktop.H) and win.id not in existing_ids)
+    rec.switch_window(overlay2)
+    rec.cursor("cross")
+    rec.pause(350)
+    pick(rec, desktop.TERMINAL)
+    rec.press("Done")
+    rec.switch_window(editor)
+    rec.cursor("arrow")
+    rec.pause(800)
+
+    rec.caption("Drag to arrange and resize images freely")
+    x1, y1, w1, h1 = rec.rect("image:1", window="editor")
+    x0, y0, w0, h0 = rec.rect("image:0", window="editor")
+    # Drag the second screenshot over the first and resize it cleanly inside the canvas.
+    rec.drag((x1 + w1 * 0.5, y1 + h1 * 0.45), (x0 + w0 * 0.48, y0 + h0 * 0.54), 750)
+    rec.pause(250)
+    x1, y1, w1, h1 = rec.rect("image:1", window="editor")
+    rec.drag((x1 + w1, y1 + h1), (x1 + w1 * 0.72, y1 + h1 * 0.72), 650)
+    rec.pause(350)
+
+    rec.caption("Reorder layers forward or backward")
+    # Send behind both the red annotation and the first screenshot, then bring back on top.
+    rec.press("style:layer:backward", window="editor")
+    rec.pause(250)
+    rec.press("style:layer:backward", window="editor")
+    rec.pause(850)
+    rec.press("style:layer:forward", window="editor")
+    rec.pause(250)
+    rec.press("style:layer:forward", window="editor")
+    rec.pause(1300)
+    rec.save(crop=(0, 0, desktop.W, desktop.H), width=1000)
+    app.close()
+
+
+def canvas_background(layout):
+    app, rec = scene("canvas-background", layout)
+    pick(rec, desktop.TERMINAL, "Open a capture in the Editor")
+    rec.press("AddToEditor")
+    editor = app.wait_window(lambda win: "bluesnap editor" in win.name)
+    rec.switch_window(editor)
+    rec.cursor("arrow")
+    rec.pause(550)
+
+    rec.caption("Drag any canvas edge or corner to expand the workspace")
+    cx, cy, cw, ch = rec.rect("selection", window="editor")
+    # Drag the right edge outward, then bottom-right corner outward.
+    rec.drag((cx + cw, cy + ch * 0.5), (cx + cw + 220, cy + ch * 0.5), 700)
+    rec.pause(250)
+    cx, cy, cw, ch = rec.rect("selection", window="editor")
+    rec.drag((cx + cw, cy + ch), (cx + cw + 90, cy + ch + 140), 700)
+    rec.pause(350)
+
+    rec.caption("Right-click the background to pick a color or transparent")
+    cx, cy, cw, ch = rec.rect("selection", window="editor")
+    exposed = (cx + cw - 90, cy + ch - 60)
+    for swatch in ("Soft blue (#DBEAFE)", "Slate (#334155)", "Transparent"):
+        rec.right_click(exposed, 450)
+        rec.pause(350)
+        rec.press(f"bg:{swatch}", window="editor")
+        rec.pause(750)
+
+    rec.pause(900)
+    rec.save(crop=(editor.x, editor.y, editor.w, editor.h), width=960)
+    app.close()
+
+
+def copy_paste(layout):
+    app, rec = scene("copy-paste", layout)
+    pick(rec, desktop.DOCS, "Copy & paste live annotations in the Editor")
+    rec.press("AddToEditor")
+    editor = app.wait_window(lambda win: "bluesnap editor" in win.name)
+    rec.switch_window(editor)
+    rec.cursor("arrow")
+    rec.pause(550)
+
+    rec.caption("Create an annotation, then Ctrl/Cmd+C and Ctrl/Cmd+V")
+    cx, cy, cw, ch = rec.rect("selection", window="editor")
+    rec.press("Tool(Text)", window="editor")
+    rec.press("style:text-style", window="editor")
+    rec.press("menu:RoundedBoxed", window="editor")
+    rec.cursor("cross")
+    rec.click((cx + cw * 0.66, cy + ch * 0.28), 450)
+    rec.type("NEW", 90)
+    # Escape commits the text while keeping the annotation selected.
+    rec.key("Escape", 350)
+    rec.cursor("arrow")
+    rec.key("ctrl+c", 550)
+    rec.key("ctrl+v", 650)
+
+    rec.caption("Pasted annotations stay live: move or restyle them")
+    sx, sy, sw, sh = rec.rect("selected", window="editor")
+    rec.drag((sx + sw * 0.5, sy + sh * 0.5), (cx + cw * 0.66, cy + ch * 0.50), 650)
+    rec.press("style:color:3", window="editor")
+    rec.pause(550)
+
+    rec.caption("Paste text or images from any app straight onto the canvas")
+    subprocess.run(
+        ["xclip", "-selection", "clipboard", "-i"],
+        input="Pasted from clipboard",
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    time.sleep(0.15)
+    # Clear active tool & selection so Ctrl+V pastes fresh clipboard text onto the canvas.
+    rec.key("Escape", 250)
+    rec.key("Escape", 250)
+    rec.key("ctrl+v", 700)
+    sx, sy, sw, sh = rec.rect("selected", window="editor")
+    rec.drag((sx + sw * 0.5, sy + sh * 0.5), (cx + cw * 0.60, cy + ch * 0.72), 650)
+    rec.pause(1300)
+    rec.save(crop=(editor.x, editor.y, editor.w, editor.h), width=960)
+    app.close()
+
+
 ALL = {
     "pick-window": pick_window,
     "select-region": select_region,
@@ -303,4 +434,7 @@ ALL = {
     "auto-redact": auto_redact,
     "scrolling": scrolling,
     "to-text": to_text,
+    "composition-editor": composition_editor,
+    "canvas-background": canvas_background,
+    "copy-paste": copy_paste,
 }

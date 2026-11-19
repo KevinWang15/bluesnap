@@ -841,6 +841,27 @@ impl CanvasView {
             let r = self.viewport.to_window_rect(sel);
             items.push(("selection".into(), (r.x, r.y, r.w, r.h)));
         }
+        if let Some((frame, _)) = self.editor.selected_frame() {
+            let r = self.viewport.to_window_rect(frame);
+            items.push(("selected".into(), (r.x, r.y, r.w, r.h)));
+        }
+        if !self.is_capture() {
+            let mut img_idx = 0usize;
+            for el in self.editor.elements() {
+                if let bluesnap_core::Element::Image(placed) = el {
+                    let r = self.viewport.to_window_rect(placed.bounds);
+                    items.push((format!("image:{img_idx}"), (r.x, r.y, r.w, r.h)));
+                    img_idx += 1;
+                }
+            }
+        }
+        if let (Some(anchor), Some(_)) = (self.bg_menu, self.editor.background_color()) {
+            let (mx, my) = self.bg_menu_origin(anchor, window);
+            for (i, &(_, label)) in bluesnap_core::BACKGROUND_PALETTE.iter().enumerate() {
+                let s = toolbar::background_menu_swatch(i);
+                items.push((format!("bg:{label}"), (mx + s.0, my + s.1, s.2, s.3)));
+            }
+        }
         let name = if self.is_capture() { "capture" } else { "editor" };
         crate::demo::report(name, window.scale_factor(), items);
     }
