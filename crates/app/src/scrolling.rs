@@ -642,7 +642,10 @@ fn capture_and_stitch(
 impl Render for ScrollingCapture {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let groups = bar_groups(self.mode);
-        let done_adds_to_editor = self.mode == CaptureMode::ForEditor;
+        let toolbar_mode = match self.mode {
+            CaptureMode::Standard => toolbar::ToolbarMode::Capture,
+            CaptureMode::ForEditor => toolbar::ToolbarMode::CaptureForEditor,
+        };
         if crate::demo::enabled() {
             let items = toolbar::row_items(&toolbar::toolbar_slots(groups, STATUS_WIDTH), 32.0, (0.0, 0.0));
             crate::demo::report("scrolling-bar", window.scale_factor(), items);
@@ -677,7 +680,7 @@ impl Render for ScrollingCapture {
         for group in groups {
             bar = bar.child(toolbar::separator());
             for &action in *group {
-                bar = bar.child(toolbar::action_button(action, false, true, done_adds_to_editor).on_mouse_down(
+                bar = bar.child(toolbar::action_button(action, false, true, toolbar_mode).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this: &mut Self, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();

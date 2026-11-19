@@ -66,6 +66,45 @@ pub fn place_size_label(sel: Rect, screen: Rect, size: (f32, f32), gap: f32) -> 
     Point::new(x, y)
 }
 
+/// Top-left corner for an in-capture toast of `size` centered over `sel`.
+/// Prefers inside the top edge of `sel` (`inset` below `sel.y`). When that
+/// would clip off `screen` or overlap any floating `panels` (toolbar / style bar),
+/// tries above `sel` / above the panels, then below `sel` / below the panels,
+/// and finally clamps within `screen`.
+pub fn place_toast(
+    sel: Rect,
+    screen: Rect,
+    size: (f32, f32),
+    panels: &[Rect],
+    inset: f32,
+    gap: f32,
+    margin: f32,
+) -> Point {
+    let (w, h) = size;
+    let x = (sel.center().x - w / 2.0).clamp(screen.x + margin, (screen.right() - w - margin).max(screen.x + margin));
+    let fits = |y: f32| y >= screen.y + margin && y + h <= screen.bottom() - margin;
+    let clear = |y: f32| {
+        let r = Rect::new(x, y, w, h);
+        panels.iter().all(|p| r.intersect(p).is_none())
+    };
+
+    let inside = sel.y + inset;
+    let mut candidates = [Some(inside), Some(sel.y - gap - h), None, Some(sel.bottom() + gap), None];
+    if !panels.is_empty() {
+        let min_y = panels.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let max_bottom = panels.iter().map(|p| p.bottom()).fold(f32::NEG_INFINITY, f32::max);
+        candidates[2] = Some(min_y - gap - h);
+        candidates[4] = Some(max_bottom + gap);
+    }
+
+    let y = candidates
+        .into_iter()
+        .flatten()
+        .find(|&y| fits(y) && clear(y))
+        .unwrap_or_else(|| inside.clamp(screen.y + margin, (screen.bottom() - h - margin).max(screen.y + margin)));
+    Point::new(x, y)
+}
+
 /// Bounds for the live scrolling-capture preview beside `sel`: bottom-aligned with
 /// `sel` on the right (or on the left when the right side lacks room), growing upward
 /// past `sel.y` as the stitched `image` (`(width, height)`) gets taller. Once its top
@@ -217,5 +256,39 @@ mod tests {
 
         // Full-width selection has room on neither side: never overlap the captured hole.
         assert_eq!(place_scrolling_preview(Rect::new(10.0, 100.0, 980.0, 500.0), SCREEN, (980, 500), 10.0, 10.0), None);
+    }
+
+    #[test]
+    fn toast_stays_inside_tall_selection_and_dodges_panels_or_edges_on_short_ones() {
+        let toast = (260.0, 44.0);
+        // Normal tall selection: stays inside the top of the selection.
+        let sel = Rect::new(200.0, 100.0, 500.0, 400.0);
+        let tb = Rect::new(300.0, 508.0, 400.0, 42.0);
+        let p = place_toast(sel, SCREEN, toast, &[tb], 12.0, 8.0, 8.0);
+        assert_eq!(p.y, 112.0);
+
+        // Short single-line selection in the middle: `inside` would overlap toolbar below -> flips above selection.
+        let short = Rect::new(200.0, 400.0, 500.0, 30.0);
+        let tb = Rect::new(300.0, 438.0, 400.0, 42.0);
+        let p = place_toast(short, SCREEN, toast, &[tb], 12.0, 8.0, 8.0);
+        assert_eq!(p.y, 400.0 - 8.0 - 44.0);
+        assert!(Rect::new(p.x, p.y, toast.0, toast.1).intersect(&tb).is_none());
+
+        // Short selection near the top edge: no room above -> flips below toolbar.
+        let top = Rect::new(200.0, 6.0, 500.0, 28.0);
+        let tb = Rect::new(300.0, 42.0, 400.0, 42.0);
+        let p = place_toast(top, SCREEN, toast, &[tb], 12.0, 8.0, 8.0);
+        assert_eq!(p.y, tb.bottom() + 8.0);
+        assert!(Rect::new(p.x, p.y, toast.0, toast.1).intersect(&tb).is_none());
+
+        // Short selection at the bottom edge with toolbar & style bar above: never clips off-screen and clears panels.
+        let bottom = Rect::new(200.0, 772.0, 500.0, 28.0);
+        let tb = Rect::new(300.0, 722.0, 400.0, 42.0);
+        let sb = Rect::new(300.0, 680.0, 320.0, 34.0);
+        let p = place_toast(bottom, SCREEN, toast, &[tb, sb], 12.0, 8.0, 8.0);
+        assert_eq!(p.y, sb.y - 8.0 - 44.0);
+        assert!(p.y >= 8.0 && p.y + toast.1 <= SCREEN.bottom() - 8.0);
+        assert!(Rect::new(p.x, p.y, toast.0, toast.1).intersect(&tb).is_none());
+        assert!(Rect::new(p.x, p.y, toast.0, toast.1).intersect(&sb).is_none());
     }
 }

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
-use bluesnap_core::layout::{place_panels, place_size_label};
+use bluesnap_core::layout::{place_panels, place_size_label, place_toast};
 use bluesnap_core::reading_order::join_lines;
 use bluesnap_core::render::to_rgba_straight;
 use bluesnap_core::shape::Shape;
@@ -16,11 +16,11 @@ use bluesnap_core::{
 };
 use bluesnap_platform::{DisplayInfo, Platform};
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, DisplayId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
-    IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection, Window, canvas,
-    div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
+    App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Deferred, DispatchPhase,
+    DisplayId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla,
+    InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection,
+    Window, canvas, deferred, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
 use crate::AppState;
@@ -39,6 +39,46 @@ const PANEL_GAP: f32 = 8.0;
 const DOC_INSET: f32 = 12.0;
 const CANVAS_MARGIN: f32 = 36.0;
 const LAYER_SNAP: f32 = 512.0;
+
+/// Explicit z-order for floating overlays in [`CanvasView`], from back to front.
+/// Applied via [`gpui::deferred`] so visual paint order, hit-testing, and mouse
+/// occlusion follow this hierarchy regardless of child insertion order.
+/// (GPUI always paints tooltips above all deferred layers.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(usize)]
+enum OverlayLayer {
+    SizeBadge = 10,
+    Loupe = 20,
+    Toolbar = 30,
+    PermissionBanner = 40,
+    Menu = 50,
+    Toast = 60,
+}
+
+fn overlay(layer: OverlayLayer, element: impl IntoElement) -> Deferred {
+    deferred(element).with_priority(layer as usize)
+}
+
+/// Vertical origin for a dropdown menu attached to a bar at `bar_y` (`bar_h` tall).
+/// When `prefer_above` is `true` (e.g. a Capture style bar sitting above the main
+/// toolbar), opens upward first so the menu doesn't cover the toolbar below.
+fn menu_y(bar_y: f32, bar_h: f32, menu_h: f32, win_h: f32, prefer_above: bool) -> f32 {
+    const GAP: f32 = 4.0;
+    const MARGIN: f32 = 8.0;
+    let below = bar_y + bar_h + GAP;
+    let above = bar_y - menu_h - GAP;
+    if prefer_above {
+        if above >= MARGIN {
+            above
+        } else {
+            below.min(win_h - menu_h - MARGIN).max(MARGIN)
+        }
+    } else if below + menu_h <= win_h - MARGIN {
+        below
+    } else {
+        above.max(MARGIN)
+    }
+}
 
 pub enum Surface {
     Capture {
@@ -287,6 +327,31 @@ impl CanvasView {
         }
     }
 
+    fn toolbar_mode(&self) -> toolbar::ToolbarMode {
+        match &self.surface {
+            Surface::Capture { mode: CaptureMode::Standard, .. } => toolbar::ToolbarMode::Capture,
+            Surface::Capture { mode: CaptureMode::ForEditor, .. } => toolbar::ToolbarMode::CaptureForEditor,
+            Surface::Editor { .. } => toolbar::ToolbarMode::Editor,
+        }
+    }
+
+    /// Height of the Editor's top bar mask and click guard; expands when the
+    /// style bar wraps to a second row in narrow windows so scrolled canvas
+    /// pixels never peek behind row 2 (while leaving room above `base_y`).
+    fn editor_top_bar(&self, width: f32) -> f32 {
+        let (tw, th) = toolbar::panel_size(toolbar::EDITOR_TOOLBAR, 0.0);
+        let single = DOC_INSET + th + DOC_INSET / 2.0;
+        let Some((sw, sh)) = self.style_panel_size() else {
+            return single;
+        };
+        let beside = DOC_INSET + tw + PANEL_GAP;
+        if beside + sw + DOC_INSET <= width {
+            single
+        } else {
+            DOC_INSET + th + PANEL_GAP + sh + 2.0
+        }
+    }
+
     fn fit_zoom(&self, window: &Window) -> (f32, f32) {
         let native = Viewport::native(window.scale_factor());
         let win = window.viewport_size();
@@ -304,11 +369,14 @@ impl CanvasView {
 
     fn layout(&mut self, window: &Window) {
         let native = Viewport::native(window.scale_factor());
+        let win_w = f32::from(window.viewport_size().width);
+        let editor_top_bar = (!self.is_capture()).then(|| self.editor_top_bar(win_w));
         match &mut self.surface {
             Surface::Capture { .. } => {
                 self.viewport = native;
             }
             Surface::Editor { pan, zoom_override, .. } => {
+                self.top_bar = editor_top_bar.unwrap_or(0.0);
                 // Freeze the viewport while dragging a canvas edge so Left/Top
                 // edge drags never fight coordinate re-centering mid-drag.
                 if self.editor.is_resizing_canvas() {
@@ -318,7 +386,6 @@ impl CanvasView {
                 let win = window.viewport_size();
                 let (w, h) = (f32::from(win.width), f32::from(win.height));
                 let top = DOC_INSET + toolbar::panel_size(toolbar::EDITOR_TOOLBAR, 0.0).1 + DOC_INSET;
-                self.top_bar = top - DOC_INSET / 2.0;
                 let canvas = self.editor.screen();
                 let avail_w = (w - 2.0 * CANVAS_MARGIN).max(64.0);
                 let avail_h = (h - top - 2.0 * CANVAS_MARGIN).max(64.0);
@@ -414,6 +481,7 @@ impl CanvasView {
             window.focus(&self.focus);
         }
         self.bg_menu = None;
+        self.text_menu = false;
         match action {
             Action::AddImage => cx.defer(crate::editor_window::request_add_image),
             Action::OpenFile => {
@@ -645,6 +713,10 @@ impl CanvasView {
         if self.ocr.is_some() {
             return;
         }
+        if self.editor.is_editing_text() {
+            self.editor.finish_text();
+        }
+        let Some(source) = RedactionSource::current(self.document_generation, &self.editor) else { return };
         let Some(pixmap) = self.editor.export() else { return };
         let (width, height, rgba) = (pixmap.width(), pixmap.height(), to_rgba_straight(&pixmap));
         let scale = self.editor.scale();
@@ -656,17 +728,27 @@ impl CanvasView {
         self.ocr = Some(cx.spawn_in(window, async move |this, cx| {
             let result = recognized.await;
             log::debug!("text recognition took {:?}", started.elapsed());
-            this.update_in(cx, |this, window, cx| this.text_recognized(result, window, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.text_recognized(source, result, window, cx)).ok();
         }));
     }
 
     fn text_recognized(
         &mut self,
+        source: RedactionSource,
         result: anyhow::Result<Vec<bluesnap_platform::TextLine>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.ocr = None;
+        if source.document != self.document_generation {
+            return;
+        }
+        if self.editor.settled_content_revision() != Some(source.revision) {
+            let toast = Toast::new(toast::Kind::Info, "Selection or image changed")
+                .detail("Run To text again to recognize the current image.");
+            self.show_toast(toast, window, cx);
+            return;
+        }
         let text = result.map(|lines| {
             join_lines(
                 lines
@@ -743,7 +825,8 @@ impl CanvasView {
                 let style = toolbar::row_items(&toolbar::style_slots_ex(tool, layer_ops.is_some()), 24.0, (at.x, at.y));
                 items.extend(style.into_iter().map(|(name, r)| (format!("style:{name}"), r)));
                 if self.text_menu {
-                    let (x, y, w) = self.text_menu_origin(at, window);
+                    let prefer_above = self.is_capture() && at.y < toolbar_at.y;
+                    let (x, y, w) = self.text_menu_origin(at, prefer_above, window);
                     for (i, style) in bluesnap_core::TextStyle::ALL.into_iter().enumerate() {
                         let row = toolbar::text_style_menu_row(i);
                         items.push((format!("menu:{style:?}"), (x + row.0, y + row.1, w - 2.0 * row.0, row.3)));
@@ -823,6 +906,7 @@ impl CanvasView {
         current: bluesnap_core::TextStyle,
         color: bluesnap_core::Color,
         bar: Point<f32>,
+        prefer_above: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -844,18 +928,18 @@ impl CanvasView {
             }
         }
         let previews = self.text_previews.as_ref().expect("just made").2.clone();
-        let (x, y, _) = self.text_menu_origin(bar, window);
+        let (x, y, _) = self.text_menu_origin(bar, prefer_above, window);
         toolbar::text_style_menu(&previews, current, color.is_light(), x, y, cx)
     }
 
-    fn text_menu_origin(&self, bar: Point<f32>, window: &Window) -> (f32, f32, f32) {
+    fn text_menu_origin(&self, bar: Point<f32>, prefer_above: bool, window: &Window) -> (f32, f32, f32) {
         let (w, h) = toolbar::text_style_menu_size(bluesnap_core::TextStyle::ALL.len());
         let (button_x, _) = toolbar::text_style_button(bar.x);
         let bar_h = toolbar::style_bar_size(bluesnap_core::Tool::Text).1;
         let win = window.viewport_size();
+        let win_h = f32::from(win.height);
         let x = button_x.min(f32::from(win.width) - w - 8.0).max(8.0);
-        let below = bar.y + bar_h + 4.0;
-        let y = if below + h <= f32::from(win.height) - 8.0 { below } else { (bar.y - h - 4.0).max(8.0) };
+        let y = menu_y(bar.y, bar_h, h, win_h, prefer_above);
         (x, y, w)
     }
 
@@ -1127,7 +1211,7 @@ impl CanvasView {
     }
 
     fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
-        self.bg_menu = None;
+        let closed_menu = self.bg_menu.take().is_some() || std::mem::take(&mut self.text_menu);
         let delta = ev.delta.pixel_delta(window.line_height());
         let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
         let cmd = ev.modifiers.secondary();
@@ -1150,6 +1234,8 @@ impl CanvasView {
                 pan.x -= dx;
                 pan.y -= dy;
             }
+            cx.notify();
+        } else if closed_menu {
             cx.notify();
         }
     }
@@ -1233,7 +1319,7 @@ impl CanvasView {
             "escape" if !self.is_capture() && self.editor.clear_tool_or_selection() => {}
             "escape" if self.is_capture() => return self.finish(Finish::Cancel, window, cx),
             "enter" if editing => self.editor.text_key(TextKey::Newline),
-            "enter" => return self.finish(Finish::Copy, window, cx),
+            "enter" if self.is_capture() => return self.finish(Finish::Copy, window, cx),
             "backspace" if editing => self.editor.text_key(TextKey::Backspace),
             "delete" if editing => self.editor.text_key(TextKey::Delete),
             "left" if editing => self.editor.text_key(TextKey::Left),
@@ -1439,7 +1525,8 @@ impl Render for CanvasView {
             let win_size = window.viewport_size();
             let bounds_rect = PxRect::new(0.0, self.top_bar, f32::from(win_size.width), (f32::from(win_size.height) - self.top_bar).max(40.0));
             let at = place_size_label(self.viewport.to_window_rect(active), bounds_rect, (96.0, 20.0), 8.0);
-            root = root.child(
+            root = root.child(overlay(
+                OverlayLayer::SizeBadge,
                 div()
                     .absolute()
                     .left(px(at.x))
@@ -1451,11 +1538,7 @@ impl Render for CanvasView {
                     .text_color(white())
                     .text_size(px(12.0))
                     .child(label),
-            );
-        }
-
-        if let Surface::Capture { permission_url: Some(url), .. } = self.surface {
-            root = root.child(permission_banner(url, cx));
+            ));
         }
 
         if let Some((cursor, pixel)) = self.loupe_target(window)
@@ -1463,41 +1546,7 @@ impl Render for CanvasView {
         {
             let selection = self.editor.active_rect();
             let loupe = self.loupe.element(doc, pixel, cursor, selection, window.viewport_size(), window);
-            root = root.child(loupe);
-        }
-
-        if let Some(toast) = &self.toast {
-            let win = window.viewport_size();
-            let full = Bounds::new(point(px(0.), px(0.)), win);
-            let (center_x, top) = match (&self.surface, self.editor.selection()) {
-                (Surface::Capture { .. }, Some(sel)) => {
-                    let b = self.viewport.to_window(sel).intersect(&full);
-                    (f32::from(b.center().x), f32::from(b.origin.y) + 12.0)
-                }
-                _ => {
-                    let (_, style_at) = self.panel_positions(window);
-                    let style_bottom = match (style_at, self.style_panel_size()) {
-                        (Some(at), Some((_, sh))) => at.y + sh,
-                        _ => 0.0,
-                    };
-                    (f32::from(win.width) / 2.0, self.top_bar.max(style_bottom) + 8.0)
-                }
-            };
-            let entity = cx.entity();
-            let close = cx.entity();
-            root = root.child(toast::render(
-                toast,
-                center_x,
-                top,
-                f32::from(win.width),
-                move |action, _, cx| entity.update(cx, |this, cx| this.toast_action(action, cx)),
-                move |_, cx| {
-                    close.update(cx, |this, cx| {
-                        this.toast = None;
-                        cx.notify();
-                    })
-                },
-            ));
+            root = root.child(overlay(OverlayLayer::Loupe, loupe));
         }
 
         if crate::demo::enabled() {
@@ -1505,45 +1554,108 @@ impl Render for CanvasView {
         }
         if self.editor.toolbar_visible() {
             let groups = self.toolbar_groups();
-            let done_adds_to_editor = self.capture_mode() == Some(CaptureMode::ForEditor);
-            let (at, style_at) = self.panel_positions(window);
+            let toolbar_mode = self.toolbar_mode();
+            let (toolbar_at, style_at) = self.panel_positions(window);
             let auto = self.auto_state();
             let layer_ops = self.layer_ops();
-            root = root.child(toolbar::toolbar(self, groups, done_adds_to_editor, at.x, at.y, cx));
+            root = root.child(overlay(
+                OverlayLayer::Toolbar,
+                toolbar::toolbar(self, groups, toolbar_mode, toolbar_at.x, toolbar_at.y, cx),
+            ));
             if let (Some((tool, style)), Some(at)) = (self.editor.current_style(), style_at) {
-                root = root.child(match self.editor.current_redaction() {
-                    Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, layer_ops, at.x, at.y, cx),
-                    None => {
-                        let extra = if let Some(numbering) = self.editor.current_counter_format() {
-                            toolbar::Extra::Numbering(numbering)
-                        } else if let Some(text) = self.editor.current_text_style() {
-                            toolbar::Extra::TextStyle(text, self.text_menu)
-                        } else if let Some(arrow) = self.editor.current_arrow_style() {
-                            toolbar::Extra::ArrowStyle(arrow)
-                        } else {
-                            toolbar::Extra::None
-                        };
-                        toolbar::style_bar(tool, style, extra, layer_ops, at.x, at.y, cx)
-                    }
-                });
+                root = root.child(overlay(
+                    OverlayLayer::Toolbar,
+                    match self.editor.current_redaction() {
+                        Some(redaction) => toolbar::redact_bar(redaction, style.size, auto, layer_ops, at.x, at.y, cx),
+                        None => {
+                            let extra = if let Some(numbering) = self.editor.current_counter_format() {
+                                toolbar::Extra::Numbering(numbering)
+                            } else if let Some(text) = self.editor.current_text_style() {
+                                toolbar::Extra::TextStyle(text, self.text_menu)
+                            } else if let Some(arrow) = self.editor.current_arrow_style() {
+                                toolbar::Extra::ArrowStyle(arrow)
+                            } else {
+                                toolbar::Extra::None
+                            };
+                            toolbar::style_bar(tool, style, extra, layer_ops, at.x, at.y, cx)
+                        }
+                    },
+                ));
                 if let Some(current) = self.editor.current_text_style().filter(|_| self.text_menu) {
-                    let menu = self.text_menu(current, style.color, at, window, cx);
-                    root = root.child(menu);
+                    let prefer_above = self.is_capture() && at.y < toolbar_at.y;
+                    let menu = self.text_menu(current, style.color, at, prefer_above, window, cx);
+                    root = root.child(overlay(OverlayLayer::Menu, menu));
                 } else {
                     self.text_menu = false;
                 }
             } else if let (true, Some(ops), Some(at)) = (self.editor.selected_is_image(), layer_ops, style_at) {
                 self.text_menu = false;
-                root = root.child(toolbar::image_bar(ops, at.x, at.y, cx));
+                root = root.child(overlay(OverlayLayer::Toolbar, toolbar::image_bar(ops, at.x, at.y, cx)));
             } else {
                 self.text_menu = false;
             }
         }
+
+        if let Surface::Capture { permission_url: Some(url), .. } = self.surface {
+            root = root.child(overlay(OverlayLayer::PermissionBanner, permission_banner(url, cx)));
+        }
+
         if let (Some(anchor), Some(current_bg)) = (self.bg_menu, self.editor.background_color()) {
             let (mx, my) = self.bg_menu_origin(anchor, window);
             let has_custom = bluesnap_platform::Native::HAS_COLOR_DIALOG;
-            root = root.child(toolbar::background_menu(current_bg, has_custom, mx, my, cx));
+            root = root.child(overlay(OverlayLayer::Menu, toolbar::background_menu(current_bg, has_custom, mx, my, cx)));
         }
+
+        if let Some(toast) = &self.toast {
+            let win = window.viewport_size();
+            let (win_w, win_h) = (f32::from(win.width), f32::from(win.height));
+            let toast_size = toast::estimated_size(toast, win_w);
+            let screen = PxRect::new(0.0, 0.0, win_w, win_h);
+            let (center_x, top) = match (&self.surface, self.editor.selection()) {
+                (Surface::Capture { .. }, Some(sel)) => {
+                    let sel_win = self.viewport.to_window_rect(sel).intersect(&screen).unwrap_or(screen);
+                    let mut panels = Vec::with_capacity(2);
+                    if self.editor.toolbar_visible() {
+                        let (tb_at, sb_at) = self.panel_positions(window);
+                        let (tw, th) = toolbar::panel_size(self.toolbar_groups(), 0.0);
+                        panels.push(PxRect::new(tb_at.x, tb_at.y, tw, th));
+                        if let (Some(at), Some((sw, sh))) = (sb_at, self.style_panel_size()) {
+                            panels.push(PxRect::new(at.x, at.y, sw, sh));
+                        }
+                    }
+                    let placed = place_toast(sel_win, screen, toast_size, &panels, 12.0, PANEL_GAP, 8.0);
+                    (sel_win.center().x, placed.y)
+                }
+                _ => {
+                    let (_, style_at) = self.panel_positions(window);
+                    let style_bottom = match (style_at, self.style_panel_size()) {
+                        (Some(at), Some((_, sh))) => at.y + sh,
+                        _ => 0.0,
+                    };
+                    let preferred = self.top_bar.max(style_bottom) + 8.0;
+                    (win_w / 2.0, preferred.clamp(8.0, (win_h - toast_size.1 - 8.0).max(8.0)))
+                }
+            };
+            let entity = cx.entity();
+            let close = cx.entity();
+            root = root.child(overlay(
+                OverlayLayer::Toast,
+                toast::render(
+                    toast,
+                    center_x,
+                    top,
+                    win_w,
+                    move |action, _, cx| entity.update(cx, |this, cx| this.toast_action(action, cx)),
+                    move |_, cx| {
+                        close.update(cx, |this, cx| {
+                            this.toast = None;
+                            cx.notify();
+                        })
+                    },
+                ),
+            ));
+        }
+
         root
     }
 }
@@ -1835,5 +1947,35 @@ mod tests {
         #[allow(clippy::reversed_empty_ranges)]
         let reversed = 4..1;
         assert_eq!(range_from_utf16(s, &reversed), 1..8);
+    }
+
+    #[test]
+    fn overlay_layers_stack_toasts_and_menus_above_toolbars() {
+        let layers = [
+            OverlayLayer::SizeBadge,
+            OverlayLayer::Loupe,
+            OverlayLayer::Toolbar,
+            OverlayLayer::PermissionBanner,
+            OverlayLayer::Menu,
+            OverlayLayer::Toast,
+        ];
+        for pair in layers.windows(2) {
+            assert!(
+                (pair[0] as usize) < (pair[1] as usize),
+                "{:?} must sit below {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn text_menu_opens_away_from_toolbar_when_style_bar_is_above() {
+        // Style bar below toolbar: opens downward when room.
+        assert_eq!(menu_y(100.0, 34.0, 180.0, 800.0, false), 138.0);
+        // Style bar above toolbar (Capture flipped above selection): opens upward to avoid covering toolbar.
+        assert_eq!(menu_y(400.0, 34.0, 180.0, 800.0, true), 216.0);
+        // Style bar above toolbar, but no room above: falls back downward and clamps inside viewport.
+        assert_eq!(menu_y(60.0, 34.0, 180.0, 800.0, true), 98.0);
     }
 }

@@ -35,6 +35,17 @@ const TEXT_STYLE: f32 = 132.0;
 /// Width of the redact bar's Auto button (AI redaction).
 const AUTO: f32 = 64.0;
 
+/// Where a toolbar is shown, which adjusts labels and shortcut hints for `Cancel` and `Done`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolbarMode {
+    /// Standalone capture overlay or scrolling capture bar.
+    Capture,
+    /// Capture overlay or scrolling bar triggered by Editor's `"Add image"`.
+    CaptureForEditor,
+    /// Composition Editor window (`Esc` clears tool/selection, bare `Enter` does not close).
+    Editor,
+}
+
 /// A toolbar button's meaning. Each surface composes the actions it offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -76,10 +87,16 @@ impl Action {
         }
     }
 
-    pub fn label_for(self, done_adds_to_editor: bool) -> &'static str {
+    pub fn label_for(self, mode: ToolbarMode) -> &'static str {
         match self {
             Action::AddImage => "Add image: capture another screenshot",
-            Action::OpenFile => "Open .bs or image file (Ctrl+O)",
+            Action::OpenFile => {
+                if cfg!(target_os = "macos") {
+                    "Open .bs or image file (⌘O)"
+                } else {
+                    "Open .bs or image file (Ctrl+O)"
+                }
+            }
             Action::Tool(Tool::Rect) => "Rectangle",
             Action::Tool(Tool::Ellipse) => "Ellipse",
             Action::Tool(Tool::Arrow) => "Arrow",
@@ -88,14 +105,32 @@ impl Action {
             Action::Tool(Tool::Counter) => "Counter: click to place 1, 2, 3 …",
             Action::Tool(Tool::Redact) => "Redact",
             Action::Tool(Tool::Text) => "Text",
-            Action::Undo => "Undo",
+            Action::Undo => {
+                if cfg!(target_os = "macos") {
+                    "Undo (⌘Z)"
+                } else {
+                    "Undo (Ctrl+Z)"
+                }
+            }
             Action::Scrolling => "Scrolling screenshot: scroll the window to capture more",
             Action::ToText => "To text: copy the text in the selection",
             Action::AddToEditor => "Add to editor",
-            Action::Save => "Save (.png or .bs)",
-            Action::Cancel => "Cancel (Esc)",
-            Action::Done if done_adds_to_editor => "Add to editor (Enter)",
-            Action::Done => "Copy (Enter)",
+            Action::Save => {
+                if cfg!(target_os = "macos") {
+                    "Save (.png or .bs) (⌘S)"
+                } else {
+                    "Save (.png or .bs) (Ctrl+S)"
+                }
+            }
+            Action::Cancel => match mode {
+                ToolbarMode::Editor => "Close",
+                ToolbarMode::Capture | ToolbarMode::CaptureForEditor => "Cancel (Esc)",
+            },
+            Action::Done => match mode {
+                ToolbarMode::CaptureForEditor => "Add to editor (Enter)",
+                ToolbarMode::Editor => "Copy and close",
+                ToolbarMode::Capture => "Copy (Enter)",
+            },
         }
     }
 
@@ -364,27 +399,27 @@ pub fn separator() -> Div {
     div().flex_none().w(px(1.0)).h(px(20.0)).mx(px(4.0)).bg(rgba(0x0000_0022))
 }
 
-/// The button for `action`; `done_adds_to_editor` adjusts `Done`'s tooltip when
-/// capturing into an open Editor.
-pub fn action_button(action: Action, active: bool, enabled: bool, done_adds_to_editor: bool) -> Stateful<Div> {
+/// The button for `action`; `mode` adjusts tooltips/shortcuts for Capture vs Editor.
+pub fn action_button(action: Action, active: bool, enabled: bool, mode: ToolbarMode) -> Stateful<Div> {
     let blue = hsla(THEME_BLUE);
     let color = match (active, enabled) {
         (true, _) => blue,
         (_, false) => hsla(Color::rgb(0xBBBBBB)),
         _ => action.color(),
     };
-    let label = action.label_for(done_adds_to_editor);
+    let label = action.label_for(mode);
+    let tip = if action == Action::ToText && active { "Recognizing text…" } else { label };
     div()
         .id(label)
-        .tooltip(tooltip(label))
+        .tooltip(tooltip(tip))
         .size(px(BUTTON))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(6.0))
-        .cursor_pointer()
+        .when(enabled, |d| d.cursor_pointer())
         .when(active, |d| d.bg(rgba(0x1677_FF1F)))
-        .when(!active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
+        .when(enabled && !active, |d| d.hover(|s| s.bg(rgba(0x0000_000F))))
         .child(svg().path(action.icon()).size(px(ICON)).text_color(color))
 }
 
@@ -403,7 +438,7 @@ fn on_press(
 pub fn toolbar(
     view: &CanvasView,
     groups: &[&[Action]],
-    done_adds_to_editor: bool,
+    mode: ToolbarMode,
     x: f32,
     y: f32,
     cx: &mut Context<CanvasView>,
@@ -418,13 +453,12 @@ pub fn toolbar(
             let (active, enabled) = match action {
                 Action::Tool(tool) => (editor.tool() == Some(tool), true),
                 Action::Undo => (false, editor.can_undo()),
-                Action::ToText => (view.is_recognizing(), true),
+                Action::ToText => (view.is_recognizing(), !view.is_recognizing()),
                 _ => (false, true),
             };
-            bar = bar.child(action_button(action, active, enabled, done_adds_to_editor).on_mouse_down(
-                MouseButton::Left,
-                on_press(cx, move |this, w, cx| this.perform(action, w, cx)),
-            ));
+            bar = bar.child(action_button(action, active, enabled, mode).when(enabled, |b| {
+                b.on_mouse_down(MouseButton::Left, on_press(cx, move |this, w, cx| this.perform(action, w, cx)))
+            }));
         }
     }
     bar.into_any_element()
@@ -1057,5 +1091,18 @@ mod tests {
         let (w, h) = background_menu_size();
         assert_eq!(w, 194.0);
         assert_eq!(h, 135.0);
+    }
+
+    #[test]
+    fn action_labels_match_toolbar_mode_and_platform() {
+        assert_eq!(Action::Cancel.label_for(ToolbarMode::Capture), "Cancel (Esc)");
+        assert_eq!(Action::Cancel.label_for(ToolbarMode::Editor), "Close");
+        assert_eq!(Action::Done.label_for(ToolbarMode::Capture), "Copy (Enter)");
+        assert_eq!(Action::Done.label_for(ToolbarMode::CaptureForEditor), "Add to editor (Enter)");
+        assert_eq!(Action::Done.label_for(ToolbarMode::Editor), "Copy and close");
+        let expected_mod = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
+        assert!(Action::OpenFile.label_for(ToolbarMode::Editor).contains(expected_mod));
+        assert!(Action::Undo.label_for(ToolbarMode::Editor).contains(expected_mod));
+        assert!(Action::Save.label_for(ToolbarMode::Editor).contains(expected_mod));
     }
 }

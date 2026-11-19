@@ -71,6 +71,32 @@ impl Toast {
     }
 }
 
+const MAX_WIDTH: f32 = 420.0;
+
+/// Conservative `(width, height)` estimate for laying out `toast` in a window
+/// `window_width` wide without clipping or overlapping floating toolbars.
+pub fn estimated_size(toast: &Toast, window_width: f32) -> (f32, f32) {
+    let max_w = (window_width - 16.0).clamp(0.0, MAX_WIDTH);
+    let chrome_w = 2.0 * 14.0
+        + 16.0
+        + 10.0
+        + toast.action.as_ref().map_or(0.0, |(label, _)| label.chars().count() as f32 * 7.0 + 30.0)
+        + if toast.dismissable() { 32.0 } else { 0.0 };
+    let text_w = (max_w - chrome_w).max(120.0);
+    let title_chars = toast.title.chars().count();
+    let title_lines = title_chars.div_ceil((text_w / 7.2).floor().max(12.0) as usize).max(1);
+    let detail_lines = toast.detail.as_ref().map_or(0, |d| {
+        let per_line = (text_w / 6.5).floor().max(14.0) as usize;
+        d.lines().map(|line| line.chars().count().div_ceil(per_line).max(1)).sum()
+    });
+    let est_text_w = (title_chars as f32 * 7.5)
+        .max(toast.detail.as_ref().map_or(0.0, |d| d.chars().count() as f32 * 6.5));
+    let width = (chrome_w + est_text_w).min(max_w);
+    let height = (22.0 + 18.0 * title_lines as f32 + if detail_lines > 0 { 2.0 + 17.0 * detail_lines as f32 } else { 0.0 })
+        .max(44.0);
+    (width, height)
+}
+
 /// The toast, centered horizontally at `(center_x, top)`, for a window
 /// `window_width` wide. `on_action` runs the button; `on_close` dismisses.
 pub fn render(
@@ -81,8 +107,7 @@ pub fn render(
     on_action: impl Fn(Action, &mut Window, &mut App) + 'static,
     on_close: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    const WIDTH: f32 = 420.0;
-    let width = (window_width - 16.0).clamp(0.0, WIDTH);
+    let width = (window_width - 16.0).clamp(0.0, MAX_WIDTH);
     let left = (center_x - width / 2.0).clamp(8.0, (window_width - width - 8.0).max(8.0));
     let icon = match toast.kind {
         Kind::Busy => svg()
@@ -443,5 +468,18 @@ mod tests {
         let tiny = PixelRect { x: 10, y: 20, width: 200, height: 80 };
         let r = corner_window_rect(tiny, (500, 200), 16, false);
         assert_eq!(r, PixelRect { x: 10, y: 20, width: 200, height: 80 });
+    }
+
+    #[test]
+    fn estimated_size_grows_with_detail_and_clamps_width() {
+        let short = Toast::new(Kind::Busy, "Recognizing text…");
+        let detailed = Toast::new(Kind::Info, "Set up AI first")
+            .detail("Auto finds sensitive text with an LLM and/or a decision model. Add one in AI Settings.")
+            .action("AI Settings…", Action::OpenAiSettings);
+        let (sw, sh) = estimated_size(&short, 1280.0);
+        let (dw, dh) = estimated_size(&detailed, 1280.0);
+        assert!(sw < MAX_WIDTH && sh >= 44.0);
+        assert!(dw <= MAX_WIDTH && dh > sh);
+        assert!(estimated_size(&detailed, 300.0).0 <= 284.0);
     }
 }
