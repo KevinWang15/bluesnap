@@ -8,6 +8,8 @@ use std::sync::Arc;
 use bluesnap_core::render::to_bgra_straight;
 use bluesnap_core::{Editor, ImageAsset, ImageId, Pixmap, Rect as PxRect};
 use gpui::{Bounds, Corners, Pixels, RenderImage, Window};
+#[cfg(any(windows, test))]
+use gpui::{DevicePixels, point, size};
 
 use crate::viewport::Viewport;
 
@@ -149,6 +151,35 @@ pub struct LayerKey {
 pub struct LayerCache {
     key: Option<LayerKey>,
     images: Vec<(PxRect, Arc<RenderImage>)>,
+    #[cfg(windows)]
+    coverage: Option<Vec<Bounds<DevicePixels>>>,
+}
+
+/// Texture-local rectangles covering every potentially nontransparent pixel.
+/// Limit the number and total size of uploads for dense or overlapping masks.
+#[cfg(any(windows, test))]
+fn sparse_coverage(elements: &[bluesnap_core::Element], layer: PxRect) -> Option<Vec<Bounds<DevicePixels>>> {
+    let layer_area = layer.w * layer.h;
+    if layer_area < 128.0 * 128.0 || layer != layer.round_out() {
+        return None;
+    }
+    let mut regions = Vec::new();
+    let mut area = 0.0;
+    for element in elements {
+        let mask = element.as_shape()?.redaction_rect()?;
+        // Match the antialiasing gutter and clipping used by Editor::render_band.
+        if let Some(r) = mask.inflate(1.0).round_out().intersect(&layer) {
+            area += r.w * r.h;
+            if regions.len() == 128 || area > layer_area * 0.5 {
+                return None;
+            }
+            regions.push(Bounds::new(
+                point(DevicePixels((r.x - layer.x) as i32), DevicePixels((r.y - layer.y) as i32)),
+                size(DevicePixels(r.w as i32), DevicePixels(r.h as i32)),
+            ));
+        }
+    }
+    (!regions.is_empty()).then_some(regions)
 }
 
 impl LayerCache {
@@ -159,12 +190,31 @@ impl LayerCache {
         window: &mut Window,
     ) -> &[(PxRect, Arc<RenderImage>)] {
         if self.key.as_ref() != Some(&key) {
+            #[cfg(not(windows))]
             self.drop_image(window);
+            let mut next = Vec::new();
             editor.render_band_parts(key.range.clone(), key.active, key.clip, key.split, |rect, pixmap| {
                 if let Some(image) = pixmap_image(&pixmap) {
-                    self.images.push((rect, image));
+                    next.push((rect, image));
                 }
             });
+            #[cfg(windows)]
+            {
+                let coverage = match next.as_slice() {
+                    [(rect, _)] if !key.split && !key.active => sparse_coverage(&editor.elements()[key.range.clone()], *rect),
+                    _ => None,
+                };
+                if let ([(old_rect, old)], [(rect, new)], Some(regions)) =
+                    (self.images.as_slice(), next.as_slice(), coverage.as_ref())
+                    && rect == old_rect && self.coverage.as_ref() == Some(regions)
+                {
+                    window.replace_image_regions(old, new, regions);
+                }
+                self.coverage = coverage;
+            }
+            for (_, old) in std::mem::replace(&mut self.images, next) {
+                window.drop_image(old).ok();
+            }
             self.key = Some(key);
         }
         &self.images
@@ -172,6 +222,10 @@ impl LayerCache {
 
     pub fn drop_image(&mut self, window: &mut Window) {
         self.key = None;
+        #[cfg(windows)]
+        {
+            self.coverage = None;
+        }
         for (_, image) in self.images.drain(..) {
             window.drop_image(image).ok();
         }
@@ -208,6 +262,33 @@ impl LayerBandPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bluesnap_core::{Element, RedactEffect, Style};
+    use bluesnap_core::shape::{Geometry, RedactShape, Shape};
+
+    #[test]
+    fn sparse_uploads_cover_clipped_masks_and_detect_layout_changes() {
+        let shape = |geometry| Element::Shape(Shape { geometry, style: Style::default() });
+        let mask = |x, y, w, h| shape(Geometry::Redact {
+            area: RedactShape::Rect(PxRect::new(x, y, w, h)),
+            effect: RedactEffect::Mosaic,
+            strength: 0.5,
+        });
+        let layer = PxRect::new(100.0, 30.0, 600.0, 300.0);
+        let first = mask(97.5, 42.25, 23.75, 10.5);
+        let second = mask(301.5, 241.5, 80.0, 20.0);
+        let coverage = sparse_coverage(&[first.clone(), second.clone()], layer).unwrap();
+        assert_eq!(coverage[0], Bounds::new(point(0.into(), 11.into()), size(23.into(), 13.into())));
+        assert!(sparse_coverage(std::slice::from_ref(&first), PxRect { x: 100.5, ..layer }).is_none());
+        for changed in [
+            vec![first.clone(), mask(315.0, 241.5, 80.0, 20.0)],
+            vec![first.clone(), mask(301.5, 241.5, 25.0, 20.0)],
+            vec![first.clone()],
+        ] {
+            assert_ne!(sparse_coverage(&changed, layer).unwrap(), coverage);
+        }
+        assert!(sparse_coverage(&[first, shape(Geometry::Ellipse(layer))], layer).is_none());
+        assert!(sparse_coverage(&[mask(layer.x, layer.y, layer.w, layer.h)], layer).is_none());
+    }
 
     #[test]
     fn tall_images_split_into_texture_sized_tiles() {
