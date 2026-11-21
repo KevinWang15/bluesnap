@@ -40,7 +40,7 @@ pub fn copy_to_clipboard(image: Pixmap, cx: &mut App) {
                 }
             })
             .await;
-        cx.update(run_mode::end_job).ok();
+        cx.update(run_mode::end_job);
     })
     .detach();
 }
@@ -84,10 +84,7 @@ pub fn save_with_dialog(
                 Ok(None) => {
                     // Fallback for platforms without a custom filter dialog (Linux).
                     let suggested = format!("{stem}.png");
-                    let rx = match cx.update(|cx| cx.prompt_for_new_path(&dir, Some(&suggested))) {
-                        Ok(rx) => rx,
-                        Err(_) => return,
-                    };
+                    let rx = cx.update(|cx| cx.prompt_for_new_path(&dir, Some(&suggested)));
                     match rx.await {
                         Ok(Ok(Some(path))) => {
                             let fmt = SaveFormat::from_path(&path).unwrap_or(SaveFormat::Png);
@@ -110,7 +107,7 @@ pub fn save_with_dialog(
 
             let Some((path, format)) = chosen else {
                 if hide_after {
-                    cx.update(|_| platform.restore_previous_app()).ok();
+                    cx.update(|_| platform.restore_previous_app());
                 }
                 return;
             };
@@ -134,17 +131,17 @@ pub fn save_with_dialog(
                 Ok(()) => {
                     log::info!("saved {}", path.display());
                     if let Some(cb) = on_saved {
-                        cx.update(|cx| cb(path, cx)).ok();
+                        cx.update(|cx| cb(path, cx));
                     }
                 }
                 Err(e) => log::error!("saving {} failed: {e:#}", path.display()),
             }
             if hide_after {
-                cx.update(|_| platform.restore_previous_app()).ok();
+                cx.update(|_| platform.restore_previous_app());
             }
         }
         .await;
-        cx.update(run_mode::end_job).ok();
+        cx.update(run_mode::end_job);
     })
     .detach();
 }

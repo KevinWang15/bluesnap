@@ -34,18 +34,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # gpui compiles its HLSL shaders with fxc.exe in release builds; its built-in
-      # lookup only knows one SDK version, so point it at whatever the runner has.
-      - name: Locate fxc.exe
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter fxc.exe |
-            Where-Object { $_.FullName -match '\\x64\\' } |
-            Sort-Object FullName | Select-Object -Last 1
-          if (-not $fxc) { throw "fxc.exe not found" }
-          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
-
       # gpui compiles its Metal shaders at build time. Newer Xcode versions ship the
       # Metal toolchain as a separate download.
       - name: Ensure Metal toolchain

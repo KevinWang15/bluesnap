@@ -23,8 +23,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    ClientToScreen, CombineRgn, CreateRectRgn, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW,
-    HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_DIFF,
+    ClientToScreen, CombineRgn, CreateRectRgn, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
+    HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, RGN_DIFF,
     ROP_CODE, ReleaseDC, SRCCOPY, SelectObject, SetWindowRgn,
 };
 use windows_sys::Win32::System::Registry::{
@@ -542,7 +542,7 @@ impl Platform for Native {
             }
             let (rc, work) = (info.rcMonitor, info.rcWork);
             let display = DisplayInfo {
-                id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
+                id: monitor as u64,
                 bounds: NativeRect {
                     x: rc.left as f64,
                     y: rc.top as f64,
@@ -756,7 +756,7 @@ fn capture_under_cursor() -> anyhow::Result<Capture> {
     }
     let rc = info.rcMonitor;
     let display = DisplayInfo {
-        id: monitor_index(monitor).context("monitor not found in EnumDisplayMonitors")?,
+        id: monitor as u64,
         bounds: NativeRect {
             x: rc.left as f64,
             y: rc.top as f64,
@@ -778,17 +778,6 @@ fn capture_under_cursor() -> anyhow::Result<Capture> {
         started.elapsed() - captured
     );
     Ok(Capture { display, image, windows, permission_missing: false })
-}
-
-/// gpui identifies monitors by their position in `EnumDisplayMonitors` order.
-fn monitor_index(target: HMONITOR) -> Option<u32> {
-    unsafe extern "system" fn collect(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> i32 {
-        unsafe { (*(data as *mut Vec<HMONITOR>)).push(m) };
-        TRUE
-    }
-    let mut monitors: Vec<HMONITOR> = Vec::new();
-    unsafe { EnumDisplayMonitors(null_mut(), null(), Some(collect), &mut monitors as *mut _ as LPARAM) };
-    monitors.iter().position(|m| *m == target).map(|i| i as u32)
 }
 
 fn monitor_scale(monitor: HMONITOR) -> f32 {

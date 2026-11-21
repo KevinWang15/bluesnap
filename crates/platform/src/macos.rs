@@ -137,7 +137,7 @@ impl Platform for Native {
         anyhow::ensure!(bounds.size.width > 0.0 && bounds.size.height > 0.0, "empty display bounds");
         let scale = image.width as f64 / bounds.size.width;
         let display = DisplayInfo {
-            id,
+            id: id.into(),
             bounds: NativeRect {
                 x: bounds.origin.x,
                 y: bounds.origin.y,
@@ -223,7 +223,7 @@ impl Platform for Native {
             size: CGSize { width: rect.width as f64 / s, height: rect.height as f64 / s },
         };
         #[allow(deprecated)] // see capture_display_under_cursor
-        let image = objc2_core_graphics::CGDisplayCreateImageForRect(display.id, r)
+        let image = objc2_core_graphics::CGDisplayCreateImageForRect(display.id as u32, r)
             .context("CGDisplayCreateImageForRect failed")?;
         to_bgrx(&image)
     }
@@ -418,7 +418,7 @@ impl Platform for Native {
             height: px(vis.size.height).max(1),
         };
         let display = DisplayInfo {
-            id,
+            id: id.into(),
             bounds: NativeRect {
                 x: bounds.origin.x,
                 y: bounds.origin.y,

@@ -160,7 +160,7 @@ pub fn render(
                         .flex_col()
                         .gap(px(2.))
                         .min_w(px(0.))
-                        .flex_shrink()
+                        .flex_shrink(1.)
                         .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).child(toast.title.clone()))
                         .when_some(toast.detail.clone(), |d, detail| {
                             d.child(div().text_size(px(12.)).line_height(px(17.)).text_color(rgba(0xFFFF_FFB3)).child(detail))
@@ -371,7 +371,7 @@ pub fn show_startup(hotkey: Option<&str>, cx: &mut App) {
         Ok(area) => area,
         Err(e) => return log::debug!("could not determine notification area: {e:#}"),
     };
-    let Some(gpui_display) = cx.displays().into_iter().find(|d| u32::from(d.id()) == display.id) else {
+    let Some(gpui_display) = cx.displays().into_iter().find(|d| u64::from(d.id()) == display.id) else {
         return;
     };
     let detail = startup_detail(Native::TRAY_LOCATION, hotkey);

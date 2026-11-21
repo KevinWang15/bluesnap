@@ -37,7 +37,7 @@ pub fn add_slice(slice: CapturedSlice, cx: &mut App) {
                 view.append_slice(image, scale, shapes, window, cx);
             }
             if !was_hidden {
-                window.focus(view.focus_handle());
+                window.focus(view.focus_handle(), cx);
                 window.activate_window();
             }
         });
@@ -69,8 +69,8 @@ pub fn open_or_focus(cx: &mut App) {
     }
     if let Some(existing) = live_editor(cx) {
         let ok = existing
-            .update(cx, |view, window, _| {
-                window.focus(view.focus_handle());
+            .update(cx, |view, window, cx| {
+                window.focus(view.focus_handle(), cx);
                 window.activate_window();
             })
             .is_ok();
@@ -129,7 +129,7 @@ pub fn open_file(path: &Path, cx: &mut App) -> anyhow::Result<()> {
                     view.append_slice(img, scale, Vec::new(), window, cx);
                 }
                 if !was_hidden {
-                    window.focus(view.focus_handle());
+                    window.focus(view.focus_handle(), cx);
                     window.activate_window();
                 }
             })
@@ -170,17 +170,14 @@ pub fn prompt_open_file(bs_only: bool, owner: Option<WindowRef>, cx: &mut App) {
             let picked = match native_choice {
                 Ok(Some(res)) => res,
                 Ok(None) => {
-                    let rx = match cx.update(|cx| {
+                    let rx = cx.update(|cx| {
                         cx.prompt_for_paths(PathPromptOptions {
                             files: true,
                             directories: false,
                             multiple: false,
                             prompt: Some(if bs_only { "Open .bs File".into() } else { "Open .bs or Image".into() }),
                         })
-                    }) {
-                        Ok(rx) => rx,
-                        Err(_) => return,
-                    };
+                    });
                     match rx.await {
                         Ok(Ok(Some(mut paths))) => paths.pop(),
                         _ => None,
@@ -209,11 +206,10 @@ pub fn prompt_open_file(bs_only: bool, owner: Option<WindowRef>, cx: &mut App) {
                         crate::show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
                     }
                 }
-            })
-            .ok();
+            });
         }
         .await;
-        cx.update(run_mode::end_job).ok();
+        cx.update(run_mode::end_job);
     })
     .detach();
 }
@@ -232,12 +228,12 @@ pub fn request_add_image(cx: &mut App) {
             if let Err(e) = platform.set_window_visible(win_ref, false) {
                 log::warn!("could not hide editor window before capture: {e:#}");
             } else {
-                cx.update(|cx| cx.global_mut::<AppState>().editor_hidden = true).ok();
+                cx.update(|cx| cx.global_mut::<AppState>().editor_hidden = true);
             }
         }
         // Let WindowServer / DWM finish any remaining frame flip before grabbing pixels.
         cx.background_executor().timer(Duration::from_millis(30)).await;
-        cx.update(|cx| capture::start_with_mode(CaptureMode::ForEditor, cx)).ok();
+        cx.update(|cx| capture::start_with_mode(CaptureMode::ForEditor, cx));
     })
     .detach();
 }
@@ -261,14 +257,13 @@ pub fn restore_if_hidden(cx: &mut App) {
         if let Some(handle) = handle {
             cx.update(|cx| {
                 handle
-                    .update(cx, |view, window, _| {
-                        window.focus(view.focus_handle());
+                    .update(cx, |view, window, cx| {
+                        window.focus(view.focus_handle(), cx);
                         window.activate_window();
                     })
                     .ok();
                 cx.activate(true);
-            })
-            .ok();
+            });
         }
     })
     .detach();
@@ -286,7 +281,7 @@ fn show_composition(comp: Composition, title: &str, cx: &mut App) -> anyhow::Res
                 }
                 window.set_window_title(&title_owned);
                 if !was_hidden {
-                    window.focus(view.focus_handle());
+                    window.focus(view.focus_handle(), cx);
                     window.activate_window();
                 }
             })
@@ -350,8 +345,8 @@ fn open_window_with(comp: Composition, display: Option<DisplayId>, title: &str, 
         ..Default::default()
     };
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new_editor(editor, cx)))?;
-    let win_ref = handle.update(cx, |view, window, _| {
-        window.focus(view.focus_handle());
+    let win_ref = handle.update(cx, |view, window, cx| {
+        window.focus(view.focus_handle(), cx);
         window.activate_window();
         let window_ref = bluesnap_platform::window_ref(window).ok();
         if let Some(window_ref) = window_ref {

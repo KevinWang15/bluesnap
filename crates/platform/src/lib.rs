@@ -49,7 +49,7 @@ pub struct NativeRect {
 #[derive(Clone, Debug)]
 pub struct DisplayInfo {
     /// Same value gpui uses for its `DisplayId` on this OS.
-    pub id: u32,
+    pub id: u64,
     pub bounds: NativeRect,
     /// Physical pixels per logical pixel.
     pub scale_factor: f32,

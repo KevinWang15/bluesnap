@@ -19,7 +19,7 @@ use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, Deferred, DispatchPhase,
     DisplayId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Hitbox, HitboxBehavior, Hsla,
     InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollWheelEvent, Styled, Task, UTF16Selection,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, RenderImage, ScrollEvent, Styled, Task, UTF16Selection,
     Window, canvas, deferred, div, fill, point, px, quad, rgb, rgba, size, transparent_black, white,
 };
 
@@ -478,7 +478,7 @@ impl CanvasView {
 
     pub fn perform(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         self.bg_menu = None;
         self.text_menu = false;
@@ -703,7 +703,7 @@ impl CanvasView {
             toast::Action::OpenAiSettings => {
                 self.toast = None;
                 let above_overlay = self.is_capture();
-                cx.defer(move |cx| crate::ai_settings::open(above_overlay, cx));
+                cx.defer(move |cx| crate::settings::open(crate::settings::Page::Ai, above_overlay, cx));
             }
         }
         cx.notify();
@@ -896,8 +896,7 @@ impl CanvasView {
                                 this.editor.set_background_color(color);
                                 cx.notify();
                             });
-                        })
-                        .ok();
+                        });
                     }
                     Ok(None) => {}
                     Err(e) => log::error!("color dialog failed: {e:#}"),
@@ -1158,7 +1157,7 @@ impl CanvasView {
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
-            window.focus(&self.focus);
+            window.focus(&self.focus, cx);
         }
         if std::mem::take(&mut self.text_menu) {
             return cx.notify();
@@ -1231,11 +1230,11 @@ impl CanvasView {
         }
     }
 
-    fn scroll_wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
+    fn scroll_wheel(&mut self, ev: &ScrollEvent, window: &Window, cx: &mut Context<Self>) {
         let closed_menu = self.bg_menu.take().is_some() || std::mem::take(&mut self.text_menu);
         let delta = ev.delta.pixel_delta(window.line_height());
         let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
-        let cmd = ev.modifiers.secondary();
+        let cmd = ev.modifiers.secondary(cx);
         let shift = ev.modifiers.shift;
         if cmd && !self.is_capture() {
             let (fit, _) = self.fit_zoom(window);
@@ -1282,7 +1281,7 @@ impl CanvasView {
                 };
                 this.show_toast(toast, window, cx);
             }).ok();
-            gpui::AsyncApp::update(cx, crate::run_mode::end_job).ok();
+            gpui::AsyncApp::update(cx, crate::run_mode::end_job);
         }).detach();
     }
 
@@ -1326,7 +1325,7 @@ impl CanvasView {
 
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
-        let cmd = ks.modifiers.secondary();
+        let cmd = ks.modifiers.secondary(cx);
         let shift = ks.modifiers.shift;
         let editing = self.editor.is_editing_text();
         if editing && self.editor.text_marked().is_some() {
@@ -1774,7 +1773,7 @@ impl Scene {
                     match band {
                         SceneBand::Image(tiles) => paint_tiles(tiles, window),
                         SceneBand::Layer(b, image) => {
-                            window.paint_image(b, Corners::default(), image, 0, false).ok();
+                            window.paint_image(b, b, Corners::default(), image, 0, false).ok();
                         }
                     }
                 }
@@ -1842,7 +1841,7 @@ impl Scene {
         });
         let entity = self.entity.clone();
         let wheel_hitbox = hitbox.clone();
-        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+        window.on_mouse_event(move |ev: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && wheel_hitbox.is_hovered(window) {
                 entity.update(cx, |this, cx| this.scroll_wheel(ev, window, cx));
             }

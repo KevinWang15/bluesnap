@@ -39,11 +39,3 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-# gpui 0.2.2 pulls in xattr 0.2.3, which no longer builds on Linux against
-# current libc (`ENOATTR` was removed there). Only affects Linux builds.
-[patch.crates-io]
-xattr = { path = "third_party/xattr" }
-
-# GPUI 0.2.2 with per-window Direct3D atlas region updates for annotation layers.
-gpui = { path = "third_party/gpui" }

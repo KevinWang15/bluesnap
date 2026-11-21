@@ -3,7 +3,7 @@
 // No console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod ai_settings;
+mod settings;
 mod assets;
 mod canvas_view;
 mod capture;
@@ -33,7 +33,7 @@ use futures::StreamExt;
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use gpui::{
-    AnyWindowHandle, App, AppContext, Application, Bounds, Context, Global, IntoElement, ParentElement, Render,
+    AnyWindowHandle, App, AppContext, Bounds, Context, Global, IntoElement, ParentElement, Render,
     Styled, Window, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, size,
 };
 
@@ -43,10 +43,11 @@ use crate::run_mode::RunMode;
 pub struct AppState {
     pub(crate) mode: RunMode,
     pub config: Config,
-    /// The optional AI endpoints (see [`ai_settings`]).
+    /// The optional AI endpoints (see [`settings`]).
     pub ai: Arc<bluesnap_ai::AiSettings>,
     /// The open AI settings window, if any.
     pub ai_window: Option<AnyWindowHandle>,
+    pub settings_window: Option<AnyWindowHandle>,
     pub(crate) fonts: Arc<Fonts>,
     /// Invisible 1×1 window keeping GPUI's event loop alive across transient
     /// window transitions and async clipboard/save jobs.
@@ -87,7 +88,7 @@ fn main() {
     let mode = RunMode::from_env();
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
 
-    let app = Application::new().with_assets(assets::Assets);
+    let app = gpui_platform::application().with_assets(assets::Assets);
     app.on_open_urls(move |urls| {
         url_tx.unbounded_send(urls).ok();
     });
@@ -130,15 +131,16 @@ fn main() {
         if fonts.is_empty() {
             log::warn!("no usable font found; text annotations will be invisible");
         }
-        text_field::bind_keys(cx);
-        ai_settings::bind_keys(cx);
-        let ai = Arc::new(ai_settings::load());
+        gpui::components::init_components(cx);
+        settings::bind_keys(cx);
+        let ai = Arc::new(settings::load_ai());
         let startup_hotkey = hotkey_active.then(|| config.hotkey.clone());
         cx.set_global(AppState {
             mode: mode.clone(),
             config,
             ai,
             ai_window: None,
+            settings_window: None,
             fonts,
             keepalive,
             pending_jobs: 0,
@@ -171,8 +173,7 @@ fn main() {
                             show_error(format!("Could not open {}:\n\n{e:#}", path.display()), cx);
                         }
                     }
-                })
-                .ok();
+                });
             }
         })
         .detach();
@@ -229,7 +230,7 @@ fn start_demo_capture(cx: &mut App) {
     let Some(ms) = std::env::var("BLUESNAP_DEMO_CAPTURE_AFTER_MS").ok().and_then(|v| v.parse().ok()) else { return };
     cx.spawn(async move |cx| {
         cx.background_executor().timer(Duration::from_millis(ms)).await;
-        cx.update(capture::start_capture).ok();
+        cx.update(capture::start_capture);
     })
     .detach();
 }
@@ -331,9 +332,9 @@ fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHo
                 continue;
             }
             if Some(event.id) == capture_id {
-                cx.update(capture::start_capture).ok();
+                cx.update(capture::start_capture);
             } else if event.id == escape_id {
-                cx.update(scrolling::cancel_active).ok();
+                cx.update(scrolling::cancel_active);
             }
         }
     })
@@ -353,28 +354,22 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                 TrayCommand::Capture => {
                     // Let the menu finish closing so it isn't in the screenshot.
                     cx.background_executor().timer(Duration::from_millis(200)).await;
-                    cx.update(capture::start_capture).ok();
+                    cx.update(capture::start_capture);
                 }
                 TrayCommand::OpenEditor => {
-                    cx.update(editor_window::open_or_focus).ok();
+                    cx.update(editor_window::open_or_focus);
                 }
                 TrayCommand::OpenBsFile => {
                     cx.update(|cx| {
                         let owner = cx.global::<AppState>().editor_ref;
                         editor_window::prompt_open_file(true, owner, cx);
-                    })
-                    .ok();
+                    });
                 }
                 TrayCommand::EditSettings => {
-                    cx.update(|cx| match Config::path() {
-                        // `Config::load` created the file on startup.
-                        Some(path) => cx.open_with_system(&path),
-                        None => log::error!("no config directory on this system"),
-                    })
-                    .ok();
+                    cx.update(|cx| settings::open(settings::Page::General, false, cx));
                 }
                 TrayCommand::AiSettings => {
-                    cx.update(|cx| ai_settings::open(false, cx)).ok();
+                    cx.update(|cx| settings::open(settings::Page::Ai, false, cx));
                 }
                 TrayCommand::ToggleStartAtLogin => {
                     cx.update(|cx| {
@@ -385,11 +380,10 @@ fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<
                         if let Some(tray) = &cx.global::<AppState>().tray {
                             tray.show_start_at_login(platform.start_at_login());
                         }
-                    })
-                    .ok();
+                    });
                 }
                 TrayCommand::Quit => {
-                    cx.update(|cx| cx.quit()).ok();
+                    cx.update(|cx| cx.quit());
                 }
             }
         }

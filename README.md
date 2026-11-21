@@ -1,6 +1,6 @@
 # bluesnap
 
-A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https://gpui.rs).
+A fast screenshot tool for Windows and macOS, written in Rust with [GPUI](https://github.com/KevinWang15/gpui).
 
 | | |
 |---|---|
@@ -131,8 +131,9 @@ Login** on macOS (`~/Library/LaunchAgents/com.kevinwang15.bluesnap.plist`), star
 bluesnap when you log in. It's off by default. If the app has been moved, the entry
 is pointed at the new location the next time it runs.
 
-Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. It is set in
-`config.toml`, created on first run in the OS config directory
+Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. Use **Edit Settings…** to change the shortcut or the default save folder.
+The folder takes effect on save. Restart BlueSnap to activate a new shortcut.
+Both settings are stored in `config.toml`, created on first run in the OS config directory
 (`%APPDATA%\bluesnap\` on Windows, `~/Library/Application Support/bluesnap/` on macOS).
 If bluesnap ever crashes, the details are appended to `crash.log` in the same
 folder.
@@ -146,7 +147,7 @@ token and model; either or both:
 - an **LLM** behind an OpenAI-compatible Responses API (`/v1/responses`);
 - a **decision model** behind a Decisions API (`/v1/decisions`).
 
-Each section has a Test button. The settings are saved to `ai.json` beside
+Each section has a **Test connection** button. The settings are saved to `ai.json` beside
 `config.toml`, readable only by the user (it holds the tokens).
 
 ### Auto redaction
@@ -206,11 +207,10 @@ crates/
               toolbar.rs        reusable toolbars, style bars, and layer-order controls
               viewport.rs, gpu_image.rs  image <-> window mapping, tiled GPU atlases
               output.rs         clipboard copy and `.png` / `.bs` save dialog
-              ai_settings.rs    the AI Settings window; text_field.rs  its text inputs
+              settings.rs       general and AI settings windows
 packaging/          app icons (generated, source in packaging/icon), macOS Info.plist
 crates/platform/assets/fonts  Nunito (SIL Open Font License, Nunito-OFL.txt), the
                     rounded text face on Windows and Linux
-third_party/xattr   patched copy of a gpui dependency (see below)
 ```
 
 Text recognition is per OS: macOS uses the built-in Vision framework (Simplified and
@@ -232,8 +232,7 @@ Adding Linux means implementing `Platform` in `crates/platform/src/linux.rs`
 cargo run --release -p bluesnap
 ```
 
-- **Windows**: MSVC toolchain. Release builds of gpui compile shaders with `fxc.exe`
-  from the Windows SDK (set `GPUI_FXC_PATH` if it isn't found).
+- **Windows**: MSVC toolchain. The GPUI fork embeds precompiled Direct3D shaders.
 - **macOS**: Xcode (gpui compiles Metal shaders). CI builds `bluesnap.app`
   (menu bar app, no Dock icon) and uploads it zipped.
 
@@ -336,5 +335,3 @@ plan recompilation, and unloads after a minute idle.
   `macos.rs` is the only file to change.
 - On Linux/X11, the `global-hotkey` crate misses a hotkey press made within about a
   second of closing the overlay. Windows and macOS use different hotkey backends.
-- `third_party/xattr` patches xattr 0.2.3 (pulled in by gpui 0.2.2), which fails to
-  compile on Linux against current `libc`. It is unused on Windows and macOS builds.

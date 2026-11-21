@@ -223,7 +223,7 @@ pub fn start(
     let gpui_display = cx
         .displays()
         .into_iter()
-        .find(|d| u32::from(d.id()) == display.id)
+        .find(|d| u64::from(d.id()) == display.id)
         .ok_or_else(|| anyhow::anyhow!("display is gone"))?;
     // Where gpui places windows for this display (global on Windows, display-
     // relative on macOS). `place_floating_window` then sets the exact position.
@@ -552,7 +552,7 @@ impl ScrollingCapture {
             return;
         };
         let (scale, id) = (self.display.scale_factor, self.display.id);
-        let display = cx.displays().into_iter().find(|d| u32::from(d.id()) == id).map(|d| d.id());
+        let display = cx.displays().into_iter().find(|d| u64::from(d.id()) == id).map(|d| d.id());
         let shapes = std::mem::take(&mut self.shapes);
         cx.defer(move |cx| {
             crate::editor_window::add_slice(CapturedSlice { image, scale, shapes, display }, cx);

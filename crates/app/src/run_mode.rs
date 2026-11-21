@@ -134,7 +134,7 @@ fn has_bs_extension(path: &Path) -> bool {
 /// Hooks window-close events so modes with [`RunMode::exits_when_idle`] terminate
 /// cleanly after their last visible window and background I/O task finish.
 pub fn install_lifecycle(cx: &mut App) {
-    cx.on_window_closed(|cx| {
+    cx.on_window_closed(|cx, _| {
         cx.defer(exit_if_idle);
     })
     .detach();
@@ -170,6 +170,7 @@ pub fn exit_if_idle(cx: &mut App) {
         || state.overlay.is_some()
         || state.scrolling.is_some()
         || state.ai_window.is_some()
+        || state.settings_window.is_some()
     {
         return;
     }

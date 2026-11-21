@@ -59,7 +59,7 @@ pub fn start_with_mode(mode: CaptureMode, cx: &mut App) {
         // Let the OS unmap the startup toast before grabbing desktop pixels.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_millis(40)).await;
-            cx.update(|cx| launch_overlay(mode, cx)).ok();
+            cx.update(|cx| launch_overlay(mode, cx));
         })
         .detach();
         return;
@@ -89,7 +89,7 @@ fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
     let display = cx
         .displays()
         .into_iter()
-        .find(|d| u32::from(d.id()) == capture.display.id)
+        .find(|d| u64::from(d.id()) == capture.display.id)
         .context("captured display not known to gpui")?;
 
     let (width, height) = (capture.image.width, capture.image.height);
@@ -134,11 +134,11 @@ fn open_overlay(mode: CaptureMode, cx: &mut App) -> anyhow::Result<()> {
     cx.activate(true);
     let handle = cx.open_window(options, |_, cx| cx.new(|cx| CanvasView::new(editor, surface, cx)))?;
     stages.push(("open window", started.elapsed()));
-    handle.update(cx, |view, window, _| {
+    handle.update(cx, |view, window, cx| {
         if let Ok(window_ref) = bluesnap_platform::window_ref(window) {
             platform.present_as_srgb(window_ref);
         }
-        window.focus(view.focus_handle());
+        window.focus(view.focus_handle(), cx);
         window.activate_window();
         if let Err(e) = platform.configure_overlay(window, &capture.display) {
             log::warn!("overlay setup: {e:#}");

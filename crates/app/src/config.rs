@@ -51,6 +51,32 @@ impl Config {
         }
     }
 
+    /// Update the two form fields while retaining comments and unrelated TOML keys.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = Self::path().ok_or_else(|| anyhow::anyhow!("No config directory available"))?;
+        let source = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default_file(),
+            Err(e) => return Err(e.into()),
+        };
+        let text = self.update_document(&source)?;
+        bluesnap_core::atomic_file::write(&path, text.as_bytes())?;
+        Ok(())
+    }
+
+    fn update_document(&self, source: &str) -> anyhow::Result<String> {
+        let mut doc: toml_edit::DocumentMut = source.parse()?;
+        if doc.get("hotkey").and_then(toml_edit::Item::as_str) != Some(&self.hotkey) {
+            doc["hotkey"] = toml_edit::value(&self.hotkey);
+        }
+        if let Some(dir) = &self.save_dir {
+            doc["save_dir"] = toml_edit::value(dir.to_str().ok_or_else(|| anyhow::anyhow!("Invalid folder path"))?);
+        } else {
+            doc.remove("save_dir");
+        }
+        Ok(doc.to_string())
+    }
+
     fn default_file() -> String {
         format!(
             "# bluesnap settings. Restart bluesnap after editing.\n\
@@ -83,6 +109,20 @@ mod tests {
         let parsed: Config = toml::from_str(&Config::default_file()).unwrap();
         assert_eq!(parsed.hotkey, Native::DEFAULT_HOTKEY);
         assert!(parsed.save_dir.is_none());
+    }
+
+    #[test]
+    fn general_settings_round_trip_with_unrelated_keys_and_folder_reset() {
+        let mut config = Config { hotkey: "Alt+F9".into(), save_dir: Some("my pictures".into()) };
+        let updated = config.update_document("# custom settings\nother = 42\n").unwrap();
+        assert!(updated.contains("# custom settings\nother = 42"));
+        let parsed: Config = toml::from_str(&updated).unwrap();
+        assert_eq!(parsed.hotkey, config.hotkey);
+        assert_eq!(parsed.save_dir, config.save_dir);
+        config.save_dir = None;
+        let updated = config.update_document(&updated).unwrap();
+        assert!(!updated.contains("save_dir"));
+        assert!(config.update_document("invalid = [").is_err());
     }
 
     #[test]
