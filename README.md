@@ -132,7 +132,7 @@ bluesnap when you log in. It's off by default. If the app has been moved, the en
 is pointed at the new location the next time it runs.
 
 Default hotkey: **Ctrl+Alt+A** on Windows, **Ctrl+Cmd+A** on macOS. Use **Edit Settings…** to change the shortcut or the default save folder.
-The folder takes effect on save. Restart BlueSnap to activate a new shortcut.
+Click the shortcut and press the new combination to activate it immediately. Esc cancels recording. The folder takes effect on save.
 Both settings are stored in `config.toml`, created on first run in the OS config directory
 (`%APPDATA%\bluesnap\` on Windows, `~/Library/Application Support/bluesnap/` on macOS).
 If bluesnap ever crashes, the details are appended to `crash.log` in the same

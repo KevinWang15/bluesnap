@@ -1,11 +1,12 @@
 //! Preferences opened from the tray or the capture overlay.
+mod shortcut;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, ensure};
 use bluesnap_ai::{AiSettings, Endpoint};
 use bluesnap_platform::Platform;
-use global_hotkey::hotkey::HotKey;
 use gpui::components::*;
 use gpui::prelude::*;
 use gpui::{
@@ -13,6 +14,7 @@ use gpui::{
     PathPromptOptions, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, div, px, size,
 };
+use shortcut::Recording;
 
 use crate::{AppState, config::Config, text_field::truncate_chars};
 
@@ -166,16 +168,16 @@ impl Service {
 }
 
 enum Draft {
-    General {
-        hotkey: InputField,
-        folder: InputField,
-    },
+    General { folder: InputField },
     Ai([Service; 2]),
 }
 
 struct Settings {
     draft: Draft,
     focus: FocusHandle,
+    recorder_focus: FocusHandle,
+    recording: Option<Recording>,
+    shortcut_error: Option<SharedString>,
     error: Option<SharedString>,
 }
 
@@ -202,14 +204,12 @@ impl Settings {
         let draft = match page {
             Page::General => {
                 let config = &cx.global::<AppState>().config;
-                let hotkey = config.hotkey.clone();
                 let folder = config
                     .save_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 Draft::General {
-                    hotkey: new_input(hotkey, Config::default().hotkey, false, cx),
                     folder: new_input(folder, "Pictures folder", false, cx),
                 }
             }
@@ -222,14 +222,29 @@ impl Settings {
             }
         };
         let fields = match &draft {
-            Draft::General { hotkey, folder } => vec![(None, hotkey), (None, folder)],
+            Draft::General { folder } => vec![(None, folder)],
             Draft::Ai(services) => services
                 .iter()
                 .enumerate()
                 .flat_map(|(i, s)| [&s.url, &s.model, &s.token].map(|f| (Some(i), f)))
                 .collect(),
         };
-        window.focus(&fields[0].1.read(cx).focus_handle(cx), cx);
+        let recorder_focus = cx.focus_handle().tab_stop(true);
+        if matches!(page, Page::General) {
+            window.focus(&recorder_focus, cx);
+            cx.on_blur(&recorder_focus, window, |this, _, cx| {
+                this.cancel_recording(cx)
+            })
+            .detach();
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.cancel_recording(cx);
+                }
+            })
+            .detach();
+        } else {
+            window.focus(&fields[0].1.read(cx).focus_handle(cx), cx);
+        }
         for (index, field) in fields {
             cx.subscribe_in(
                 field,
@@ -249,27 +264,32 @@ impl Settings {
             )
             .detach();
         }
-        cx.on_release(move |_, cx| *page.handle(cx.global_mut::<AppState>()) = None)
-            .detach();
+        cx.on_release(move |this, cx| {
+            let state = cx.global_mut::<AppState>();
+            if let Some(recording) = this.recording.take()
+                && let Err(e) = recording.restore(state)
+            {
+                crate::show_error(format!("{e:#}"), cx);
+            }
+            *page.handle(cx.global_mut::<AppState>()) = None;
+        })
+        .detach();
         Self {
             draft,
             focus: cx.focus_handle(),
+            recorder_focus,
+            recording: None,
+            shortcut_error: None,
             error: None,
         }
     }
 
     fn persist(&self, cx: &mut App) -> Result<()> {
         match &self.draft {
-            Draft::General { hotkey, folder } => {
-                let hotkey = hotkey.read(cx).value().trim();
-                ensure!(
-                    hotkey.parse::<HotKey>().is_ok(),
-                    "Enter a valid shortcut, such as {}.",
-                    Config::default().hotkey
-                );
+            Draft::General { folder } => {
                 let dir = folder.read(cx).value().trim();
                 let config = Config {
-                    hotkey: hotkey.to_owned(),
+                    hotkey: cx.global::<AppState>().config.hotkey.clone(),
                     save_dir: (!dir.is_empty()).then(|| dir.into()),
                 };
                 config.save()?;
@@ -452,17 +472,20 @@ impl Render for Settings {
             .gap(px(16.))
             .p(px(22.));
         let body = match &self.draft {
-            Draft::General { hotkey, folder } => {
-                let shortcut = field().label("Global shortcut")
-                    .description("Restart BlueSnap to activate a new shortcut.")
-                    .child(input(hotkey));
+            Draft::General { folder } => {
+                let shortcut = setting_row("Global shortcut")
+                    .description("Click to record. Changes apply immediately. Esc cancels recording.")
+                    .control(self.shortcut_recorder(cx));
                 let browse = button("browse").outline().label("Browse…")
                     .on_click(cx.listener(|this, _, _, cx| this.browse(cx)));
                 let directory = field().label("Default save folder")
                     .description("Leave empty to use your Pictures folder.")
                     .child(div().flex().gap(px(8.))
                         .child(div().flex_1().min_w_0().child(input(folder))).child(browse));
-                body.child(section("Capture").child(card().p(px(16.)).child(shortcut)))
+                let capture = card().child(shortcut).when_some(self.shortcut_error.clone(), |c, error| {
+                    c.child(div().px(px(18.)).pb(px(12.)).text_sm().text_color(theme.destructive).child(error))
+                });
+                body.child(section("Capture").child(capture))
                     .child(section("Saving").child(card().p(px(16.)).child(directory)))
             }
             Draft::Ai(services) => body
@@ -477,7 +500,9 @@ impl Render for Settings {
             .bg(theme.background)
             .text_color(theme.foreground)
             .track_focus(&self.focus)
-            .key_context("BlueSnapSettings")
+            .when(self.recording.is_none(), |d| {
+                d.key_context("BlueSnapSettings")
+            })
             .on_action(cx.listener(|_, _: &NextField, w, cx| w.focus_next(cx)))
             .on_action(cx.listener(|_, _: &PreviousField, w, cx| w.focus_prev(cx)))
             .on_action(cx.listener(|this, _: &Save, w, cx| this.save(w, cx)))

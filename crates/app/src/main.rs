@@ -71,6 +71,8 @@ pub struct AppState {
     /// Global hotkey manager; kept alive for the lifetime of the app and shared
     /// with scrolling capture so it can register a session-scoped `Escape` cancel.
     pub(crate) hotkeys: Option<Rc<GlobalHotKeyManager>>,
+    /// Currently registered capture shortcut. Empty while recording a replacement.
+    capture_hotkey: Option<HotKey>,
     /// Removes the tray / menu bar icon when dropped.
     tray: Option<Tray>,
 }
@@ -105,7 +107,7 @@ fn main() {
         // In daemon mode, registers the global capture shortcut (warning on conflict);
         // in standalone `.bs` editor mode, skips global shortcut registration while
         // still wiring the manager for session-scoped `Esc` during scrolling capture.
-        let (hotkeys, hotkey_active) = init_hotkeys(mode.capture_hotkey(&config.hotkey), cx);
+        let (hotkeys, capture_hotkey) = init_hotkeys(mode.capture_hotkey(&config.hotkey), cx);
         if mode.refreshes_login_item()
             && platform.start_at_login()
             && let Err(e) = platform.set_start_at_login(true)
@@ -134,7 +136,7 @@ fn main() {
         gpui::components::init_components(cx);
         settings::bind_keys(cx);
         let ai = Arc::new(settings::load_ai());
-        let startup_hotkey = hotkey_active.then(|| config.hotkey.clone());
+        let startup_hotkey = capture_hotkey.map(|_| config.hotkey.clone());
         cx.set_global(AppState {
             mode: mode.clone(),
             config,
@@ -151,6 +153,7 @@ fn main() {
             scrolling: None,
             startup_toast: None,
             hotkeys,
+            capture_hotkey,
             tray,
         });
         run_mode::install_lifecycle(cx);
@@ -282,10 +285,9 @@ fn open_keepalive_window(cx: &mut App) -> Option<AnyWindowHandle> {
     }
 }
 
-fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, bool) {
+fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHotKeyManager>>, Option<HotKey>) {
     let report = |e: anyhow::Error, cx: &mut App| {
-        let path = Config::path().map(|p| p.display().to_string()).unwrap_or_default();
-        show_error(format!("{e:#}\n\nChange `hotkey` in {path}, then quit and restart bluesnap."), cx);
+        show_error(format!("{e:#}\n\nOpen Edit Settings… to record a capture shortcut."), cx);
     };
     let manager = match GlobalHotKeyManager::new().context("global hotkeys unavailable") {
         Ok(m) => Rc::new(m),
@@ -295,10 +297,10 @@ fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHo
             } else {
                 log::debug!("session hotkeys unavailable in standalone mode: {e:#}");
             }
-            return (None, false);
+            return (None, None);
         }
     };
-    let capture_id = capture_spec.and_then(|spec| {
+    let capture_key = capture_spec.and_then(|spec| {
         match spec
             .parse::<HotKey>()
             .with_context(|| format!("invalid hotkey {spec:?}"))
@@ -306,11 +308,11 @@ fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHo
                 manager
                     .register(hotkey)
                     .with_context(|| format!("could not register {spec:?}; another app may be using it"))?;
-                Ok(hotkey.id())
+                Ok(hotkey)
             }) {
-            Ok(id) => {
+            Ok(key) => {
                 log::info!("ready: press {spec} to capture");
-                Some(id)
+                Some(key)
             }
             Err(e) => {
                 report(e, cx);
@@ -318,7 +320,6 @@ fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHo
             }
         }
     });
-    let hotkey_active = capture_id.is_some();
 
     // The handler runs inside the OS event dispatch; hop onto a gpui task.
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
@@ -331,15 +332,17 @@ fn init_hotkeys(capture_spec: Option<&str>, cx: &mut App) -> (Option<Rc<GlobalHo
             if event.state != HotKeyState::Pressed {
                 continue;
             }
-            if Some(event.id) == capture_id {
-                cx.update(capture::start_capture);
-            } else if event.id == escape_id {
-                cx.update(scrolling::cancel_active);
-            }
+            cx.update(|cx| {
+                if cx.global::<AppState>().capture_hotkey.is_some_and(|key| key.id() == event.id) {
+                    capture::start_capture(cx);
+                } else if event.id == escape_id {
+                    scrolling::cancel_active(cx);
+                }
+            });
         }
     })
     .detach();
-    (Some(manager), hotkey_active)
+    (Some(manager), capture_key)
 }
 
 fn create_tray(platform: &Native, hotkey: &str, cx: &mut App) -> anyhow::Result<Tray> {

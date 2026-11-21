@@ -87,5 +87,13 @@ pub(crate) fn create(style: Style, hotkey: &str, on_command: Box<dyn Fn(TrayComm
     let tray = builder.build().context("creating tray icon")?;
     // The menu checks or unchecks the item itself when clicked; the app sets
     // it again once it knows whether the change worked.
-    Ok(Tray { _icon: Box::new(tray), show_start_at_login: Box::new(move |on| login.set_checked(on)) })
+    Ok(Tray {
+        update_hotkey: Box::new(move |spec| {
+            capture.set_text(format!("Take Screenshot ({spec})"));
+            if let Err(e) = tray.set_tooltip(Some(format!("bluesnap ({spec})"))) {
+                log::warn!("could not update the tray tooltip: {e}");
+            }
+        }),
+        show_start_at_login: Box::new(move |on| login.set_checked(on)),
+    })
 }

@@ -162,11 +162,16 @@ pub enum AppRole {
 
 /// Keeps the tray / menu bar icon alive; dropping it removes the icon.
 pub struct Tray {
-    _icon: Box<dyn std::any::Any>,
+    update_hotkey: Box<dyn Fn(&str)>,
     show_start_at_login: Box<dyn Fn(bool)>,
 }
 
 impl Tray {
+    /// Updates the capture menu label and tray tooltip after recording a shortcut.
+    pub fn show_hotkey(&self, spec: &str) {
+        (self.update_hotkey)(spec);
+    }
+
     /// Sets the check mark of the start-at-login item.
     pub fn show_start_at_login(&self, enabled: bool) {
         (self.show_start_at_login)(enabled)
