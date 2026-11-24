@@ -492,6 +492,9 @@ impl CanvasView {
             Action::Undo => {
                 self.editor.undo();
             }
+            Action::Redo => {
+                self.editor.redo();
+            }
             Action::Scrolling => self.start_scrolling_capture(window, cx),
             Action::ToText => self.extract_text(window, cx),
             Action::AddToEditor => self.send_capture_to_editor(window, cx),
@@ -1175,10 +1178,12 @@ impl CanvasView {
         let p = self.viewport.to_image(ev.position);
         match ev.button {
             MouseButton::Left => {
-                if ev.click_count >= 2 && self.editor.double_click(p) {
-                    return self.finish(Finish::Copy, window, cx);
+                if !self.editor.text_pointer_down(p, ev.modifiers.shift, ev.click_count) {
+                    if ev.click_count >= 2 && self.editor.double_click(p) {
+                        return self.finish(Finish::Copy, window, cx);
+                    }
+                    self.editor.pointer_down(p);
                 }
-                self.editor.pointer_down(p);
             }
             MouseButton::Right => match self.editor.right_click_at(p) {
                 RightClick::Exit => return self.finish(Finish::Cancel, window, cx),
@@ -1327,11 +1332,16 @@ impl CanvasView {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.secondary(cx);
         let shift = ks.modifiers.shift;
+        let alt = ks.modifiers.alt;
+        let word_mod = if cfg!(target_os = "macos") { alt } else { cmd };
+        let line_mod = cfg!(target_os = "macos") && cmd;
+        let doc_mod = if cfg!(target_os = "macos") { cmd } else { ks.modifiers.control };
         let editing = self.editor.is_editing_text();
         if editing && self.editor.text_marked().is_some() {
             return;
         }
-        match ks.key.as_str() {
+        let key = ks.key.to_ascii_lowercase();
+        match key.as_str() {
             "escape" if self.text_menu => self.text_menu = false,
             "escape" if self.bg_menu.is_some() => self.bg_menu = None,
             "i" if !editing && self.loupe_target(window).is_some() => self.copy_color(window, cx),
@@ -1340,12 +1350,77 @@ impl CanvasView {
             "escape" if self.is_capture() => return self.finish(Finish::Cancel, window, cx),
             "enter" if editing => self.editor.text_key(TextKey::Newline),
             "enter" if self.is_capture() => return self.finish(Finish::Copy, window, cx),
-            "backspace" if editing => self.editor.text_key(TextKey::Backspace),
-            "delete" if editing => self.editor.text_key(TextKey::Delete),
-            "left" if editing => self.editor.text_key(TextKey::Left),
-            "right" if editing => self.editor.text_key(TextKey::Right),
-            "home" if editing => self.editor.text_key(TextKey::Home),
-            "end" if editing => self.editor.text_key(TextKey::End),
+            "backspace" if editing => self.editor.text_key(if word_mod {
+                TextKey::DeleteWordLeft
+            } else {
+                TextKey::Backspace
+            }),
+            "delete" if editing => self.editor.text_key(if word_mod {
+                TextKey::DeleteWordRight
+            } else {
+                TextKey::Delete
+            }),
+            "left" if editing => self.editor.text_key(match (line_mod, word_mod, shift) {
+                (true, _, true) => TextKey::SelectHome,
+                (true, _, false) => TextKey::Home,
+                (false, true, true) => TextKey::SelectWordLeft,
+                (false, true, false) => TextKey::WordLeft,
+                (false, false, true) => TextKey::SelectLeft,
+                (false, false, false) => TextKey::Left,
+            }),
+            "right" if editing => self.editor.text_key(match (line_mod, word_mod, shift) {
+                (true, _, true) => TextKey::SelectEnd,
+                (true, _, false) => TextKey::End,
+                (false, true, true) => TextKey::SelectWordRight,
+                (false, true, false) => TextKey::WordRight,
+                (false, false, true) => TextKey::SelectRight,
+                (false, false, false) => TextKey::Right,
+            }),
+            "up" if editing => self.editor.text_key(match (line_mod, shift) {
+                (true, true) => TextKey::SelectDocStart,
+                (true, false) => TextKey::DocStart,
+                (false, true) => TextKey::SelectUp,
+                (false, false) => TextKey::Up,
+            }),
+            "down" if editing => self.editor.text_key(match (line_mod, shift) {
+                (true, true) => TextKey::SelectDocEnd,
+                (true, false) => TextKey::DocEnd,
+                (false, true) => TextKey::SelectDown,
+                (false, false) => TextKey::Down,
+            }),
+            "home" if editing => self.editor.text_key(match (doc_mod, shift) {
+                (true, true) => TextKey::SelectDocStart,
+                (true, false) => TextKey::DocStart,
+                (false, true) => TextKey::SelectHome,
+                (false, false) => TextKey::Home,
+            }),
+            "end" if editing => self.editor.text_key(match (doc_mod, shift) {
+                (true, true) => TextKey::SelectDocEnd,
+                (true, false) => TextKey::DocEnd,
+                (false, true) => TextKey::SelectEnd,
+                (false, false) => TextKey::End,
+            }),
+            "a" if cmd && editing => self.editor.text_key(TextKey::SelectAll),
+            "x" if cmd && editing => {
+                if let Some(selected) = self.editor.text_selected().map(str::to_owned) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    self.editor.text_key(TextKey::Backspace);
+                }
+            }
+            "c" if cmd && editing => {
+                if let Some(selected) = self.editor.text_selected().map(str::to_owned) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                } else if !self.is_capture() {
+                    self.copy_canvas_item(window, cx);
+                }
+            }
+            "v" if cmd && editing && self.is_capture() => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                    && !text.is_empty()
+                {
+                    self.editor.text_replace(None, &text, false, None);
+                }
+            }
             "backspace" | "delete" => {
                 self.editor.delete_selected();
             }
@@ -1357,8 +1432,14 @@ impl CanvasView {
                 let order = if shift { LayerOrder::ToFront } else { LayerOrder::Forward };
                 self.editor.reorder_selected(order);
             }
+            "z" if cmd && shift => {
+                self.editor.redo();
+            }
             "z" if cmd => {
                 self.editor.undo();
+            }
+            "y" if cmd && !cfg!(target_os = "macos") && !shift => {
+                self.editor.redo();
             }
             "o" if cmd && !self.is_capture() => {
                 let owner = bluesnap_platform::window_ref(window).ok();
@@ -1484,6 +1565,11 @@ impl CanvasView {
                 .selected_frame()
                 .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
             text_frame: e.text_frame().map(|r| v.to_window(r)),
+            text_selection: e.text_selection_rects().into_iter().map(|r| v.to_window(r)).collect(),
+            text_selection_color: match e.text_box_color() {
+                Some(c) if c.b > 160 && c.b > c.r.saturating_add(40) => rgba(0xFFFF_FF66).into(),
+                _ => rgba(0x1677_FF59).into(),
+            },
             brush_ring: e.brush_ring().map(|b| {
                 let z = |d: f32| px(d * v.zoom);
                 (v.point_to_window(b.center), size(z(b.half_width), z(b.half_height)), z(b.corner))
@@ -1700,6 +1786,8 @@ struct Scene {
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_frame: Option<Bounds<Pixels>>,
+    text_selection: Vec<Bounds<Pixels>>,
+    text_selection_color: Hsla,
     brush_ring: Option<(Point<Pixels>, gpui::Size<Pixels>, Pixels)>,
     caret: Option<(Bounds<Pixels>, Hsla)>,
     editor_cursor: CursorKind,
@@ -1812,6 +1900,9 @@ impl Scene {
         if let Some(frame) = self.text_frame {
             window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), blue, BorderStyle::Dashed));
         }
+        for rect in &self.text_selection {
+            window.paint_quad(fill(*rect, self.text_selection_color));
+        }
         if let Some((caret, color)) = self.caret {
             window.paint_quad(fill(caret, color));
         }
@@ -1878,8 +1969,8 @@ impl EntityInputHandler for CanvasView {
 
     fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
         let text = self.editor.text_content()?;
-        let caret = byte_to_utf16(text, self.editor.text_caret()?);
-        Some(UTF16Selection { range: caret..caret, reversed: false })
+        let range = range_to_utf16(text, &self.editor.text_selection()?);
+        Some(UTF16Selection { range, reversed: self.editor.text_selection_reversed() })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {

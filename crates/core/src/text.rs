@@ -339,6 +339,111 @@ impl TextLayout {
             .min_by(|a, b| (a.1 - p.x).abs().total_cmp(&(b.1 - p.x).abs()))
             .map_or(0, |c| c.0)
     }
+
+    /// Selection highlight rectangles (relative to the layout origin) for byte `range`.
+    pub fn selection_rects(&self, range: std::ops::Range<usize>) -> Vec<Rect> {
+        if range.start >= range.end {
+            return Vec::new();
+        }
+        let x_of = |line: &LineLayout, offset: usize| -> f32 {
+            if let Some(&(_, x)) = line.carets.iter().find(|&&(b, _)| b == offset) {
+                return x;
+            }
+            line.carets
+                .iter()
+                .rfind(|&&(b, _)| b <= offset)
+                .or_else(|| line.carets.first())
+                .map_or(0.0, |&(_, x)| x)
+        };
+        let mut rects = Vec::new();
+        let newline_w = (self.size * 0.35).max(4.0);
+        for line in &self.lines {
+            let Some(&(line_start, _)) = line.carets.first() else { continue };
+            let Some(&(line_end, _)) = line.carets.last() else { continue };
+            if range.end <= line_start || range.start > line_end {
+                continue;
+            }
+            if range.start == line_end && range.end <= line_end {
+                continue;
+            }
+            let s = range.start.max(line_start);
+            let e = range.end.min(line_end);
+            let x0 = x_of(line, s);
+            let mut x1 = x_of(line, e);
+            if range.end > line_end {
+                x1 += newline_w;
+            }
+            if x1 > x0 {
+                rects.push(Rect::new(x0, line.top, x1 - x0, self.line_height));
+            }
+        }
+        rects
+    }
+
+    /// Moves `index` up (`delta_lines < 0`) or down (`delta_lines > 0`), preserving
+    /// `preferred_x` when moving across lines. Clamps to start/end of text on the
+    /// first/last line and clears `preferred_x` on clamp.
+    pub fn vertical_move(&self, index: usize, delta_lines: isize, preferred_x: Option<f32>) -> (usize, Option<f32>) {
+        if self.lines.is_empty() || delta_lines == 0 {
+            return (index, preferred_x);
+        }
+        let (mut row, mut col, mut x) = (self.lines.len() - 1, 0usize, 0.0f32);
+        if let Some(last) = self.lines.last()
+            && let Some((i, &(_, lx))) = last.carets.iter().enumerate().last()
+        {
+            col = i;
+            x = lx;
+        }
+        'find: for (r, line) in self.lines.iter().enumerate() {
+            for (c, &(b, cx)) in line.carets.iter().enumerate() {
+                if b == index {
+                    row = r;
+                    col = c;
+                    x = cx;
+                    break 'find;
+                }
+            }
+        }
+        let has_x = self.lines.iter().any(|l| l.carets.last().is_some_and(|c| c.1 > 0.0));
+        if delta_lines < 0 {
+            if row == 0 {
+                return (0, None);
+            }
+            let target_row = row.saturating_sub(delta_lines.unsigned_abs());
+            let line = &self.lines[target_row];
+            if has_x {
+                let target_x = preferred_x.unwrap_or(x);
+                let next = line
+                    .carets
+                    .iter()
+                    .min_by(|a, b| (a.1 - target_x).abs().total_cmp(&(b.1 - target_x).abs()))
+                    .map_or(0, |c| c.0);
+                (next, Some(target_x))
+            } else {
+                let c = col.min(line.carets.len().saturating_sub(1));
+                (line.carets.get(c).map_or(0, |k| k.0), None)
+            }
+        } else {
+            if row + 1 >= self.lines.len() {
+                let end = self.lines.last().and_then(|l| l.carets.last()).map_or(0, |c| c.0);
+                return (end, None);
+            }
+            let target_row = (row + delta_lines as usize).min(self.lines.len() - 1);
+            let line = &self.lines[target_row];
+            if has_x {
+                let target_x = preferred_x.unwrap_or(x);
+                let next = line
+                    .carets
+                    .iter()
+                    .min_by(|a, b| (a.1 - target_x).abs().total_cmp(&(b.1 - target_x).abs()))
+                    .map_or(0, |c| c.0);
+                (next, Some(target_x))
+            } else {
+                let c = col.min(line.carets.len().saturating_sub(1));
+                (line.carets.get(c).map_or(0, |k| k.0), None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +480,32 @@ mod tests {
         // Bad ranges and no fonts: the whole line.
         assert_eq!(fonts.span_rect(line, "key", 0..9), line);
         assert_eq!(FontSet::empty().span_rect(line, "key=secret", 4..10), line);
+    }
+
+    #[test]
+    fn selection_rects_and_vertical_move_cover_multiline_text() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../platform/assets/fonts/Nunito.ttf");
+        let set = FontSet::from_sources(&[FontSource::file(path).weight(800.0)]);
+        let text = "hello\nworld\nend";
+        let layout = set.layout(text, 24.0);
+        // Single-line selection inside first line.
+        let single = layout.selection_rects(1..4);
+        assert_eq!(single.len(), 1);
+        assert!(single[0].w > 0.0 && single[0].h > 0.0);
+        assert_eq!(single[0].y, 0.0);
+        // Multi-line selection spanning across lines 0 and 1.
+        let multi = layout.selection_rects(3..9);
+        assert_eq!(multi.len(), 2);
+        assert!(multi[0].y < multi[1].y);
+        assert!(multi[0].w > 0.0 && multi[1].w > 0.0);
+        // Vertical movement down then up returns near the starting column, and clamps at ends.
+        let (down1, px) = layout.vertical_move(2, 1, None);
+        assert!(down1 >= 6 && down1 <= 11);
+        assert!(px.is_some());
+        let (up1, _) = layout.vertical_move(down1, -1, px);
+        assert_eq!(up1, 2);
+        assert_eq!(layout.vertical_move(2, -1, None), (0, None));
+        assert_eq!(layout.vertical_move(13, 1, None), (text.len(), None));
     }
 }
 

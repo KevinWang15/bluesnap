@@ -55,6 +55,7 @@ pub enum Action {
     OpenFile,
     Tool(Tool),
     Undo,
+    Redo,
     Scrolling,
     ToText,
     /// Sends the capture (raw image + unflattened annotations) into the Editor.
@@ -78,6 +79,7 @@ impl Action {
             Action::Tool(Tool::Redact) => "icons/mosaic.svg",
             Action::Tool(Tool::Text) => "icons/text.svg",
             Action::Undo => "icons/undo.svg",
+            Action::Redo => "icons/redo.svg",
             Action::Scrolling => "icons/scroll.svg",
             Action::ToText => "icons/ocr.svg",
             Action::AddToEditor => "icons/edit.svg",
@@ -110,6 +112,13 @@ impl Action {
                     "Undo (⌘Z)"
                 } else {
                     "Undo (Ctrl+Z)"
+                }
+            }
+            Action::Redo => {
+                if cfg!(target_os = "macos") {
+                    "Redo (⇧⌘Z)"
+                } else {
+                    "Redo (Ctrl+Shift+Z)"
                 }
             }
             Action::Scrolling => "Scrolling screenshot: scroll the window to capture more",
@@ -169,21 +178,21 @@ pub const FINISH: [Action; 3] = [Action::Save, Action::Cancel, Action::Done];
 /// Standalone capture overlay toolbar: includes `AddToEditor`.
 pub const CAPTURE_TOOLBAR: &[&[Action]] = &[
     &TOOLS,
-    &[Action::Undo],
+    &[Action::Undo, Action::Redo],
     &[Action::Scrolling, Action::ToText, Action::AddToEditor, FINISH[0], FINISH[1], FINISH[2]],
 ];
 
 /// Capture overlay toolbar when capturing a new image from inside the Editor:
 /// `AddToEditor` is hidden and `Done` adds the image to the open Editor.
 pub const CAPTURE_FOR_EDITOR_TOOLBAR: &[&[Action]] =
-    &[&TOOLS, &[Action::Undo], &[Action::Scrolling, Action::ToText, FINISH[0], FINISH[1], FINISH[2]]];
+    &[&TOOLS, &[Action::Undo, Action::Redo], &[Action::Scrolling, Action::ToText, FINISH[0], FINISH[1], FINISH[2]]];
 
 /// Composition Editor toolbar: `AddImage` at the far left, followed by `OpenFile`,
-/// then all annotation tools, Undo, ToText, Save, Cancel, and Done (Copy).
+/// then all annotation tools, Undo, Redo, ToText, Save, Cancel, and Done (Copy).
 pub const EDITOR_TOOLBAR: &[&[Action]] = &[
     &[Action::AddImage, Action::OpenFile],
     &TOOLS,
-    &[Action::Undo],
+    &[Action::Undo, Action::Redo],
     &[Action::ToText, FINISH[0], FINISH[1], FINISH[2]],
 ];
 
@@ -453,6 +462,7 @@ pub fn toolbar(
             let (active, enabled) = match action {
                 Action::Tool(tool) => (editor.tool() == Some(tool), true),
                 Action::Undo => (false, editor.can_undo()),
+                Action::Redo => (false, editor.can_redo()),
                 Action::ToText => (view.is_recognizing(), !view.is_recognizing()),
                 _ => (false, true),
             };
@@ -1045,8 +1055,8 @@ mod tests {
     #[test]
     fn panel_size_counts_buttons_separators_and_gaps() {
         let frame = 2.0 * (BORDER + PAD);
-        // CAPTURE_TOOLBAR: 8 tools | Undo | Scrolling, ToText, AddToEditor, Save, Cancel, Done = 15 buttons, 2 separators, 16 gaps.
-        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 15.0 * BUTTON + 2.0 * SEP + 16.0 * GAP, 42.0));
+        // CAPTURE_TOOLBAR: 8 tools | Undo, Redo | Scrolling, ToText, AddToEditor, Save, Cancel, Done = 16 buttons, 2 separators, 17 gaps.
+        assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0), (frame + 16.0 * BUTTON + 2.0 * SEP + 17.0 * GAP, 42.0));
         // CAPTURE_FOR_EDITOR_TOOLBAR hides AddToEditor: one button + gap narrower.
         assert_eq!(panel_size(CAPTURE_TOOLBAR, 0.0).0 - panel_size(CAPTURE_FOR_EDITOR_TOOLBAR, 0.0).0, BUTTON + GAP);
         // EDITOR_TOOLBAR starts with AddImage on the far left.
@@ -1111,6 +1121,7 @@ mod tests {
         let expected_mod = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
         assert!(Action::OpenFile.label_for(ToolbarMode::Editor).contains(expected_mod));
         assert!(Action::Undo.label_for(ToolbarMode::Editor).contains(expected_mod));
+        assert!(Action::Redo.label_for(ToolbarMode::Editor).contains(expected_mod));
         assert!(Action::Save.label_for(ToolbarMode::Editor).contains(expected_mod));
     }
 }
