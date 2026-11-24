@@ -18,13 +18,11 @@ use shortcut::Recording;
 
 use crate::{AppState, config::Config, text_field::truncate_chars};
 
-actions!(settings, [NextField, PreviousField, Save, Close]);
+actions!(settings, [Save, Close]);
 
 pub fn bind_keys(cx: &mut App) {
     let c = Some("BlueSnapSettings");
     cx.bind_keys([
-        KeyBinding::new("tab", NextField, c),
-        KeyBinding::new("shift-tab", PreviousField, c),
         KeyBinding::new(
             if cfg!(target_os = "macos") {
                 "cmd-s"
@@ -168,16 +166,17 @@ impl Service {
 }
 
 enum Draft {
-    General { folder: InputField },
+    General {
+        recorder: Entity<ShortcutRecorderState>,
+        folder: Entity<PathInputState>,
+    },
     Ai([Service; 2]),
 }
 
 struct Settings {
     draft: Draft,
     focus: FocusHandle,
-    recorder_focus: FocusHandle,
     recording: Option<Recording>,
-    shortcut_error: Option<SharedString>,
     error: Option<SharedString>,
 }
 
@@ -196,22 +195,27 @@ impl Settings {
             .with_accent(gpui::rgb(0x1677ff).into())
             .with_preference(pref)
         };
-        Theme::set_global(
-            theme(window.appearance().into(), ThemePreference::System, cx),
-            cx,
-        );
+        let initial = theme(window.appearance().into(), ThemePreference::System, cx);
+        initial.sync_window_appearance(window);
+        Theme::set_global(initial, cx);
         Theme::observe_system_appearance(window, theme).detach();
         let draft = match page {
             Page::General => {
                 let config = &cx.global::<AppState>().config;
-                let folder = config
+                let hotkey = config.hotkey.clone();
+                let folder_value = config
                     .save_dir
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                Draft::General {
-                    folder: new_input(folder, "Pictures folder", false, cx),
-                }
+                let recorder = shortcut::new_recorder(&hotkey, cx);
+                let folder = cx.new(|cx| {
+                    PathInputState::new(PathSource::local_directories(), cx)
+                        .default_value(folder_value, cx)
+                        .placeholder("Pictures folder")
+                        .clearable(true)
+                });
+                Draft::General { recorder, folder }
             }
             Page::Ai => {
                 let ai = cx.global::<AppState>().ai.clone();
@@ -221,48 +225,50 @@ impl Settings {
                 ])
             }
         };
-        let fields = match &draft {
-            Draft::General { folder } => vec![(None, folder)],
-            Draft::Ai(services) => services
-                .iter()
-                .enumerate()
-                .flat_map(|(i, s)| [&s.url, &s.model, &s.token].map(|f| (Some(i), f)))
-                .collect(),
-        };
-        let recorder_focus = cx.focus_handle().tab_stop(true);
-        if matches!(page, Page::General) {
-            window.focus(&recorder_focus, cx);
-            cx.on_blur(&recorder_focus, window, |this, _, cx| {
-                this.cancel_recording(cx)
-            })
-            .detach();
-            cx.observe_window_activation(window, |this, window, cx| {
-                if !window.is_window_active() {
-                    this.cancel_recording(cx);
-                }
-            })
-            .detach();
-        } else {
-            window.focus(&fields[0].1.read(cx).focus_handle(cx), cx);
-        }
-        for (index, field) in fields {
-            cx.subscribe_in(
-                field,
-                window,
-                move |this, _, event, window, cx| match event {
-                    InputEvent::Submit(_) => this.save(window, cx),
-                    InputEvent::Change(_) => {
+        match &draft {
+            Draft::General { recorder, folder } => {
+                window.focus(&recorder.read(cx).focus_handle(cx), cx);
+                cx.subscribe(recorder, Self::handle_recorder_event).detach();
+                cx.subscribe_in(folder, window, |this, _, event, window, cx| match event {
+                    PathInputEvent::Submit(_) => this.save(window, cx),
+                    PathInputEvent::Change(_) => {
                         this.error = None;
-                        if let (Draft::Ai(services), Some(i)) = (&mut this.draft, index) {
-                            services[i].test = None;
-                            services[i].status = None;
-                        }
                         cx.notify();
                     }
                     _ => {}
-                },
-            )
-            .detach();
+                })
+                .detach();
+                cx.observe_window_activation(window, |this, window, cx| {
+                    if !window.is_window_active() {
+                        this.cancel_recording(cx);
+                    }
+                })
+                .detach();
+            }
+            Draft::Ai(services) => {
+                window.focus(&services[0].url.read(cx).focus_handle(cx), cx);
+                for (index, service) in services.iter().enumerate() {
+                    for field in [&service.url, &service.model, &service.token] {
+                        cx.subscribe_in(
+                            field,
+                            window,
+                            move |this, _, event, window, cx| match event {
+                                InputEvent::Submit(_) => this.save(window, cx),
+                                InputEvent::Change(_) => {
+                                    this.error = None;
+                                    if let Draft::Ai(services) = &mut this.draft {
+                                        services[index].test = None;
+                                        services[index].status = None;
+                                    }
+                                    cx.notify();
+                                }
+                                _ => {}
+                            },
+                        )
+                        .detach();
+                    }
+                }
+            }
         }
         cx.on_release(move |this, cx| {
             let state = cx.global_mut::<AppState>();
@@ -277,17 +283,15 @@ impl Settings {
         Self {
             draft,
             focus: cx.focus_handle(),
-            recorder_focus,
             recording: None,
-            shortcut_error: None,
             error: None,
         }
     }
 
     fn persist(&self, cx: &mut App) -> Result<()> {
         match &self.draft {
-            Draft::General { folder } => {
-                let dir = folder.read(cx).value().trim();
+            Draft::General { folder, .. } => {
+                let dir = folder.read(cx).value(cx).trim();
                 let config = Config {
                     hotkey: cx.global::<AppState>().config.hotkey.clone(),
                     save_dir: (!dir.is_empty()).then(|| dir.into()),
@@ -314,14 +318,25 @@ impl Settings {
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.persist(cx) {
-            Ok(()) => Self::close(window, cx),
+            Ok(()) => Self::close_window(window, cx),
             Err(e) => {
                 self.error = Some(truncate_chars(&format!("{e:#}"), 220).into());
                 cx.notify();
             }
         }
     }
-    fn close(window: &mut Window, cx: &mut Context<Self>) {
+
+    fn close_or_dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Draft::General { folder, .. } = &self.draft
+            && folder.read(cx).is_open()
+        {
+            folder.update(cx, |f, cx| f.close_suggestions(cx));
+            return;
+        }
+        Self::close_window(window, cx);
+    }
+
+    fn close_window(window: &mut Window, cx: &mut Context<Self>) {
         cx.defer_in(window, |_, window, _| window.remove_window());
     }
 
@@ -339,7 +354,14 @@ impl Settings {
         cx.spawn(async move |this, cx| match picker.await {
             Ok(Ok(Some(paths))) => {
                 if let Some(path) = paths.first() {
-                    folder.update(cx, |f, cx| f.set_value(path.display().to_string(), cx));
+                    folder.update(cx, |f, cx| {
+                        f.set_value_silent(path.display().to_string(), cx);
+                    });
+                    this.update(cx, |this, cx| {
+                        this.error = None;
+                        cx.notify();
+                    })
+                    .ok();
                 }
             }
             Ok(Err(e)) => {
@@ -462,30 +484,32 @@ impl Settings {
 impl Render for Settings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let body = div()
-            .id("settings-scroll")
-            .overflow_y_scroll()
+        let body = scroll_area("settings-scroll")
+            .fill_viewport(true)
             .flex_1()
             .min_h_0()
-            .flex()
-            .flex_col()
-            .gap(px(16.))
-            .p(px(22.));
+            .padding(px(22.))
+            .spacing(px(16.));
         let body = match &self.draft {
-            Draft::General { folder } => {
+            Draft::General { recorder, folder } => {
                 let shortcut = setting_row("Global shortcut")
                     .description("Click to record. Changes apply immediately. Esc cancels recording.")
-                    .control(self.shortcut_recorder(cx));
-                let browse = button("browse").outline().label("Browse…")
+                    .control(shortcut_recorder(recorder).w(px(230.)));
+                let browse = button("browse")
+                    .outline()
+                    .label("Browse…")
                     .on_click(cx.listener(|this, _, _, cx| this.browse(cx)));
-                let directory = field().label("Default save folder")
+                let directory = field()
+                    .label("Default save folder")
                     .description("Leave empty to use your Pictures folder.")
-                    .child(div().flex().gap(px(8.))
-                        .child(div().flex_1().min_w_0().child(input(folder))).child(browse));
-                let capture = card().child(shortcut).when_some(self.shortcut_error.clone(), |c, error| {
-                    c.child(div().px(px(18.)).pb(px(12.)).text_sm().text_color(theme.destructive).child(error))
-                });
-                body.child(section("Capture").child(capture))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(div().flex_1().min_w_0().child(path_input(folder)))
+                            .child(browse),
+                    );
+                body.child(section("Capture").child(card().child(shortcut)))
                     .child(section("Saving").child(card().p(px(16.)).child(directory)))
             }
             Draft::Ai(services) => body
@@ -503,10 +527,8 @@ impl Render for Settings {
             .when(self.recording.is_none(), |d| {
                 d.key_context("BlueSnapSettings")
             })
-            .on_action(cx.listener(|_, _: &NextField, w, cx| w.focus_next(cx)))
-            .on_action(cx.listener(|_, _: &PreviousField, w, cx| w.focus_prev(cx)))
             .on_action(cx.listener(|this, _: &Save, w, cx| this.save(w, cx)))
-            .on_action(cx.listener(|_, _: &Close, w, cx| Self::close(w, cx)))
+            .on_action(cx.listener(|this, _: &Close, w, cx| this.close_or_dismiss(w, cx)))
             .child(body)
             .child(
                 div()
@@ -530,7 +552,7 @@ impl Render for Settings {
                         button("cancel")
                             .outline()
                             .label("Cancel")
-                            .on_click(cx.listener(|_, _, w, cx| Self::close(w, cx))),
+                            .on_click(cx.listener(|_, _, w, cx| Self::close_window(w, cx))),
                     )
                     .child(
                         button("save")

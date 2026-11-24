@@ -1,6 +1,6 @@
 //! User settings, stored as TOML in the OS config directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bluesnap_platform::{Native, Platform};
 use serde::Deserialize;
@@ -93,11 +93,32 @@ impl Config {
 
     pub fn save_dir(&self) -> PathBuf {
         self.save_dir
-            .clone()
+            .as_deref()
+            .map(expand_tilde)
             .or_else(dirs::picture_dir)
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+fn expand_tilde(path: &Path) -> PathBuf {
+    expand_tilde_with_home(path, dirs::home_dir().as_deref())
+}
+
+fn expand_tilde_with_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return if rest.is_empty() { home.to_path_buf() } else { home.join(rest) };
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -123,6 +144,17 @@ mod tests {
         let updated = config.update_document(&updated).unwrap();
         assert!(!updated.contains("save_dir"));
         assert!(config.update_document("invalid = [").is_err());
+    }
+
+    #[test]
+    fn save_dir_expands_leading_tilde() {
+        let home = Path::new("/home/alice");
+        assert_eq!(expand_tilde_with_home(Path::new("~"), Some(home)), home);
+        assert_eq!(expand_tilde_with_home(Path::new("~/"), Some(home)), home);
+        assert_eq!(expand_tilde_with_home(Path::new("~/Pictures/"), Some(home)), home.join("Pictures/"));
+        assert_eq!(expand_tilde_with_home(Path::new("~\\Screenshots"), Some(home)), home.join("Screenshots"));
+        assert_eq!(expand_tilde_with_home(Path::new("~bob/Pictures"), Some(home)), Path::new("~bob/Pictures"));
+        assert_eq!(expand_tilde_with_home(Path::new("/tmp/shots"), Some(home)), Path::new("/tmp/shots"));
     }
 
     #[test]

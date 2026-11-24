@@ -18,8 +18,8 @@ dirs = "6"
 env_logger = "0.11"
 futures = "0.3"
 global-hotkey = "0.10"
-gpui = { git = "https://github.com/KevinWang15/gpui", rev = "0d4b8adeee8040e3e47e74d1b82aad139328c2e5" }
-gpui_platform = { git = "https://github.com/KevinWang15/gpui", rev = "0d4b8adeee8040e3e47e74d1b82aad139328c2e5", features = ["font-kit", "x11", "wayland"] }
+gpui = { git = "https://github.com/KevinWang15/gpui", rev = "978bac0ffc7cdde7d773b1c23eb9becba2a544e7" }
+gpui_platform = { git = "https://github.com/KevinWang15/gpui", rev = "978bac0ffc7cdde7d773b1c23eb9becba2a544e7", features = ["font-kit", "x11", "wayland"] }
 # Same major version gpui uses for `RenderImage` frames.
 image = { version = "0.25", default-features = false }
 serde = { version = "1", features = ["derive"] }
