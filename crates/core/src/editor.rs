@@ -1589,6 +1589,16 @@ impl Editor {
     }
 
     pub fn set_color(&mut self, color: Color) {
+        if let Some((tool, _)) = self.current_style()
+            && tool.uses_color()
+            && tool != Tool::Highlighter
+        {
+            for t in Tool::ALL {
+                if t.uses_color() && t != Tool::Highlighter {
+                    self.styles[t.index()].color = color;
+                }
+            }
+        }
         self.update_style(|s| s.color = color);
     }
 
@@ -2660,6 +2670,38 @@ mod tests {
         assert_eq!(shapes_of(&e)[0].style.color, crate::style::PALETTE[2]);
         assert!(e.undo());
         assert_eq!(shapes_of(&e)[0].style.color, crate::style::PALETTE[0]);
+    }
+
+    #[test]
+    fn chosen_color_carries_across_tools_within_a_single_session() {
+        let green = crate::style::PALETTE[2];
+        let blue = crate::style::PALETTE[3];
+        let yellow = crate::style::PALETTE[1];
+        let red = crate::style::PALETTE[0];
+
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        // Change a drawn circle's color to green -> switching to Text (and other ink tools) keeps green.
+        e.toggle_tool(Tool::Ellipse);
+        drag(&mut e, (50.0, 50.0), (150.0, 120.0));
+        e.set_color(green);
+        e.toggle_tool(Tool::Text);
+        assert_eq!(e.current_style().unwrap().1.color, green);
+        e.toggle_tool(Tool::Arrow);
+        assert_eq!(e.current_style().unwrap().1.color, green);
+
+        // Changing color before drawing also carries over to other ink tools, while Highlighter keeps yellow.
+        e.set_color(blue);
+        e.toggle_tool(Tool::Rect);
+        assert_eq!(e.current_style().unwrap().1.color, blue);
+        e.toggle_tool(Tool::Highlighter);
+        assert_eq!(e.current_style().unwrap().1.color, yellow);
+
+        // A new session starts fresh with default colors.
+        let mut fresh = editor();
+        drag(&mut fresh, (0.0, 0.0), (400.0, 300.0));
+        fresh.toggle_tool(Tool::Text);
+        assert_eq!(fresh.current_style().unwrap().1.color, red);
     }
 
     #[test]
