@@ -121,6 +121,20 @@ enum Drag {
     TextSelect,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextSnapshot {
+    content: String,
+    anchor: usize,
+    caret: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextEditKind {
+    Insert,
+    Delete,
+    Other,
+}
+
 #[derive(Clone, Debug)]
 struct TextEdit {
     idx: usize,
@@ -131,9 +145,28 @@ struct TextEdit {
     marked: Option<Range<usize>>,
     /// Preserved horizontal position across consecutive Up/Down moves.
     preferred_x: Option<f32>,
+    /// Scoped text-content undo history for the active editing session.
+    undo: VecDeque<TextSnapshot>,
+    /// Scoped text-content redo history for the active editing session.
+    redo: VecDeque<TextSnapshot>,
+    /// Coalescing state for consecutive typing / deletion edits.
+    last_edit: Option<TextEditKind>,
 }
 
 impl TextEdit {
+    fn new(idx: usize) -> Self {
+        Self {
+            idx,
+            anchor: 0,
+            caret: 0,
+            marked: None,
+            preferred_x: None,
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
+            last_edit: None,
+        }
+    }
+
     fn selection(&self) -> Range<usize> {
         self.anchor.min(self.caret)..self.anchor.max(self.caret)
     }
@@ -144,6 +177,13 @@ impl TextEdit {
 
     fn is_reversed(&self) -> bool {
         self.caret < self.anchor
+    }
+
+    fn push_undo(&mut self, snap: TextSnapshot) {
+        while self.undo.len() >= MAX_HISTORY {
+            self.undo.pop_front();
+        }
+        self.undo.push_back(snap);
     }
 }
 
@@ -478,7 +518,13 @@ impl Editor {
             self.text_replace(None, &text, false, None);
             true
         } else if !text.is_empty() {
-            let geometry = Geometry::Text { origin: position, content: text, style: self.text_style };
+            let geometry = Geometry::Text {
+                origin: position,
+                content: text,
+                style: self.text_style,
+                max_width: None,
+                min_height: None,
+            };
             self.paste_element_at(Element::Shape(Shape { geometry, style: self.styles[Tool::Text.index()] }), position)
         } else {
             true
@@ -999,19 +1045,31 @@ impl Editor {
     }
 
     pub fn can_undo(&self) -> bool {
-        !self.history.is_empty()
+        match &self.text {
+            Some(edit) => !edit.undo.is_empty(),
+            None => !self.history.is_empty(),
+        }
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo_history.is_empty()
+        match &self.text {
+            Some(edit) => !edit.redo.is_empty(),
+            None => !self.redo_history.is_empty(),
+        }
     }
 
     pub fn undo_depth(&self) -> usize {
-        self.history.len().min(MAX_HISTORY)
+        match &self.text {
+            Some(edit) => edit.undo.len().min(MAX_HISTORY),
+            None => self.history.len().min(MAX_HISTORY),
+        }
     }
 
     pub fn redo_depth(&self) -> usize {
-        self.redo_history.len().min(MAX_HISTORY)
+        match &self.text {
+            Some(edit) => edit.redo.len().min(MAX_HISTORY),
+            None => self.redo_history.len().min(MAX_HISTORY),
+        }
     }
 
     pub fn has_shapes(&self) -> bool {
@@ -1024,8 +1082,10 @@ impl Editor {
         if self.text.is_some() || matches!(self.drag, Some(Drag::Create { .. } | Drag::CanvasResize { .. })) {
             return None;
         }
-        let handles = el.handles().into_iter().map(|(_, p)| p).collect();
-        Some((el.bounds(self.metrics()), handles))
+        let m = self.metrics();
+        let frame = el.as_shape().and_then(|s| s.text_frame_rect(m)).unwrap_or_else(|| el.bounds(m));
+        let handles = el.handles(m).into_iter().map(|(_, p)| p).collect();
+        Some((frame, handles))
     }
 
     pub fn cursor(&self) -> CursorKind {
@@ -1044,16 +1104,16 @@ impl Editor {
         }
         let p = self.pointer;
         let Some(sel) = self.selection() else { return CursorKind::Crosshair };
-        if let Some(edit) = &self.text
-            && self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p))
-        {
-            return CursorKind::Text;
-        }
         if let Some((_, h)) = self.element_handle_at(p) {
             return match h {
                 EditHandle::Bounds(h) => h.cursor(),
                 _ => CursorKind::Crosshair,
             };
+        }
+        if let Some(edit) = &self.text
+            && self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p))
+        {
+            return CursorKind::Text;
         }
         if let Some(h) = self.selection_handle_at(sel, p) {
             return h.cursor();
@@ -1124,11 +1184,18 @@ impl Editor {
 
     fn element_handle_at(&self, p: Point) -> Option<(usize, EditHandle)> {
         let idx = self.selected?;
-        let radius = HANDLE_HIT_RADIUS * self.ui_scale;
+        let m = self.metrics();
+        let el = self.elements.get(idx)?;
+        let inside_editing_text = self.text.as_ref().is_some_and(|t| {
+            t.idx == idx && el.as_shape().and_then(|s| s.text_rect(m)).is_some_and(|r| r.contains(p))
+        });
+        let radius = if inside_editing_text {
+            3.5 * self.ui_scale
+        } else {
+            HANDLE_HIT_RADIUS * self.ui_scale
+        };
         let is_corner = |h: EditHandle| matches!(h, EditHandle::Bounds(b) if b.is_corner());
-        self.elements
-            .get(idx)?
-            .handles()
+        el.handles(m)
             .into_iter()
             .filter(|(_, hp)| hp.distance(p) <= radius)
             .min_by(|(ha, pa), (hb, pb)| {
@@ -1155,8 +1222,11 @@ impl Editor {
         self.pointer = p;
         self.touch();
 
-        if let Some(edit) = self.text.clone() {
-            if self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
+        if let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) {
+            if self.start_text_handle_drag(p) {
+                return;
+            }
+            if self.elements.get(edit_idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
                 self.set_caret_from_point(p, false);
                 self.drag = Some(Drag::TextSelect);
             } else {
@@ -1233,7 +1303,13 @@ impl Editor {
             Tool::Text => {
                 let size = style.size.logical_px(Tool::Text) * self.scale;
                 let half_line = self.fonts.get(self.text_style.family()).layout("", size).line_height / 2.0;
-                Geometry::Text { origin: Point::new(p.x, p.y - half_line), content: String::new(), style: self.text_style }
+                Geometry::Text {
+                    origin: Point::new(p.x, p.y - half_line),
+                    content: String::new(),
+                    style: self.text_style,
+                    max_width: None,
+                    min_height: None,
+                }
             }
         };
         self.begin_change();
@@ -1241,7 +1317,7 @@ impl Editor {
         let idx = self.elements.len() - 1;
         self.selected = Some(idx);
         if tool == Tool::Text {
-            self.text = Some(TextEdit { idx, anchor: 0, caret: 0, marked: None, preferred_x: None });
+            self.text = Some(TextEdit::new(idx));
         } else {
             self.drag = Some(Drag::Create { idx, start: p });
         }
@@ -1271,6 +1347,7 @@ impl Editor {
         let mut moved_element = None;
         let mut text_select = false;
 
+        let metrics = Metrics { scale: content_scale, fonts: &self.fonts };
         match self.drag.as_mut().expect("checked") {
             Drag::Pick { start, moved } => {
                 if !*moved && start.distance(p) > DRAG_THRESHOLD * scale {
@@ -1343,7 +1420,7 @@ impl Editor {
             }
             Drag::ElementHandle { idx, handle, orig, start } => {
                 let elem_idx = *idx;
-                let next = orig.with_handle_moved(*handle, p - *start, constrain);
+                let next = orig.with_handle_moved(*handle, p - *start, constrain, metrics);
                 moved_element = Some((elem_idx, std::mem::replace(&mut self.elements[elem_idx], next)));
             }
             Drag::TextSelect => {
@@ -1473,11 +1550,17 @@ impl Editor {
                 if changed {
                     self.invalidate_backdrop_from(idx);
                 }
-                self.end_change();
-                if matches!(self.elements[idx], Element::Shape(_)) || (changed && self.has_effect_redaction_above(idx)) {
+                if self.text.is_none() {
+                    self.end_change();
+                    if matches!(self.elements[idx], Element::Shape(_)) || (changed && self.has_effect_redaction_above(idx)) {
+                        self.touch_shapes();
+                    } else {
+                        self.touch();
+                    }
+                } else if changed && self.has_effect_redaction_above(idx) {
                     self.touch_shapes();
                 } else {
-                    self.touch();
+                    self.touch_active();
                 }
             }
             Drag::TextSelect => {}
@@ -1653,6 +1736,9 @@ impl Editor {
     }
 
     pub fn undo(&mut self) -> bool {
+        if self.text.is_some() {
+            return self.text_undo();
+        }
         self.settle_in_flight();
         let Some(prev) = self.history.pop_back() else { return false };
         let current = self.current_snapshot();
@@ -1665,6 +1751,9 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
+        if self.text.is_some() {
+            return self.text_redo();
+        }
         self.settle_in_flight();
         let Some(next) = self.redo_history.pop_back() else { return false };
         let current = self.current_snapshot();
@@ -1737,7 +1826,7 @@ impl Editor {
     fn edit_text(&mut self, idx: usize, p: Point) {
         self.begin_change();
         self.selected = Some(idx);
-        self.text = Some(TextEdit { idx, anchor: 0, caret: 0, marked: None, preferred_x: None });
+        self.text = Some(TextEdit::new(idx));
         self.set_caret_from_point(p, false);
         self.touch_shapes();
     }
@@ -1754,6 +1843,7 @@ impl Editor {
             edit.caret = caret;
             edit.marked = None;
             edit.preferred_x = None;
+            edit.last_edit = None;
         }
         self.touch_active();
     }
@@ -1764,15 +1854,32 @@ impl Editor {
             edit.caret = caret;
             edit.marked = None;
             edit.preferred_x = None;
+            edit.last_edit = None;
             self.touch_active();
         }
     }
 
-    /// Handles a left mouse press while editing text, supporting Shift+click
-    /// selection extension, drag-to-select, double-click word selection, and
-    /// triple-click line selection. Returns `false` if not currently editing text.
+    fn start_text_handle_drag(&mut self, p: Point) -> bool {
+        let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) else {
+            return false;
+        };
+        let Some((idx, handle)) = self.element_handle_at(p) else {
+            return false;
+        };
+        if idx != edit_idx {
+            return false;
+        }
+        self.drag = Some(Drag::ElementHandle { idx, handle, orig: self.elements[idx].clone(), start: p });
+        self.touch_active();
+        true
+    }
+
+    /// Handles a left mouse press while editing text, supporting 8-point box
+    /// resize handles, Shift+click selection extension, drag-to-select,
+    /// double-click word selection, and triple-click line selection. Returns
+    /// `false` if not currently editing text.
     pub fn text_pointer_down(&mut self, p: Point, extend: bool, click_count: usize) -> bool {
-        let Some(edit) = self.text.clone() else {
+        let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) else {
             return false;
         };
         if self.drag.is_some() {
@@ -1780,7 +1887,10 @@ impl Editor {
         }
         self.pointer = p;
         self.touch();
-        if !self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
+        if self.start_text_handle_drag(p) {
+            return true;
+        }
+        if !self.elements.get(edit_idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
             self.finish_text();
             return true;
         }
@@ -1807,7 +1917,7 @@ impl Editor {
     }
 
     pub fn finish_text(&mut self) {
-        if matches!(self.drag, Some(Drag::TextSelect)) {
+        if matches!(self.drag, Some(Drag::TextSelect | Drag::ElementHandle { .. })) {
             self.drag = None;
         }
         let Some(edit) = self.text.take() else { return };
@@ -1825,6 +1935,80 @@ impl Editor {
         } else {
             self.touch_shapes();
         }
+    }
+
+    fn text_undo(&mut self) -> bool {
+        if matches!(self.drag, Some(Drag::TextSelect)) {
+            self.drag = None;
+        } else if matches!(self.drag, Some(Drag::ElementHandle { .. })) {
+            self.pointer_up(self.pointer);
+        }
+        let Some(edit) = self.text.as_mut() else { return false };
+        let Some(prev) = edit.undo.pop_back() else { return false };
+        let idx = edit.idx;
+        let Some(Shape { geometry: Geometry::Text { content, .. }, .. }) =
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
+        else {
+            return false;
+        };
+        let current = TextSnapshot {
+            content: std::mem::replace(content, prev.content),
+            anchor: edit.anchor,
+            caret: edit.caret,
+        };
+        while edit.redo.len() >= MAX_HISTORY {
+            edit.redo.pop_front();
+        }
+        edit.redo.push_back(current);
+        edit.anchor = prev.anchor.min(content.len());
+        edit.caret = prev.caret.min(content.len());
+        edit.marked = None;
+        edit.preferred_x = None;
+        edit.last_edit = None;
+        self.invalidate_backdrop_from(idx);
+        if matches!(self.workspace, Workspace::Canvas { .. }) && self.has_effect_redaction_above(idx) {
+            self.touch_shapes();
+        } else {
+            self.touch_active();
+        }
+        true
+    }
+
+    fn text_redo(&mut self) -> bool {
+        if matches!(self.drag, Some(Drag::TextSelect)) {
+            self.drag = None;
+        } else if matches!(self.drag, Some(Drag::ElementHandle { .. })) {
+            self.pointer_up(self.pointer);
+        }
+        let Some(edit) = self.text.as_mut() else { return false };
+        let Some(next) = edit.redo.pop_back() else { return false };
+        let idx = edit.idx;
+        let Some(Shape { geometry: Geometry::Text { content, .. }, .. }) =
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
+        else {
+            return false;
+        };
+        let current = TextSnapshot {
+            content: std::mem::replace(content, next.content),
+            anchor: edit.anchor,
+            caret: edit.caret,
+        };
+        while edit.undo.len() >= MAX_HISTORY {
+            edit.undo.pop_front();
+        }
+        edit.undo.push_back(current);
+        edit.anchor = next.anchor.min(content.len());
+        edit.caret = next.caret.min(content.len());
+        edit.marked = None;
+        edit.preferred_x = None;
+        edit.last_edit = None;
+        self.invalidate_backdrop_from(idx);
+        if matches!(self.workspace, Workspace::Canvas { .. }) && self.has_effect_redaction_above(idx) {
+            self.touch_shapes();
+        } else {
+            self.touch_active();
+        }
+        true
     }
 
     pub fn text_content(&self) -> Option<&str> {
@@ -1862,30 +2046,84 @@ impl Editor {
     pub fn text_unmark(&mut self) {
         if let Some(edit) = &mut self.text {
             edit.marked = None;
+            edit.last_edit = None;
             self.touch_active();
         }
     }
 
     pub fn text_replace(&mut self, range: Option<Range<usize>>, new_text: &str, mark: bool, caret_in_new: Option<usize>) {
-        let Some(edit) = self.text.clone() else { return };
+        let Some(edit) = self.text.as_mut() else { return };
+        let idx = edit.idx;
         let Some(Shape { geometry: Geometry::Text { content, .. }, .. }) =
-            self.elements.get_mut(edit.idx).and_then(Element::as_shape_mut)
+            self.elements.get_mut(idx).and_then(Element::as_shape_mut)
         else {
             return;
         };
-        let range = range.or(edit.marked.clone()).unwrap_or_else(|| edit.selection());
+        let was_marked = edit.marked.is_some();
+        let range = range.or_else(|| edit.marked.clone()).unwrap_or_else(|| edit.selection());
         if range.start > range.end || !content.is_char_boundary(range.start) || !content.is_char_boundary(range.end) {
             return;
         }
+        if !mark && !was_marked && range.is_empty() && new_text.is_empty() {
+            return;
+        }
+
+        if mark {
+            if !was_marked {
+                edit.push_undo(TextSnapshot { content: content.clone(), anchor: edit.anchor, caret: edit.caret });
+            }
+            edit.redo.clear();
+            edit.last_edit = Some(TextEditKind::Other);
+        } else if !was_marked {
+            let removed = &content[range.clone()];
+            let single_insert =
+                range.is_empty() && range.start == edit.caret && !edit.has_selection() && new_text.chars().count() == 1;
+            let single_delete = new_text.is_empty()
+                && !edit.has_selection()
+                && removed.chars().count() == 1
+                && (range.end == edit.caret || range.start == edit.caret)
+                && removed != "\n";
+            let (coalesce, next_kind) = if single_insert {
+                let ch = new_text.chars().next().expect("single char");
+                if ch == '\n' {
+                    (false, Some(TextEditKind::Other))
+                } else if ch.is_whitespace() {
+                    // Attach trailing space to the current word, then start a new undo group on the next word.
+                    (edit.last_edit == Some(TextEditKind::Insert), None)
+                } else {
+                    (edit.last_edit == Some(TextEditKind::Insert), Some(TextEditKind::Insert))
+                }
+            } else if single_delete {
+                (edit.last_edit == Some(TextEditKind::Delete), Some(TextEditKind::Delete))
+            } else {
+                (false, Some(TextEditKind::Other))
+            };
+            if !coalesce {
+                edit.push_undo(TextSnapshot { content: content.clone(), anchor: edit.anchor, caret: edit.caret });
+            }
+            edit.redo.clear();
+            edit.last_edit = next_kind;
+        } else {
+            // Committing (or cancelling) an active IME composition: the pre-composition
+            // snapshot is already on top of `edit.undo`.
+            edit.redo.clear();
+            edit.last_edit = Some(TextEditKind::Other);
+        }
+
         content.replace_range(range.clone(), new_text);
+        if was_marked && !mark && edit.undo.back().is_some_and(|s| s.content == *content) {
+            edit.undo.pop_back();
+            edit.last_edit = None;
+        }
         let end = range.start + new_text.len();
         let caret = caret_in_new
             .map(|c| range.start + c.min(new_text.len()))
             .filter(|c| content.is_char_boundary(*c))
             .unwrap_or(end);
-        let idx = edit.idx;
-        let marked = (mark && !new_text.is_empty()).then_some(range.start..end);
-        self.text = Some(TextEdit { idx, anchor: caret, caret, marked, preferred_x: None });
+        edit.anchor = caret;
+        edit.caret = caret;
+        edit.marked = (mark && !new_text.is_empty()).then_some(range.start..end);
+        edit.preferred_x = None;
         self.invalidate_backdrop_from(idx);
         if matches!(self.workspace, Workspace::Canvas { .. }) && self.has_effect_redaction_above(idx) {
             self.touch_shapes();
@@ -1895,19 +2133,37 @@ impl Editor {
     }
 
     pub fn text_key(&mut self, key: TextKey) {
-        let Some(edit) = self.text.clone() else { return };
+        let Some((idx, anchor, c, sel, has_sel, preferred_x)) = self
+            .text
+            .as_ref()
+            .map(|e| (e.idx, e.anchor, e.caret, e.selection(), e.has_selection(), e.preferred_x))
+        else {
+            return;
+        };
         let Some(content) = self.text_content() else { return };
-        let c = edit.caret;
-        let sel = edit.selection();
-        let has_sel = edit.has_selection();
         let prev = content[..c].char_indices().next_back().map_or(0, |(i, _)| i);
         let next = content[c..].chars().next().map_or(c, |ch| c + ch.len_utf8());
-        let line_start = content[..c].rfind('\n').map_or(0, |i| i + 1);
-        let line_end = content[c..].find('\n').map_or(content.len(), |i| c + i);
+        let (line_start, line_end) = self
+            .elements
+            .get(idx)
+            .and_then(Element::as_shape)
+            .and_then(|s| self.text_layout(s))
+            .map_or_else(
+                || {
+                    (
+                        content[..c].rfind('\n').map_or(0, |i| i + 1),
+                        content[c..].find('\n').map_or(content.len(), |i| c + i),
+                    )
+                },
+                |(_, layout)| {
+                    let r = layout.visual_line_range(c);
+                    (r.start, r.end)
+                },
+            );
         let content_len = content.len();
         let vertical = |from: usize, delta: isize, preferred_x: Option<f32>| -> (usize, Option<f32>) {
             self.elements
-                .get(edit.idx)
+                .get(idx)
                 .and_then(Element::as_shape)
                 .and_then(|s| self.text_layout(s))
                 .map_or((from, None), |(_, layout)| layout.vertical_move(from, delta, preferred_x))
@@ -1960,10 +2216,16 @@ impl Editor {
                 let (origin, pref) = if has_sel {
                     (if delta < 0 { sel.start } else { sel.end }, None)
                 } else {
-                    (c, edit.preferred_x)
+                    (c, preferred_x)
                 };
-                let (caret, preferred_x) = vertical(origin, delta, pref);
-                self.text = Some(TextEdit { idx: edit.idx, anchor: caret, caret, marked: None, preferred_x });
+                let (caret, next_pref) = vertical(origin, delta, pref);
+                if let Some(edit) = self.text.as_mut() {
+                    edit.anchor = caret;
+                    edit.caret = caret;
+                    edit.marked = None;
+                    edit.preferred_x = next_pref;
+                    edit.last_edit = None;
+                }
                 self.touch_active();
             }
             TextKey::WordLeft => {
@@ -1978,32 +2240,38 @@ impl Editor {
             TextKey::End => self.set_text_selection(line_end, line_end),
             TextKey::DocStart => self.set_text_selection(0, 0),
             TextKey::DocEnd => self.set_text_selection(content_len, content_len),
-            TextKey::SelectLeft => self.set_text_selection(edit.anchor, prev),
-            TextKey::SelectRight => self.set_text_selection(edit.anchor, next),
+            TextKey::SelectLeft => self.set_text_selection(anchor, prev),
+            TextKey::SelectRight => self.set_text_selection(anchor, next),
             TextKey::SelectUp | TextKey::SelectDown => {
                 let delta = if key == TextKey::SelectUp { -1 } else { 1 };
-                let (caret, preferred_x) = vertical(c, delta, edit.preferred_x);
-                self.text = Some(TextEdit { idx: edit.idx, anchor: edit.anchor, caret, marked: None, preferred_x });
+                let (caret, next_pref) = vertical(c, delta, preferred_x);
+                if let Some(edit) = self.text.as_mut() {
+                    edit.anchor = anchor;
+                    edit.caret = caret;
+                    edit.marked = None;
+                    edit.preferred_x = next_pref;
+                    edit.last_edit = None;
+                }
                 self.touch_active();
             }
             TextKey::SelectWordLeft => {
                 let caret = prev_word_boundary(content, c);
-                self.set_text_selection(edit.anchor, caret);
+                self.set_text_selection(anchor, caret);
             }
             TextKey::SelectWordRight => {
                 let caret = next_word_boundary(content, c);
-                self.set_text_selection(edit.anchor, caret);
+                self.set_text_selection(anchor, caret);
             }
-            TextKey::SelectHome => self.set_text_selection(edit.anchor, line_start),
-            TextKey::SelectEnd => self.set_text_selection(edit.anchor, line_end),
-            TextKey::SelectDocStart => self.set_text_selection(edit.anchor, 0),
-            TextKey::SelectDocEnd => self.set_text_selection(edit.anchor, content_len),
+            TextKey::SelectHome => self.set_text_selection(anchor, line_start),
+            TextKey::SelectEnd => self.set_text_selection(anchor, line_end),
+            TextKey::SelectDocStart => self.set_text_selection(anchor, 0),
+            TextKey::SelectDocEnd => self.set_text_selection(anchor, content_len),
         }
     }
 
     fn text_layout(&self, shape: &Shape) -> Option<(Point, TextLayout)> {
-        let Geometry::Text { origin, content, style } = &shape.geometry else { return None };
-        Some((*origin, self.fonts.get(style.family()).layout(content, shape.size_px(self.scale))))
+        let Geometry::Text { origin, content, style, max_width, .. } = &shape.geometry else { return None };
+        Some((*origin, self.fonts.get(style.family()).layout_wrapped(content, shape.size_px(self.scale), *max_width)))
     }
 
     pub fn text_ink(&self) -> Option<Color> {
@@ -2046,9 +2314,13 @@ impl Editor {
         Some(layout.index_at(p - origin))
     }
 
-    pub fn text_frame(&self) -> Option<Rect> {
+    pub fn text_frame(&self) -> Option<(Rect, Vec<Point>)> {
         let edit = self.text.as_ref()?;
-        Some(self.elements.get(edit.idx)?.bounds(self.metrics()).inflate(3.0 * self.scale))
+        let el = self.elements.get(edit.idx)?;
+        let m = self.metrics();
+        let frame = el.as_shape()?.text_frame_rect(m)?;
+        let handles = el.handles(m).into_iter().map(|(_, p)| p).collect();
+        Some((frame, handles))
     }
 
     // ----- output ---------------------------------------------------------
@@ -3468,9 +3740,19 @@ mod tests {
         e.toggle_tool(Tool::Text);
         click(&mut e, 160.0, 120.0);
         e.text_replace(None, "hello", false, None);
-        // Undo while text edit is still open: commits and undoes the text box, enabling redo.
+        // Undo while text edit is still open stays scoped to text content and keeps focus.
         assert!(e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some(""));
+        assert!(!e.can_undo());
+        assert!(e.can_redo());
+        assert!(e.redo());
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some("hello"));
+        // Finish text editing, then canvas-level undo removes the text box and enables redo.
+        e.finish_text();
         assert!(!e.is_editing_text());
+        assert!(e.undo());
         assert_eq!(shapes_of(&e).len(), 1);
         assert!(e.can_redo());
         // No-op click selecting the rectangle does not wipe redo history.
@@ -3522,5 +3804,121 @@ mod tests {
         assert!(ce.redo());
         assert_eq!(shapes_of(&ce).len(), 1);
         assert!(!ce.can_redo());
+    }
+
+    #[test]
+    fn in_text_undo_redo_stays_scoped_and_keeps_text_focus() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        // Draw a rectangle first so canvas undo history is non-empty.
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (20.0, 20.0), (100.0, 80.0));
+        assert_eq!(shapes_of(&e).len(), 1);
+        assert!(e.can_undo());
+
+        // Start a text box: text undo stack starts empty, so undo is a no-op and never blurs or removes the rect.
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 160.0, 120.0);
+        assert!(e.is_editing_text());
+        assert!(!e.can_undo());
+        assert!(!e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(shapes_of(&e).len(), 2);
+
+        // Type two words character-by-character: each word coalesces into its own undo step.
+        for ch in "hello world".chars() {
+            let s = ch.to_string();
+            e.text_replace(None, &s, false, None);
+        }
+        assert_eq!(e.text_content(), Some("hello world"));
+        assert!(e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some("hello "));
+        assert!(e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some(""));
+        // Further undo stays focused inside the text editor and leaves the rectangle untouched.
+        assert!(!e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(shapes_of(&e).len(), 2);
+
+        // Redo brings back both words, then IME composition + commit undo as one step.
+        assert!(e.redo());
+        assert_eq!(e.text_content(), Some("hello "));
+        assert!(e.redo());
+        assert_eq!(e.text_content(), Some("hello world"));
+        assert!(!e.can_redo());
+
+        e.text_replace(None, "n", true, Some(1));
+        e.text_replace(None, "ni", true, Some(2));
+        e.text_replace(None, "你", false, None);
+        assert_eq!(e.text_content(), Some("hello world你"));
+        assert!(e.undo());
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some("hello world"));
+        assert!(e.redo());
+        assert_eq!(e.text_content(), Some("hello world你"));
+
+        // Committing the text box returns to canvas-level undo/redo.
+        e.finish_text();
+        assert!(!e.is_editing_text());
+        assert_eq!(shapes_of(&e).len(), 2);
+        assert!(e.undo());
+        assert_eq!(shapes_of(&e).len(), 1);
+        assert!(e.redo());
+        assert_eq!(shapes_of(&e).len(), 2);
+    }
+
+    #[test]
+    fn text_box_eight_point_handles_resize_and_reflow_while_editing_and_selected() {
+        use crate::text::{FontSet, FontSource};
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../platform/assets/fonts/Nunito.ttf");
+        let fonts = Arc::new(Fonts::sans_only(FontSet::from_sources(&[FontSource::file(path).weight(800.0)])));
+        let comp = Composition::from_slice(Pixmap::new(500, 300).unwrap(), 1.0, Vec::new()).unwrap();
+        let mut e = Editor::from_composition(comp, fonts);
+
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 60.0, 60.0);
+        e.text_replace(None, "one two three four five six", false, None);
+        assert!(e.is_editing_text());
+
+        // Active text box exposes 8 border resize handles and reports resize cursors on hover.
+        let (orig_frame, handles) = e.text_frame().unwrap();
+        assert_eq!(handles.len(), 8);
+        let right_handle = handles[3];
+        e.pointer_move(right_handle, false);
+        assert_eq!(e.cursor(), CursorKind::ResizeEw);
+
+        // Dragging the Right handle inward while editing text narrows the box, reflows text taller,
+        // keeps text focus open, and preserves font size.
+        assert!(e.text_pointer_down(right_handle, false, 1));
+        let target_x = orig_frame.x + orig_frame.w * 0.45;
+        e.pointer_move(Point::new(target_x, right_handle.y), false);
+        e.pointer_up(Point::new(target_x, right_handle.y));
+        assert!(e.is_editing_text());
+        let (narrow_frame, narrow_handles) = e.text_frame().unwrap();
+        assert_eq!(narrow_handles.len(), 8);
+        assert!(narrow_frame.w < orig_frame.w * 0.6);
+        assert!(narrow_frame.h > orig_frame.h * 1.5);
+        assert_eq!(e.text_content(), Some("one two three four five six"));
+
+        // Finishing text editing keeps the same 8 handles on `selected_frame`, and dragging a handle
+        // while selected is a canvas-undoable resize.
+        e.finish_text();
+        assert!(!e.is_editing_text());
+        let (sel_frame, sel_handles) = e.selected_frame().unwrap();
+        assert_eq!(sel_frame, narrow_frame);
+        assert_eq!(sel_handles.len(), 8);
+        let right = sel_handles[3];
+        drag(&mut e, (right.x, right.y), (right.x + 120.0, right.y));
+        let (wider_frame, _) = e.selected_frame().unwrap();
+        assert!(wider_frame.w > narrow_frame.w + 100.0);
+        assert!(wider_frame.h < narrow_frame.h);
+
+        // Canvas undo restores the narrower wrapped box.
+        assert!(e.undo());
+        let restored = e.elements()[1].as_shape().unwrap().text_frame_rect(e.metrics()).unwrap();
+        assert!((restored.w - narrow_frame.w).abs() < 0.5);
     }
 }

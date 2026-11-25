@@ -181,10 +181,10 @@ impl Element {
         }
     }
 
-    pub fn handles(&self) -> Vec<(EditHandle, Point)> {
+    pub fn handles(&self, m: Metrics) -> Vec<(EditHandle, Point)> {
         match self {
             Element::Image(img) => img.handles(),
-            Element::Shape(s) => s.handles(),
+            Element::Shape(s) => s.handles(m),
         }
     }
 
@@ -195,10 +195,10 @@ impl Element {
         }
     }
 
-    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool) -> Element {
+    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool, m: Metrics) -> Element {
         match self {
             Element::Image(img) => Element::Image(img.with_handle_moved(handle, delta, constrain)),
-            Element::Shape(s) => Element::Shape(s.with_handle_moved(handle, delta, constrain)),
+            Element::Shape(s) => Element::Shape(s.with_handle_moved(handle, delta, constrain, m)),
         }
     }
 

@@ -173,6 +173,11 @@ impl FontSet {
 
     /// Lays out `text` (with `\n` line breaks) at `size` pixels per em, top-left at the origin.
     pub fn layout(&self, text: &str, size: f32) -> TextLayout {
+        self.layout_wrapped(text, size, None)
+    }
+
+    /// Lays out `text` at `size` pixels per em, soft-wrapping lines when `max_width` is `Some`.
+    pub fn layout_wrapped(&self, text: &str, size: f32, max_width: Option<f32>) -> TextLayout {
         let (ascent, line_height) = match self.fonts.first() {
             Some(f) => {
                 let s = f.as_scaled(Self::px_scale(f, size));
@@ -180,33 +185,103 @@ impl FontSet {
             }
             None => (size * 0.8, size * 1.2),
         };
+        let wrap_limit = max_width.filter(|w| w.is_finite() && *w > 0.0);
 
         let mut glyphs = Vec::new();
         let mut lines = Vec::new();
         let mut width: f32 = 0.0;
-        let mut line_start = 0;
-        for (line_index, line) in text.split('\n').enumerate() {
-            let baseline = line_index as f32 * line_height + ascent;
-            let mut x = 0.0;
-            let mut carets = vec![(line_start, 0.0)];
-            let mut prev: Option<(usize, GlyphId)> = None;
-            for (offset, c) in line.char_indices() {
-                if let Some((fi, id)) = self.glyph_for(c) {
-                    let font = self.fonts[fi].as_scaled(Self::px_scale(&self.fonts[fi], size));
-                    if let Some((pfi, pid)) = prev
-                        && pfi == fi
-                    {
-                        x += font.kern(pid, id);
-                    }
-                    glyphs.push(PlacedGlyph { font: fi, id, x, baseline });
-                    x += font.h_advance(id);
-                    prev = Some((fi, id));
-                }
-                carets.push((line_start + offset + c.len_utf8(), x));
+        let mut line_index = 0usize;
+        let mut para_start = 0usize;
+
+        for para in text.split('\n') {
+            if para.is_empty() {
+                lines.push(LineLayout {
+                    top: line_index as f32 * line_height,
+                    carets: vec![(para_start, 0.0)],
+                    soft_break: false,
+                });
+                line_index += 1;
+                para_start += 1;
+                continue;
             }
-            width = width.max(x);
-            lines.push(LineLayout { top: line_index as f32 * line_height, carets });
-            line_start += line.len() + 1;
+
+            let chars: Vec<(usize, char)> = para.char_indices().collect();
+            let mut line_begin = 0usize;
+            'wrap: while line_begin < chars.len() {
+                let baseline = line_index as f32 * line_height + ascent;
+                let mut x = 0.0f32;
+                let mut prev: Option<(usize, GlyphId)> = None;
+                let mut line_glyphs: Vec<PlacedGlyph> = Vec::new();
+                let mut line_carets = vec![(para_start + chars[line_begin].0, 0.0)];
+                // (char_count_on_line, glyph_count_on_line, width_without_trailing_ws)
+                let mut break_opportunity: Option<(usize, usize, f32)> = None;
+                let mut visible_x = 0.0f32;
+
+                for k in line_begin..chars.len() {
+                    let (offset, c) = chars[k];
+                    let mut next_x = x;
+                    let mut placed: Option<(usize, GlyphId, f32)> = None;
+                    if let Some((fi, id)) = self.glyph_for(c) {
+                        let font = self.fonts[fi].as_scaled(Self::px_scale(&self.fonts[fi], size));
+                        let mut gx = x;
+                        if let Some((pfi, pid)) = prev
+                            && pfi == fi
+                        {
+                            gx += font.kern(pid, id);
+                        }
+                        placed = Some((fi, id, gx));
+                        next_x = gx + font.h_advance(id);
+                    }
+
+                    if let Some(limit) = wrap_limit
+                        && k > line_begin
+                        && !c.is_whitespace()
+                        && next_x > limit
+                    {
+                        let (take_chars, take_glyphs, take_vis_w) =
+                            break_opportunity.unwrap_or((k - line_begin, line_glyphs.len(), visible_x));
+                        line_glyphs.truncate(take_glyphs);
+                        line_carets.truncate(take_chars + 1);
+                        width = width.max(take_vis_w);
+                        glyphs.extend(line_glyphs);
+                        lines.push(LineLayout {
+                            top: line_index as f32 * line_height,
+                            carets: line_carets,
+                            soft_break: true,
+                        });
+                        line_index += 1;
+                        line_begin += take_chars;
+                        continue 'wrap;
+                    }
+
+                    if let Some((fi, id, gx)) = placed {
+                        line_glyphs.push(PlacedGlyph { font: fi, id, x: gx, baseline });
+                        prev = Some((fi, id));
+                    }
+                    x = next_x;
+                    if !c.is_whitespace() {
+                        visible_x = x;
+                    }
+                    line_carets.push((para_start + offset + c.len_utf8(), x));
+
+                    let count = k - line_begin + 1;
+                    let next_is_cjk = chars.get(k + 1).is_some_and(|&(_, nc)| is_cjk(nc));
+                    if c.is_whitespace() || c == '-' || is_cjk(c) || next_is_cjk {
+                        break_opportunity = Some((count, line_glyphs.len(), visible_x));
+                    }
+                }
+
+                width = width.max(if wrap_limit.is_some() { visible_x } else { x });
+                glyphs.extend(line_glyphs);
+                lines.push(LineLayout {
+                    top: line_index as f32 * line_height,
+                    carets: line_carets,
+                    soft_break: false,
+                });
+                line_index += 1;
+                break;
+            }
+            para_start += para.len() + 1;
         }
 
         TextLayout { glyphs, lines, width, line_height, size }
@@ -298,10 +373,39 @@ struct PlacedGlyph {
     baseline: f32,
 }
 
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x2E80..=0x2EFF
+            | 0x3000..=0x303F
+            | 0x3040..=0x30FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+            | 0xFF00..=0xFFEF
+    )
+}
+
 struct LineLayout {
     top: f32,
     /// Every caret stop on the line as (byte offset into the whole text, x).
     carets: Vec<(usize, f32)>,
+    /// True when this visual line ended due to soft-wrapping rather than `\n` or end-of-text.
+    soft_break: bool,
+}
+
+impl LineLayout {
+    /// Caret stops uniquely owned by this visual line (excluding the shared
+    /// boundary offset at the end of a soft-wrapped line, which belongs to the
+    /// start of the following visual line).
+    fn owned_carets(&self) -> &[(usize, f32)] {
+        if self.soft_break && self.carets.len() > 1 {
+            &self.carets[..self.carets.len() - 1]
+        } else {
+            &self.carets
+        }
+    }
 }
 
 pub struct TextLayout {
@@ -317,24 +421,50 @@ impl TextLayout {
         self.lines.len() as f32 * self.line_height
     }
 
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn line_pos(&self, index: usize) -> (usize, usize, f32) {
+        for (r, line) in self.lines.iter().enumerate() {
+            for (c, &(b, x)) in line.owned_carets().iter().enumerate() {
+                if b == index {
+                    return (r, c, x);
+                }
+            }
+        }
+        let last_r = self.lines.len().saturating_sub(1);
+        if let Some(line) = self.lines.get(last_r)
+            && let Some((c, &(_, x))) = line.carets.iter().enumerate().last()
+        {
+            return (last_r, c, x);
+        }
+        (0, 0, 0.0)
+    }
+
+    /// Byte range `(start..end)` of the visual line containing `index`.
+    pub fn visual_line_range(&self, index: usize) -> std::ops::Range<usize> {
+        let (row, _, _) = self.line_pos(index);
+        let Some(line) = self.lines.get(row) else { return 0..0 };
+        let owned = line.owned_carets();
+        let start = owned.first().map_or(0, |c| c.0);
+        let end = owned.last().map_or(start, |c| c.0);
+        start..end
+    }
+
     /// Caret rectangle (relative to the layout origin) at byte offset `index`.
     pub fn caret_rect(&self, index: usize) -> Rect {
         let width = (self.size / 12.0).max(1.0);
-        for line in &self.lines {
-            if let Some(&(_, x)) = line.carets.iter().find(|(b, _)| *b == index) {
-                return Rect::new(x, line.top, width, self.line_height);
-            }
-        }
-        let line = self.lines.last().expect("layout always has one line");
-        let x = line.carets.last().map_or(0.0, |c| c.1);
-        Rect::new(x, line.top, width, self.line_height)
+        let (row, _, x) = self.line_pos(index);
+        let top = self.lines.get(row).map_or(0.0, |l| l.top);
+        Rect::new(x, top, width, self.line_height)
     }
 
     /// Byte offset of the caret stop closest to `p` (relative to the layout origin).
     pub fn index_at(&self, p: Point) -> usize {
         let row = ((p.y / self.line_height).floor().max(0.0) as usize).min(self.lines.len() - 1);
         self.lines[row]
-            .carets
+            .owned_carets()
             .iter()
             .min_by(|a, b| (a.1 - p.x).abs().total_cmp(&(b.1 - p.x).abs()))
             .map_or(0, |c| c.0)
@@ -363,14 +493,14 @@ impl TextLayout {
             if range.end <= line_start || range.start > line_end {
                 continue;
             }
-            if range.start == line_end && range.end <= line_end {
+            if range.start == line_end && (line.soft_break || range.end <= line_end) {
                 continue;
             }
             let s = range.start.max(line_start);
             let e = range.end.min(line_end);
             let x0 = x_of(line, s);
             let mut x1 = x_of(line, e);
-            if range.end > line_end {
+            if !line.soft_break && range.end > line_end {
                 x1 += newline_w;
             }
             if x1 > x0 {
@@ -387,41 +517,24 @@ impl TextLayout {
         if self.lines.is_empty() || delta_lines == 0 {
             return (index, preferred_x);
         }
-        let (mut row, mut col, mut x) = (self.lines.len() - 1, 0usize, 0.0f32);
-        if let Some(last) = self.lines.last()
-            && let Some((i, &(_, lx))) = last.carets.iter().enumerate().last()
-        {
-            col = i;
-            x = lx;
-        }
-        'find: for (r, line) in self.lines.iter().enumerate() {
-            for (c, &(b, cx)) in line.carets.iter().enumerate() {
-                if b == index {
-                    row = r;
-                    col = c;
-                    x = cx;
-                    break 'find;
-                }
-            }
-        }
+        let (row, col, x) = self.line_pos(index);
         let has_x = self.lines.iter().any(|l| l.carets.last().is_some_and(|c| c.1 > 0.0));
         if delta_lines < 0 {
             if row == 0 {
                 return (0, None);
             }
             let target_row = row.saturating_sub(delta_lines.unsigned_abs());
-            let line = &self.lines[target_row];
+            let owned = self.lines[target_row].owned_carets();
             if has_x {
                 let target_x = preferred_x.unwrap_or(x);
-                let next = line
-                    .carets
+                let next = owned
                     .iter()
                     .min_by(|a, b| (a.1 - target_x).abs().total_cmp(&(b.1 - target_x).abs()))
                     .map_or(0, |c| c.0);
                 (next, Some(target_x))
             } else {
-                let c = col.min(line.carets.len().saturating_sub(1));
-                (line.carets.get(c).map_or(0, |k| k.0), None)
+                let c = col.min(owned.len().saturating_sub(1));
+                (owned.get(c).map_or(0, |k| k.0), None)
             }
         } else {
             if row + 1 >= self.lines.len() {
@@ -429,18 +542,17 @@ impl TextLayout {
                 return (end, None);
             }
             let target_row = (row + delta_lines as usize).min(self.lines.len() - 1);
-            let line = &self.lines[target_row];
+            let owned = self.lines[target_row].owned_carets();
             if has_x {
                 let target_x = preferred_x.unwrap_or(x);
-                let next = line
-                    .carets
+                let next = owned
                     .iter()
                     .min_by(|a, b| (a.1 - target_x).abs().total_cmp(&(b.1 - target_x).abs()))
                     .map_or(0, |c| c.0);
                 (next, Some(target_x))
             } else {
-                let c = col.min(line.carets.len().saturating_sub(1));
-                (line.carets.get(c).map_or(0, |k| k.0), None)
+                let c = col.min(owned.len().saturating_sub(1));
+                (owned.get(c).map_or(0, |k| k.0), None)
             }
         }
     }
@@ -506,6 +618,28 @@ mod tests {
         assert_eq!(up1, 2);
         assert_eq!(layout.vertical_move(2, -1, None), (0, None));
         assert_eq!(layout.vertical_move(13, 1, None), (text.len(), None));
+    }
+
+    #[test]
+    fn layout_wrapped_reflows_words_long_tokens_and_selection_cleanly() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../platform/assets/fonts/Nunito.ttf");
+        let set = FontSet::from_sources(&[FontSource::file(path).weight(800.0)]);
+        let text = "hello world again";
+        let single = set.layout_wrapped(text, 24.0, None);
+        assert_eq!(single.line_count(), 1);
+        let narrow = set.layout_wrapped(text, 24.0, Some(single.width * 0.5));
+        assert!(narrow.line_count() >= 2);
+        assert!(narrow.height() > single.height());
+        // Caret at the start of the wrapped second word sits on line 1 (y > 0) at x = 0.
+        let line1_start = narrow.visual_line_range(text.find("world").unwrap()).start;
+        let c1 = narrow.caret_rect(line1_start);
+        assert!(c1.y > 0.0 && c1.x == 0.0, "{c1:?}");
+        // Selecting only the second wrapped line must NOT create a phantom rect on line 0.
+        let rects = narrow.selection_rects(line1_start..text.len());
+        assert!(rects.iter().all(|r| r.y > 0.0), "{rects:?}");
+        // Long unbroken word still wraps without panicking or looping.
+        let long = set.layout_wrapped("supercalifragilisticexpialidocious", 24.0, Some(80.0));
+        assert!(long.line_count() >= 3);
     }
 }
 

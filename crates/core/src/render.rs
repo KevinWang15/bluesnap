@@ -591,8 +591,19 @@ fn draw_shape_with(
                 }
             }
         }
-        Geometry::Text { origin, content, style } => {
-            draw_text(pixmap, m.fonts.get(style.family()), content, *origin, w, *style, shape.style.color, ts)
+        Geometry::Text { origin, content, style, max_width, min_height } => {
+            draw_text(
+                pixmap,
+                m.fonts.get(style.family()),
+                content,
+                *origin,
+                w,
+                *style,
+                *max_width,
+                *min_height,
+                shape.style.color,
+                ts,
+            )
         }
     }
 }
@@ -644,9 +655,9 @@ fn draw_arrow(pixmap: &mut Pixmap, from: Point, to: Point, style: ArrowStyle, w:
 pub fn text_sample(fonts: &Fonts, text: &str, style: TextStyle, color: Color, size: f32) -> Option<Pixmap> {
     let set = fonts.get(style.family());
     let layout = set.layout(text, size);
-    let b = text_box(Point::new(0.0, 0.0), &layout, size, style).inflate(1.0).round_out();
+    let b = text_box(Point::new(0.0, 0.0), &layout, size, style, None, None).inflate(1.0).round_out();
     let mut pixmap = Pixmap::new(b.w as u32, b.h as u32)?;
-    draw_text(&mut pixmap, set, text, Point::new(0.0, 0.0), size, style, color, Transform::from_translate(-b.x, -b.y));
+    draw_text(&mut pixmap, set, text, Point::new(0.0, 0.0), size, style, None, None, color, Transform::from_translate(-b.x, -b.y));
     Some(pixmap)
 }
 
@@ -660,12 +671,14 @@ fn draw_text(
     origin: Point,
     size: f32,
     style: TextStyle,
+    max_width: Option<f32>,
+    min_height: Option<f32>,
     color: Color,
     ts: Transform,
 ) {
-    let layout = fonts.layout(content, size);
+    let layout = fonts.layout_wrapped(content, size, max_width);
     let glyphs = fonts.outline_path(&layout, origin);
-    let backdrop = text_box(origin, &layout, size, style);
+    let backdrop = text_box(origin, &layout, size, style, max_width, min_height);
     match style.backdrop() {
         TextBackdrop::None => {}
         TextBackdrop::Outline => {
@@ -876,13 +889,15 @@ fn smooth_path(pts: &[Point]) -> Option<tiny_skia::Path> {
 }
 
 fn draw_underline(pixmap: &mut Pixmap, shape: &Shape, m: Metrics, range: Range<usize>, ts: Transform) {
-    let Geometry::Text { origin, content, style } = &shape.geometry else { return };
-    let layout = m.fonts.get(style.family()).layout(content, shape.size_px(m.scale));
-    let (a, b) = (layout.caret_rect(range.start), layout.caret_rect(range.end));
+    let Geometry::Text { origin, content, style, max_width, .. } = &shape.geometry else { return };
+    let layout = m.fonts.get(style.family()).layout_wrapped(content, shape.size_px(m.scale), *max_width);
     let thickness = (m.scale * 1.5).max(1.0);
-    let y = a.bottom() - thickness;
-    if let Some(r) = tiny_skia::Rect::from_xywh(origin.x + a.x, origin.y + y, (b.x - a.x).max(thickness), thickness) {
-        pixmap.fill_rect(r, &solid(style.ink(shape.style.color)), ts, None);
+    let ink = solid(style.ink(shape.style.color));
+    for rect in layout.selection_rects(range) {
+        let y = rect.bottom() - thickness;
+        if let Some(r) = tiny_skia::Rect::from_xywh(origin.x + rect.x, origin.y + y, rect.w.max(thickness), thickness) {
+            pixmap.fill_rect(r, &ink, ts, None);
+        }
     }
 }
 

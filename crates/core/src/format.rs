@@ -418,7 +418,7 @@ fn encode_shape(d: &mut Doc, shape: &Shape) {
                 }
             }
         }
-        Geometry::Text { origin, content, style } => {
+        Geometry::Text { origin, content, style, max_width, min_height } => {
             d.push("kind", Value::String("text".into()));
             d.push("origin", Value::Document(encode_point(*origin)));
             d.push("content", Value::String(content.clone()));
@@ -432,6 +432,12 @@ fn encode_shape(d: &mut Doc, shape: &Shape) {
                 TextStyle::MonospacedBoxed => "monospaced_boxed",
             };
             d.push("text_style", Value::String(ts.into()));
+            if let Some(w) = max_width {
+                d.push("max_width", Value::Double(*w as f64));
+            }
+            if let Some(h) = min_height {
+                d.push("min_height", Value::Double(*h as f64));
+            }
         }
     }
     d.push("color", Value::Document(encode_color(shape.style.color)));
@@ -545,7 +551,27 @@ fn decode_shape(d: &Doc, kind: &str) -> Result<Shape, FormatError> {
                 "monospaced_boxed" => TextStyle::MonospacedBoxed,
                 other => return Err(bad(format!("unknown text_style `{other}`"))),
             };
-            Geometry::Text { origin, content, style: text_style }
+            let max_width = match d.get("max_width") {
+                Some(_) => {
+                    let w = check_coord(d.req_f32("max_width")?, "max_width")?;
+                    if w <= 0.0 {
+                        return Err(bad("text `max_width` must be positive"));
+                    }
+                    Some(w)
+                }
+                None => None,
+            };
+            let min_height = match d.get("min_height") {
+                Some(_) => {
+                    let h = check_coord(d.req_f32("min_height")?, "min_height")?;
+                    if h <= 0.0 {
+                        return Err(bad("text `min_height` must be positive"));
+                    }
+                    Some(h)
+                }
+                None => None,
+            };
+            Geometry::Text { origin, content, style: text_style, max_width, min_height }
         }
         other => return Err(bad(format!("unknown element kind `{other}`"))),
     };
@@ -600,7 +626,13 @@ mod tests {
                 style: Style::default(),
             },
             Shape {
-                geometry: Geometry::Text { origin: Point::new(3.0, 4.0), content: "Hello 你好".into(), style: TextStyle::RoundedBoxed },
+                geometry: Geometry::Text {
+                    origin: Point::new(3.0, 4.0),
+                    content: "Hello 你好".into(),
+                    style: TextStyle::RoundedBoxed,
+                    max_width: Some(120.0),
+                    min_height: Some(48.0),
+                },
                 style: Style { color: PALETTE[4], size: SizeLevel::Large },
             },
         ];

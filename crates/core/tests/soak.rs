@@ -792,7 +792,13 @@ fn adversarial_and_fuzz_bson_and_bs_decoder_soak_test() {
                 style: Style::default(),
             },
             Shape {
-                geometry: Geometry::Text { origin: Point::new(4.0, 6.0), content: "fuzz 测试".into(), style: TextStyle::Boxed },
+                geometry: Geometry::Text {
+                    origin: Point::new(4.0, 6.0),
+                    content: "fuzz 测试".into(),
+                    style: TextStyle::Boxed,
+                    max_width: None,
+                    min_height: None,
+                },
                 style: Style::default(),
             },
         ];

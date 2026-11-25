@@ -18,8 +18,16 @@ pub enum Geometry {
     /// Hides what's under `area` with `effect`; `strength` is the 0..=1 slider
     /// value (see [`RedactEffect::amount`]).
     Redact { area: RedactShape, effect: RedactEffect, strength: f32 },
-    /// `origin` is the top-left corner of the first line.
-    Text { origin: Point, content: String, style: TextStyle },
+    /// `origin` is the top-left corner of the first line. When `max_width` is
+    /// `Some`, lines soft-wrap to that inner width; `min_height` keeps the box
+    /// at least that tall without clipping reflowed lines.
+    Text {
+        origin: Point,
+        content: String,
+        style: TextStyle,
+        max_width: Option<f32>,
+        min_height: Option<f32>,
+    },
 }
 
 /// The area a redaction covers.
@@ -97,9 +105,13 @@ impl Shape {
                 effect: *effect,
                 strength: *strength,
             },
-            Geometry::Text { origin, content, style } => {
-                Geometry::Text { origin: *origin + d, content: content.clone(), style: *style }
-            }
+            Geometry::Text { origin, content, style, max_width, min_height } => Geometry::Text {
+                origin: *origin + d,
+                content: content.clone(),
+                style: *style,
+                max_width: *max_width,
+                min_height: *min_height,
+            },
         };
         Shape { geometry, style: self.style }
     }
@@ -127,9 +139,13 @@ impl Shape {
                 effect: *effect,
                 strength: *strength,
             },
-            Geometry::Text { origin, content, style } => {
-                Geometry::Text { origin: *origin * k, content: content.clone(), style: *style }
-            }
+            Geometry::Text { origin, content, style, max_width, min_height } => Geometry::Text {
+                origin: *origin * k,
+                content: content.clone(),
+                style: *style,
+                max_width: max_width.map(|w| w * k),
+                min_height: min_height.map(|h| h * k),
+            },
         };
         Shape { geometry, style: self.style }
     }
@@ -149,10 +165,7 @@ impl Shape {
                 counter_box(*center, &format.label(*number), w, m.fonts.sans()).inflate(1.0)
             }
             Geometry::Redact { area: RedactShape::Rect(r), .. } => *r,
-            Geometry::Text { origin, content, style } => {
-                let layout = m.fonts.get(style.family()).layout(content, w);
-                text_box(*origin, &layout, w, *style).inflate(1.0)
-            }
+            Geometry::Text { .. } => self.text_rect(m).expect("text geometry").inflate(1.0),
         }
     }
 
@@ -189,9 +202,30 @@ impl Shape {
         }
     }
 
-    pub fn handles(&self) -> Vec<(EditHandle, Point)> {
+    /// Outer visual box of a text shape (glyphs/wrap box plus style padding).
+    pub fn text_rect(&self, m: Metrics) -> Option<Rect> {
+        let Geometry::Text { origin, content, style, max_width, min_height } = &self.geometry else {
+            return None;
+        };
+        let w = self.size_px(m.scale);
+        let layout = m.fonts.get(style.family()).layout_wrapped(content, w, *max_width);
+        Some(text_box(*origin, &layout, w, *style, *max_width, *min_height))
+    }
+
+    /// Interactive frame rectangle for a text shape's border and 8 resize handles:
+    /// slightly inflated around [`Self::text_rect`] so the border and handles sit
+    /// clear of glyphs and the editing caret.
+    pub fn text_frame_rect(&self, m: Metrics) -> Option<Rect> {
+        Some(self.text_rect(m)?.inflate(4.0 * m.scale))
+    }
+
+    pub fn handles(&self, m: Metrics) -> Vec<(EditHandle, Point)> {
         match &self.geometry {
             Geometry::Rect(r) | Geometry::Ellipse(r) | Geometry::Redact { area: RedactShape::Rect(r), .. } => {
+                Handle::ALL.iter().map(|h| (EditHandle::Bounds(*h), r.handle_point(*h))).collect()
+            }
+            Geometry::Text { .. } => {
+                let Some(r) = self.text_frame_rect(m) else { return Vec::new() };
                 Handle::ALL.iter().map(|h| (EditHandle::Bounds(*h), r.handle_point(*h))).collect()
             }
             Geometry::Arrow { from, to, .. } => vec![(EditHandle::ArrowFrom, *from), (EditHandle::ArrowTo, *to)],
@@ -201,8 +235,9 @@ impl Shape {
 
     /// Copy of `self` with `handle` dragged by `delta`. When `constrain` (`Shift`)
     /// is `true`, all 8 box handles preserve aspect ratio and arrow endpoints snap
-    /// to 45° angles.
-    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool) -> Shape {
+    /// to 45° angles. For text shapes, resizing adjusts the text box and reflows
+    /// the wrapped lines without scaling the font size.
+    pub fn with_handle_moved(&self, handle: EditHandle, delta: Point, constrain: bool, m: Metrics) -> Shape {
         let resize_box = |r: &Rect, h: Handle| {
             if constrain {
                 resize_rect_with_handle(*r, h, delta, true, 4.0)
@@ -215,6 +250,68 @@ impl Shape {
             (Geometry::Ellipse(r), EditHandle::Bounds(h)) => Geometry::Ellipse(resize_box(r, h)),
             (Geometry::Redact { area: RedactShape::Rect(r), effect, strength }, EditHandle::Bounds(h)) => {
                 Geometry::Redact { area: RedactShape::Rect(resize_box(r, h)), effect: *effect, strength: *strength }
+            }
+            (Geometry::Text { origin, content, style, max_width, min_height }, EditHandle::Bounds(h)) => {
+                let font_size = self.size_px(m.scale);
+                let font_set = m.fonts.get(style.family());
+                let orig_layout = font_set.layout_wrapped(content, font_size, *max_width);
+                let orig_box = text_box(*origin, &orig_layout, font_size, *style, *max_width, *min_height);
+                let (pad_x, pad_y) = text_padding(*style, font_size);
+                let min_inner_w = (font_size * 1.5).max(16.0 * m.scale);
+                let min_inner_h = orig_layout.line_height.max(font_size);
+                let min_box_w = min_inner_w + 2.0 * pad_x;
+                let min_box_h = min_inner_h + 2.0 * pad_y;
+                let target_box = if constrain {
+                    resize_rect_with_handle(orig_box, h, delta, true, min_box_w.min(min_box_h))
+                } else {
+                    resize_rect_with_handle(orig_box, h, delta, false, 4.0)
+                };
+                let changes_x = matches!(
+                    h,
+                    Handle::Left | Handle::Right | Handle::TopLeft | Handle::TopRight | Handle::BottomLeft | Handle::BottomRight
+                );
+                let changes_y = matches!(
+                    h,
+                    Handle::Top | Handle::Bottom | Handle::TopLeft | Handle::TopRight | Handle::BottomLeft | Handle::BottomRight
+                );
+                let pins_right = matches!(h, Handle::Left | Handle::TopLeft | Handle::BottomLeft);
+                let pins_bottom = matches!(h, Handle::Top | Handle::TopLeft | Handle::TopRight);
+
+                let next_max_width = if changes_x || constrain {
+                    Some((target_box.w - 2.0 * pad_x).max(min_inner_w))
+                } else {
+                    *max_width
+                };
+                let next_layout = font_set.layout_wrapped(content, font_size, next_max_width);
+                let next_min_height = if changes_y || constrain {
+                    let desired = (target_box.h - 2.0 * pad_y).max(min_inner_h);
+                    (desired > next_layout.height() + 0.5).then_some(desired)
+                } else {
+                    *min_height
+                };
+                let inner_w = next_max_width.map_or(next_layout.width, |w| w.max(next_layout.width)).max(font_size / 2.0);
+                let inner_h = next_layout.height().max(next_min_height.unwrap_or(0.0));
+                let next_x = if pins_right {
+                    orig_box.right() - pad_x - inner_w
+                } else if constrain && !changes_x {
+                    target_box.x + pad_x
+                } else {
+                    origin.x
+                };
+                let next_y = if pins_bottom {
+                    orig_box.bottom() - pad_y - inner_h
+                } else if constrain && !changes_y {
+                    target_box.y + pad_y
+                } else {
+                    origin.y
+                };
+                Geometry::Text {
+                    origin: Point::new(next_x, next_y),
+                    content: content.clone(),
+                    style: *style,
+                    max_width: next_max_width,
+                    min_height: next_min_height,
+                }
             }
             (Geometry::Arrow { from, to, style }, EditHandle::ArrowFrom) => {
                 let next_from = if constrain { snap_45(*to, *from + delta) } else { *from + delta };
@@ -246,10 +343,20 @@ impl Shape {
 }
 
 /// The area a text annotation covers: its glyphs' box at `origin` (at least
-/// a little wide while empty, so there's something to click) plus room for
+/// `max_width` wide and `min_height` tall when explicitly sized, and at least
+/// a little wide while empty so there's something to click) plus room for
 /// the style's outline or backdrop. `size` is the font size.
-pub fn text_box(origin: Point, layout: &TextLayout, size: f32, style: TextStyle) -> Rect {
-    let glyphs = Rect::new(origin.x, origin.y, layout.width.max(size / 2.0), layout.height());
+pub fn text_box(
+    origin: Point,
+    layout: &TextLayout,
+    size: f32,
+    style: TextStyle,
+    max_width: Option<f32>,
+    min_height: Option<f32>,
+) -> Rect {
+    let w = max_width.map_or(layout.width, |mw| mw.max(layout.width)).max(size / 2.0);
+    let h = layout.height().max(min_height.unwrap_or(0.0));
+    let glyphs = Rect::new(origin.x, origin.y, w, h);
     let (px, py) = text_padding(style, size);
     Rect::new(glyphs.x - px, glyphs.y - py, glyphs.w + 2.0 * px, glyphs.h + 2.0 * py)
 }
@@ -418,11 +525,12 @@ mod tests {
 
     #[test]
     fn arrow_handles_move_independently() {
+        let fonts = Fonts::empty();
         let s = Shape {
             geometry: Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(10.0, 10.0), style: ArrowStyle::Elbow },
             style: Style::default(),
         };
-        let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0), false);
+        let moved = s.with_handle_moved(EditHandle::ArrowTo, Point::new(5.0, 0.0), false, metrics(&fonts));
         let style = ArrowStyle::Elbow;
         assert_eq!(moved.geometry, Geometry::Arrow { from: Point::new(0.0, 0.0), to: Point::new(15.0, 10.0), style });
     }
@@ -493,10 +601,47 @@ mod tests {
             style: Style::default(),
         };
         assert!(s.hit(Point::new(100.0, 50.0), metrics(&fonts)));
-        assert_eq!(s.handles().len(), 8);
-        let moved = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(20.0, 0.0), false);
+        assert_eq!(s.handles(metrics(&fonts)).len(), 8);
+        let moved = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(20.0, 0.0), false, metrics(&fonts));
         assert_eq!(moved.bounds(metrics(&fonts)), Rect::new(0.0, 0.0, 220.0, 100.0));
-        let constrained = s.with_handle_moved(EditHandle::Bounds(Handle::Bottom), Point::new(0.0, 50.0), true);
+        let constrained = s.with_handle_moved(EditHandle::Bounds(Handle::Bottom), Point::new(0.0, 50.0), true, metrics(&fonts));
         assert_eq!(constrained.bounds(metrics(&fonts)), Rect::new(-50.0, 0.0, 300.0, 150.0));
+    }
+
+    #[test]
+    fn text_box_exposes_eight_handles_and_reflows_without_scaling_font() {
+        use crate::text::FontSource;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../platform/assets/fonts/Nunito.ttf");
+        let fonts = Fonts::sans_only(FontSet::from_sources(&[FontSource::file(path).weight(800.0)]));
+        let m = metrics(&fonts);
+        let s = Shape {
+            geometry: Geometry::Text {
+                origin: Point::new(100.0, 50.0),
+                content: "one two three four five".into(),
+                style: TextStyle::Boxed,
+                max_width: None,
+                min_height: None,
+            },
+            style: Style::default(),
+        };
+        assert_eq!(s.handles(m).len(), 8);
+        let orig = s.text_rect(m).unwrap();
+        // Narrowing from Right pins the left edge and wraps text taller while keeping font size fixed.
+        let narrowed = s.with_handle_moved(EditHandle::Bounds(Handle::Right), Point::new(-orig.w * 0.55, 0.0), false, m);
+        let nr = narrowed.text_rect(m).unwrap();
+        assert_eq!(narrowed.style.size, s.style.size);
+        assert!((nr.x - orig.x).abs() < 0.01);
+        assert!(nr.w < orig.w * 0.6);
+        assert!(nr.h > orig.h * 1.5);
+        // Narrowing from Left pins the right edge.
+        let from_left = s.with_handle_moved(EditHandle::Bounds(Handle::Left), Point::new(orig.w * 0.5, 0.0), false, m);
+        let lr = from_left.text_rect(m).unwrap();
+        assert!((lr.right() - orig.right()).abs() < 0.5, "{lr:?} vs {orig:?}");
+        assert!(lr.h > orig.h);
+        // Dragging Top upward pins the bottom edge and grows the box upward.
+        let taller = s.with_handle_moved(EditHandle::Bounds(Handle::Top), Point::new(0.0, -40.0), false, m);
+        let tr = taller.text_rect(m).unwrap();
+        assert!((tr.bottom() - orig.bottom()).abs() < 0.5);
+        assert!(tr.h >= orig.h + 39.0);
     }
 }

@@ -1564,7 +1564,9 @@ impl CanvasView {
             shape_frame: e
                 .selected_frame()
                 .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
-            text_frame: e.text_frame().map(|r| v.to_window(r)),
+            text_frame: e
+                .text_frame()
+                .map(|(r, hs)| (v.to_window(r), hs.into_iter().map(|p| v.point_to_window(p)).collect())),
             text_selection: e.text_selection_rects().into_iter().map(|r| v.to_window(r)).collect(),
             text_selection_color: match e.text_box_color() {
                 Some(c) if c.b > 160 && c.b > c.r.saturating_add(40) => rgba(0xFFFF_FF66).into(),
@@ -1785,7 +1787,7 @@ struct Scene {
     dim: Option<Option<Bounds<Pixels>>>,
     selection_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     shape_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
-    text_frame: Option<Bounds<Pixels>>,
+    text_frame: Option<(Bounds<Pixels>, Vec<Point<Pixels>>)>,
     text_selection: Vec<Bounds<Pixels>>,
     text_selection_color: Hsla,
     brush_ring: Option<(Point<Pixels>, gpui::Size<Pixels>, Pixels)>,
@@ -1897,8 +1899,12 @@ impl Scene {
                 window.paint_quad(quad(b, px(1.), white(), px(1.5), blue, BorderStyle::Solid));
             }
         }
-        if let Some(frame) = self.text_frame {
-            window.paint_quad(quad(frame, px(0.), transparent_black(), px(1.), blue, BorderStyle::Dashed));
+        if let Some((frame, handles)) = &self.text_frame {
+            window.paint_quad(quad(*frame, px(0.), transparent_black(), px(1.5), blue, BorderStyle::Dashed));
+            for p in handles {
+                let b = Bounds::centered_at(*p, size(px(7.), px(7.)));
+                window.paint_quad(quad(b, px(1.), white(), px(1.5), blue, BorderStyle::Solid));
+            }
         }
         for rect in &self.text_selection {
             window.paint_quad(fill(*rect, self.text_selection_color));
