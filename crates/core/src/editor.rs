@@ -1110,9 +1110,7 @@ impl Editor {
                 _ => CursorKind::Crosshair,
             };
         }
-        if let Some(edit) = &self.text
-            && self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p))
-        {
+        if self.point_in_active_text(p) {
             return CursorKind::Text;
         }
         if let Some(h) = self.selection_handle_at(sel, p) {
@@ -1124,7 +1122,9 @@ impl Editor {
         if self.element_at(p, self.tool.is_none()).is_some() {
             return CursorKind::Move;
         }
+        let empty_text = self.text.is_some() && self.text_content().is_none_or(str::is_empty);
         match self.tool {
+            Some(_) if empty_text => CursorKind::Default,
             Some(Tool::Text) if sel.contains(p) => CursorKind::Text,
             Some(_) if sel.contains(p) => CursorKind::Crosshair,
             None if sel.contains(p) && self.selection_mode() == SelectionMode::Pick => CursorKind::Move,
@@ -1216,25 +1216,18 @@ impl Editor {
     // ----- pointer input --------------------------------------------------
 
     pub fn pointer_down(&mut self, p: Point) {
+        if self.text_pointer_down(p, false, 1) {
+            return;
+        }
         if self.drag.is_some() {
             self.pointer_up(self.pointer);
         }
         self.pointer = p;
         self.touch();
+        self.pointer_down_canvas(p, true);
+    }
 
-        if let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) {
-            if self.start_text_handle_drag(p) {
-                return;
-            }
-            if self.elements.get(edit_idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
-                self.set_caret_from_point(p, false);
-                self.drag = Some(Drag::TextSelect);
-            } else {
-                self.finish_text();
-            }
-            return;
-        }
-
+    fn pointer_down_canvas(&mut self, p: Point, allow_create: bool) {
         let Some(sel) = self.selection() else {
             self.update_hover();
             self.drag = Some(Drag::Pick { start: p, moved: false });
@@ -1271,7 +1264,8 @@ impl Editor {
             return;
         }
         match self.tool {
-            Some(tool) => self.start_shape(tool, p),
+            Some(tool) if allow_create => self.start_shape(tool, p),
+            Some(_) => {}
             None if self.selection_mode() == SelectionMode::Pick => {
                 self.drag = Some(Drag::SelMove { orig: sel, start: p });
             }
@@ -1859,6 +1853,14 @@ impl Editor {
         }
     }
 
+    fn point_in_active_text(&self, p: Point) -> bool {
+        let Some(edit) = &self.text else {
+            return false;
+        };
+        let pad = 4.0 * self.scale.max(self.ui_scale);
+        self.elements.get(edit.idx).is_some_and(|e| e.bounds(self.metrics()).inflate(pad).contains(p))
+    }
+
     fn start_text_handle_drag(&mut self, p: Point) -> bool {
         let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) else {
             return false;
@@ -1876,12 +1878,13 @@ impl Editor {
 
     /// Handles a left mouse press while editing text, supporting 8-point box
     /// resize handles, Shift+click selection extension, drag-to-select,
-    /// double-click word selection, and triple-click line selection. Returns
-    /// `false` if not currently editing text.
+    /// double-click word selection, triple-click line selection, and single-click
+    /// commit + fall-through to what the user clicked outside the text box.
+    /// Returns `false` if not currently editing text.
     pub fn text_pointer_down(&mut self, p: Point, extend: bool, click_count: usize) -> bool {
-        let Some(edit_idx) = self.text.as_ref().map(|t| t.idx) else {
+        if self.text.is_none() {
             return false;
-        };
+        }
         if self.drag.is_some() {
             self.pointer_up(self.pointer);
         }
@@ -1890,8 +1893,14 @@ impl Editor {
         if self.start_text_handle_drag(p) {
             return true;
         }
-        if !self.elements.get(edit_idx).is_some_and(|e| e.bounds(self.metrics()).inflate(4.0 * self.ui_scale).contains(p)) {
+        if !self.point_in_active_text(p) {
+            // Commit/discard the active text box, then dispatch the click directly to
+            // whatever lies under `p` (another shape, handle, or a new shape when the
+            // active text was non-empty). An empty text box dismissed on empty canvas
+            // stops cleanly instead of spawning another empty box.
+            let was_empty = self.text_content().is_none_or(str::is_empty);
             self.finish_text();
+            self.pointer_down_canvas(p, !was_empty);
             return true;
         }
         if click_count >= 3 {
@@ -2831,7 +2840,12 @@ mod tests {
         e.text_key(TextKey::Left);
         e.text_key(TextKey::Newline);
         assert_eq!(e.text_content(), Some("h\ni"));
+        // Clicking empty canvas while Text tool is active commits the first text and
+        // immediately starts a new text box; clicking empty canvas again while empty dismisses it.
         click(&mut e, 300.0, 250.0);
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some(""));
+        click(&mut e, 350.0, 250.0);
         assert!(!e.is_editing_text());
         assert_eq!(shapes_of(&e).len(), 1);
         assert!(e.undo());
@@ -3920,5 +3934,52 @@ mod tests {
         assert!(e.undo());
         let restored = e.elements()[1].as_shape().unwrap().text_frame_rect(e.metrics()).unwrap();
         assert!((restored.w - narrow_frame.w).abs() < 0.5);
+    }
+
+    #[test]
+    fn clicking_outside_text_starts_next_text_in_one_click_and_empty_click_dismisses() {
+        let mut e = editor();
+        drag(&mut e, (0.0, 0.0), (400.0, 300.0));
+        // Add a rectangle to verify click-through to other existing shapes too.
+        e.toggle_tool(Tool::Rect);
+        drag(&mut e, (20.0, 20.0), (80.0, 60.0));
+
+        e.toggle_tool(Tool::Text);
+        click(&mut e, 120.0, 100.0);
+        assert!(e.is_editing_text());
+        // Empty text box: hovering empty canvas promises Default (dismiss), not Text.
+        e.pointer_move(Point::new(260.0, 180.0), false);
+        assert_eq!(e.cursor(), CursorKind::Default);
+
+        // Type first text: hovering empty canvas now promises Text (1-click next text).
+        e.text_replace(None, "first", false, None);
+        e.pointer_move(Point::new(260.0, 180.0), false);
+        assert_eq!(e.cursor(), CursorKind::Text);
+
+        // One click creates and focuses the second text immediately while committing the first.
+        click(&mut e, 260.0, 180.0);
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some(""));
+        e.text_replace(None, "second", false, None);
+
+        // Clicking an existing text box while editing another commits "second" and opens "first" in one click.
+        click(&mut e, 122.0, 100.0);
+        assert!(e.is_editing_text());
+        assert_eq!(e.text_content(), Some("first"));
+
+        // Clearing all text and clicking empty canvas deletes the emptied box and blurs cleanly.
+        e.text_key(TextKey::SelectAll);
+        e.text_key(TextKey::Backspace);
+        assert_eq!(e.text_content(), Some(""));
+        click(&mut e, 340.0, 240.0);
+        assert!(!e.is_editing_text());
+        assert_eq!(shapes_of(&e).len(), 2); // rect + "second"
+
+        // Re-open "second", then drag the rectangle's outline in one gesture: commits text and moves rect.
+        click(&mut e, 262.0, 180.0);
+        assert!(e.is_editing_text());
+        drag(&mut e, (20.0, 40.0), (30.0, 50.0));
+        assert!(!e.is_editing_text());
+        assert_eq!(shapes_of(&e)[0].geometry, Geometry::Rect(Rect::new(30.0, 30.0, 60.0, 40.0)));
     }
 }
