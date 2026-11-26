@@ -19,8 +19,8 @@ use global_hotkey::GlobalHotKeyManager;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString, Styled, StyledImage,
-    Task, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, div,
-    point, prelude::FluentBuilder, px, rgba, size, svg,
+    Task, WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    canvas, div, fill, point, prelude::FluentBuilder, px, rgba, size, svg,
 };
 
 use crate::AppState;
@@ -95,12 +95,53 @@ pub fn cancel_active(cx: &mut App) {
     }
 }
 
-/// Dims the screen around the captured region (the "hole", in logical pixels),
-/// outlines it, and renders the live stitched preview beside it. The platform
-/// makes the entire dim layer click-through so clicking anywhere outside (or
-/// inside) the hole passes straight through without raising it above the bar.
+/// Exact physical-pixel rectangle `[x0, x1) × [y0, y1)` mapped to logical GPUI
+/// bounds so `window.paint_quad` snaps back to those exact device pixels.
+fn dev_bounds(x0: i32, y0: i32, x1: i32, y1: i32, scale: f32) -> Bounds<gpui::Pixels> {
+    Bounds::from_corners(
+        point(px(x0 as f32 / scale), px(y0 as f32 / scale)),
+        point(px(x1 as f32 / scale), px(y1 as f32 / scale)),
+    )
+}
+
+/// Computes the 4 dim-strip quads and 4 outer blue border quads in physical
+/// device pixels around `hole` within `screen`. Every rectangle sits strictly
+/// outside `hole` so sub-pixel DPI rounding can never paint into the captured
+/// region.
+fn dim_and_border_rects(
+    screen: (i32, i32),
+    hole: PixelRect,
+    scale: f32,
+) -> ([(i32, i32, i32, i32); 4], [(i32, i32, i32, i32); 4]) {
+    let (sw, sh) = screen;
+    let hx0 = hole.x;
+    let hy0 = hole.y;
+    let hx1 = hole.x + hole.width;
+    let hy1 = hole.y + hole.height;
+    let bw = (BORDER * scale).round().max(1.0) as i32;
+    let dim = [
+        (0, 0, sw, hy0),
+        (0, hy1, sw, sh),
+        (0, hy0, hx0, hy1),
+        (hx1, hy0, sw, hy1),
+    ];
+    let border = [
+        (hx0 - bw, hy0 - bw, hx1 + bw, hy0),
+        (hx0 - bw, hy1, hx1 + bw, hy1 + bw),
+        (hx0 - bw, hy0, hx0, hy1),
+        (hx1, hy0, hx1 + bw, hy1),
+    ];
+    (dim, border)
+}
+
+/// Dims the screen around the captured region (the "hole", in physical device
+/// pixels), outlines it strictly outside the hole, and renders the live stitched
+/// preview beside it. The platform makes the entire dim layer click-through so
+/// clicking anywhere outside (or inside) the hole passes straight through
+/// without raising it above the bar.
 struct Dim {
-    hole: Bounds<gpui::Pixels>,
+    screen_px: (i32, i32),
+    hole_px: PixelRect,
     preview: Option<(PxRect, Arc<RenderImage>)>,
     session: Option<WeakEntity<ScrollingCapture>>,
 }
@@ -115,24 +156,33 @@ impl Dim {
 
 impl Render for Dim {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let h = self.hole;
-        let dim = || div().absolute().bg(rgba(0x0000_0073));
+        let screen = self.screen_px;
+        let hole = self.hole_px;
         div()
             .size_full()
             .relative()
-            .child(dim().left_0().right_0().top_0().h(h.top()))
-            .child(dim().left_0().right_0().top(h.bottom()).bottom_0())
-            .child(dim().left_0().w(h.left()).top(h.top()).h(h.size.height))
-            .child(dim().left(h.right()).right_0().top(h.top()).h(h.size.height))
             .child(
-                div()
-                    .absolute()
-                    .left(h.left() - px(BORDER))
-                    .top(h.top() - px(BORDER))
-                    .w(h.size.width + px(2.0 * BORDER))
-                    .h(h.size.height + px(2.0 * BORDER))
-                    .border(px(BORDER))
-                    .border_color(hsla(THEME_BLUE)),
+                canvas(
+                    |_, _, _| (),
+                    move |_, (), window, _| {
+                        let scale = window.scale_factor();
+                        let (dim_rects, border_rects) = dim_and_border_rects(screen, hole, scale);
+                        let dim_color = rgba(0x0000_0073);
+                        let blue = hsla(THEME_BLUE);
+                        for (x0, y0, x1, y1) in dim_rects {
+                            if x1 > x0 && y1 > y0 {
+                                window.paint_quad(fill(dev_bounds(x0, y0, x1, y1, scale), dim_color));
+                            }
+                        }
+                        for (x0, y0, x1, y1) in border_rects {
+                            if x1 > x0 && y1 > y0 {
+                                window.paint_quad(fill(dev_bounds(x0, y0, x1, y1, scale), blue));
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
             )
             .when_some(self.preview.clone(), |el, (r, image)| {
                 el.child(
@@ -252,10 +302,6 @@ pub fn start(
     let bar_rect = PixelRect { x: bar_x, y: bar_y, width: bar_w, height: bar_h };
     // The dim layer covers the whole display; only the region is a hole.
     let screen_rect = PixelRect { x: 0, y: 0, width: screen_w, height: screen_h };
-    let hole = Bounds::new(
-        point(px(rect.x as f32 / scale), px(rect.y as f32 / scale)),
-        size(px(rect.width as f32 / scale), px(rect.height as f32 / scale)),
-    );
     let frame = cx.open_window(
         helper_window_options(logical_bounds(origin, screen_rect, scale), gpui_display.id(), true),
         |_, cx| {
@@ -268,7 +314,7 @@ pub fn start(
                     }
                 })
                 .detach();
-                Dim { hole, preview: None, session: None }
+                Dim { screen_px: screen, hole_px: rect, preview: None, session: None }
             })
         },
     )?;
@@ -695,7 +741,43 @@ impl Render for ScrollingCapture {
 
 #[cfg(test)]
 mod tests {
-    use super::EscapeEdge;
+    use bluesnap_platform::PixelRect;
+
+    use super::{EscapeEdge, dev_bounds, dim_and_border_rects};
+
+    #[test]
+    fn dim_and_border_quads_stay_strictly_outside_hole_across_fractional_dpi() {
+        let screen = (3840, 2160);
+        let holes = [
+            PixelRect { x: 100, y: 100, width: 500, height: 500 },
+            PixelRect { x: 101, y: 101, width: 501, height: 501 },
+            PixelRect { x: 333, y: 217, width: 819, height: 613 },
+            PixelRect { x: 0, y: 0, width: 1200, height: 900 },
+        ];
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0] {
+            for hole in holes {
+                let (dim, border) = dim_and_border_rects(screen, hole, scale);
+                let (hx0, hy0, hx1, hy1) = (hole.x, hole.y, hole.x + hole.width, hole.y + hole.height);
+                for (x0, y0, x1, y1) in dim.into_iter().chain(border) {
+                    if x1 <= x0 || y1 <= y0 {
+                        continue;
+                    }
+                    let b = dev_bounds(x0, y0, x1, y1, scale);
+                    let sl = (f32::from(b.left()) * scale).round() as i32;
+                    let st = (f32::from(b.top()) * scale).round() as i32;
+                    let sr = (f32::from(b.right()) * scale).round() as i32;
+                    let sb = (f32::from(b.bottom()) * scale).round() as i32;
+                    assert_eq!((sl, st, sr, sb), (x0, y0, x1, y1), "scale={scale}, hole={hole:?}");
+                    let overlaps_x = sl < hx1 && sr > hx0;
+                    let overlaps_y = st < hy1 && sb > hy0;
+                    assert!(
+                        !(overlaps_x && overlaps_y),
+                        "quad ({sl},{st},{sr},{sb}) overlaps hole ({hx0},{hy0},{hx1},{hy1}) at scale={scale}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn escape_edge_ignores_already_held_key_and_fires_on_new_press() {

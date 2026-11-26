@@ -665,6 +665,11 @@ impl CanvasView {
         // Mark `finished = true` so `on_release` doesn't un-hide the Editor
         // prematurely while scrolling capture takes over the `ForEditor` session.
         self.finished = true;
+        // Hide without DWM/AppKit close animations before destroying the window so
+        // the capture overlay's blue selection border cannot linger into frame 0.
+        if let Ok(win_ref) = bluesnap_platform::window_ref(window) {
+            let _ = bluesnap_platform::native().set_window_visible(win_ref, false);
+        }
         self.drop_gpu_images(window);
         window.remove_window();
         bluesnap_platform::native().restore_previous_app();

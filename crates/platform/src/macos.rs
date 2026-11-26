@@ -12,8 +12,8 @@ use objc2::runtime::AnyObject;
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, Message, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel,
-    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowAnimationBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScreen, NSView, NSWindowAnimationBehavior, NSWindowSharingType,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -244,6 +244,9 @@ impl Platform for Native {
         // Window shadows follow transparency, so one would be drawn inside the
         // hole, over the content being captured.
         ns_window.setHasShadow(false);
+        // Exclude floating scrolling-capture UI (dim mask, blue border, preview,
+        // bar) from CoreGraphics captures while keeping it visible on screen.
+        ns_window.setSharingType(NSWindowSharingType::None);
         ns_window.setAcceptsMouseMovedEvents(true);
         ns_window.setLevel(if above.is_some() { ABOVE_OVERLAY } else { POPUP_LEVEL });
         let s = display.scale_factor as f64;

@@ -46,9 +46,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HCURSOR, HTCLIENT,
     HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENWSE, IDC_SIZENS, IDC_SIZEWE,
     IsIconic, IsWindowVisible, IsZoomed, LoadCursorW, PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WM_NCDESTROY, WM_SETCURSOR, WNDPROC, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_CAPTION, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor, SetForegroundWindow, SetWindowDisplayAffinity,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WDA_EXCLUDEFROMCAPTURE, WM_NCDESTROY, WM_SETCURSOR, WNDPROC,
+    WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_THICKFRAME,
 };
 
 use crate::{
@@ -303,6 +304,15 @@ impl Platform for Native {
                     == FALSE
                 {
                     bail!("SetWindowPos failed: {}", std::io::Error::last_os_error());
+                }
+                // Exclude floating capture overlays (dim mask, blue border, live preview,
+                // status bar) from screen capture on Windows 10 2004+ / Windows 11 so
+                // DWM never composites our UI into `BitBlt` scrolling frames.
+                if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == FALSE {
+                    log::debug!(
+                        "SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) unavailable: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
                 // gpui keeps invisible resize borders around frameless windows; grow the
                 // window by them so the client area (what gpui draws) lands on `rect`.
